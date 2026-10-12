@@ -1462,6 +1462,13 @@ def compute_off_targets_directory(
     # spawn: each worker starts a fresh interpreter, avoiding fork+Rayon deadlocks.
     # Chromosome-major workers never build the eager per-worker loader.
     _ctx = multiprocessing.get_context("spawn")
+    # Polars sizes its thread pool when it is imported, which in a spawned
+    # worker happens while the initializer is being unpickled -- before the
+    # initializer runs. The budget therefore has to be in the environment the
+    # children inherit. The parent's own pool is already sized, so this does
+    # not affect it; restored on exit.
+    _prev_polars_threads = os.environ.get("POLARS_MAX_THREADS")
+    os.environ["POLARS_MAX_THREADS"] = str(polars_threads_per_worker)
     _init_args = (
         str(_ipc_path) if gtf_file else "",
         str(accessibility_dir) if (accessibility_dir and not chrom_major) else "",
@@ -1514,3 +1521,7 @@ def compute_off_targets_directory(
             shutil.rmtree(_ipc_tmp, ignore_errors=True)
         if _run_tmp:
             shutil.rmtree(_run_tmp, ignore_errors=True)
+        if _prev_polars_threads is None:
+            os.environ.pop("POLARS_MAX_THREADS", None)
+        else:
+            os.environ["POLARS_MAX_THREADS"] = _prev_polars_threads
