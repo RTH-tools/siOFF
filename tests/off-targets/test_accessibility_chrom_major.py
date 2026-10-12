@@ -148,7 +148,11 @@ def hits(tmp_path_factory) -> tuple[Path, pl.DataFrame]:
     return d, df
 
 
-SORT_KEYS = ["sirna_id", "chrom", "start", "end", "strand"]
+# "energy" breaks ties: the random fixture can produce two hits with the same
+# siRNA, contig, coordinates and strand (seed 11 does, once), and polars does
+# not order tied rows deterministically, so without it the comparison below
+# depended on which of the pair came first (failed once on CI, ubuntu 3.14).
+SORT_KEYS = ["sirna_id", "chrom", "start", "end", "strand", "energy"]
 
 
 def _run(
