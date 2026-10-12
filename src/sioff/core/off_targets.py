@@ -209,6 +209,27 @@ def _process_one_sirna(
     return arrow, meta
 
 
+class WorkerFailureError(RuntimeError):
+    """Raised by `compute_off_targets_directory` when worker tasks failed.
+
+    Successful siRNAs are still yielded first; the error is raised once the
+    pool has drained (or immediately for a failed accessibility contig, whose
+    loss would silently corrupt every siRNA). ``failures`` holds
+    ``(task_name, error_message)`` pairs in completion order.
+    """
+
+    def __init__(self, stage: str, failures: list[tuple[str, str]], n_total: int):
+        self.stage = stage
+        self.failures = failures
+        self.n_total = n_total
+        unit = "contigs" if stage.startswith("pass 2") else "siRNAs"
+        name, msg = failures[0]
+        super().__init__(
+            f"{len(failures)}/{n_total} {unit} failed in {stage}; "
+            f"first error: {name}: {msg}"
+        )
+
+
 # ---------------------------------------------------------------------------
 # Chromosome-major accessibility: three passes over a run temp dir.
 #
@@ -583,8 +604,12 @@ def _stream_chrom_major(
         try:
             chrom, batches, stats = future.result()
         except Exception as exc:
+            for pending in futures2:
+                pending.cancel()
             logger.error(f"Pass 2 failed for {c}: {exc}")
-            continue
+            raise WorkerFailureError(
+                "pass 2 (accessibility gather)", [(c, str(exc))], len(order)
+            ) from exc
         out_path = str(pass2_dir / f"{chrom}.arrow")
         for idx, batch_index in batches.items():
             energy_sources[idx].append((out_path, batch_index))
@@ -653,6 +678,8 @@ def _stream_chrom_major(
         f"[chrom-major] pass 3: {n_yielded} siRNAs scored in {t3_end - t2_end:.1f}s; "
         f"total {t3_end - t1:.1f}s"
     )
+    if failures:
+        raise WorkerFailureError("pass 1/3 (per-siRNA)", failures, n_files)
 
 
 def _stream_eager(
@@ -670,6 +697,11 @@ def _stream_eager(
     ------
     tuple[polars.DataFrame, dict]
         ``(df, meta)`` per siRNA, in completion order.
+
+    Raises
+    ------
+    WorkerFailureError
+        After the last successful siRNA, when any task failed.
     """
     failures: list[tuple[str, str]] = []
     futures = {
@@ -704,6 +736,8 @@ def _stream_eager(
         df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
         del arrow_table  # Arrow copy no longer needed; Polars owns the data
         yield df_chunk, batch_metadata
+    if failures:
+        raise WorkerFailureError("per-siRNA workers", failures, len(all_files))
 
 
 ACCESSIBILITY_STRATEGIES = ("auto", "eager", "chrom-major")
@@ -1254,10 +1288,12 @@ def compute_off_targets_directory(
     worker process (``spawn`` rather than ``fork`` avoids Rayon/Polars
     thread-pool deadlocks): it is loaded, optionally filtered to the sense
     strand, intersected with the transcriptome, and scored with the per-siRNA
-    partition function. Files whose worker fails are logged and skipped, and
-    files with no remaining predictions are skipped silently. Heavy intermediate
-    columns (``boltzmann_weight*``, ``Z_sirna*``, ``E_min``) are dropped from
-    the yielded frames.
+    partition function. Files with no remaining predictions are skipped
+    silently. Files whose worker fails are logged and skipped, and once every
+    successful siRNA has been yielded a `WorkerFailureError` summarising them
+    is raised, so a run where tasks failed never looks like an empty success.
+    Heavy intermediate columns (``boltzmann_weight*``, ``Z_sirna*``, ``E_min``)
+    are dropped from the yielded frames.
 
     With ``accessibility_dir`` and more than one worker (``"auto"``), or with
     ``accessibility_strategy="chrom-major"``, opening energies are gathered
@@ -1360,6 +1396,9 @@ def compute_off_targets_directory(
         When ``input_dir`` contains no RIsearch prediction files.
     ValueError
         When ``accessibility_strategy`` is not one of the three values.
+    WorkerFailureError
+        After the last successful siRNA, when any worker task failed; at once
+        when a chromosome-major accessibility pass fails.
 
     See Also
     --------
