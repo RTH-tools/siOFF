@@ -30,6 +30,51 @@ def _reverse_complement(seq: str) -> str:
     return seq.translate(_COMPLEMENT_TABLE)[::-1]
 
 
+def site_cells(
+    strand: str,
+    starts: np.ndarray,
+    ends: np.ndarray,
+    seq_len: int,
+    n_u: int,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Map RIsearch hits to cells of one strand's opening-energy profile.
+
+    The single place that turns a hit into a profile index; every lookup path
+    (eager, in-memory frames, memory-mapped cache, chromosome-major gather,
+    on-target) goes through it.
+
+    A profile row ``i`` (0-based) and column ``k`` hold the energy to open the
+    ``k + 1`` bases ENDING at position ``i + 1`` of the molecule that was folded
+    (RNAplfold's ``-u`` convention). A hit ``[s, e]`` (1-based, inclusive, on the
+    chromosome) needs the stretch covering exactly ``[s, e]`` on its own
+    transcript, with the column clamped to the widest ``u``:
+
+    * ``'+'``: the forward sequence; the stretch ends at ``e`` -> row ``e - 1``.
+    * ``'-'``: the reverse complement, which ``_fold_full_chromosome`` folds and
+      writes in its own coordinates (RC position ``p`` = chromosome position
+      ``N - p + 1``). ``[s, e]`` is RC ``[N - e + 1, N - s + 1]``, ending at
+      ``N - s + 1`` -> row ``N - s``. ``seq_len`` must therefore be the full
+      contig length ``N``; the writer emits every position, so the strand's
+      maximum position is ``N``.
+
+    Returns ``(rows, cols, in_bounds)`` as int64/int64/bool arrays. Rows of
+    out-of-bounds hits (``s < 1`` or ``e > N``) are clipped into range so the
+    gather stays valid; callers must use ``in_bounds`` to discard them.
+    """
+    s = np.asarray(starts, dtype=np.int64)
+    e = np.asarray(ends, dtype=np.int64)
+    in_bounds = (s >= 1) & (e <= seq_len)
+    cols = np.maximum(np.minimum(e - s + 1, n_u) - 1, 0)
+    if strand == "+":
+        rows = e - 1
+    elif strand == "-":
+        rows = seq_len - s
+    else:
+        raise AccessibilityError(f"strand must be '+' or '-', got {strand!r}")
+    rows = np.clip(rows, 0, max(seq_len - 1, 0))
+    return rows, cols, in_bounds
+
+
 def fold_sequence(
     sequence: str,
     window_size: int = 80,
@@ -928,10 +973,14 @@ class GenomeAccessibilityService:
         return profile_key
 
     def query(self, chrom: str, start: int, end: int, strand: str = "+") -> np.ndarray:
-        """Return opening energies for a region (0-based, half-open [start, end)).
+        """Return profile rows ``[start, end)`` (0-based, half-open) of one strand.
 
         Always a float32 ``[end - start, n_u]`` array in kcal/mol, whichever
-        kind of profile backs the chromosome.
+        kind of profile backs the chromosome. Rows are in the coordinates of the
+        molecule that was folded: chromosome positions for ``'+'``, reverse-
+        complement positions for ``'-'`` (see `site_cells`). To look up the
+        energy of a hit given in chromosome coordinates use `query_single` or
+        `annotate_opening_energy_vectorized`.
         """
         profile_key = self._ensure_profile(chrom, strand)
         profile = self._profiles[profile_key]
@@ -950,10 +999,9 @@ class GenomeAccessibilityService:
         """
         Fast-path: return a single opening energy value for a prediction.
 
-        Mirrors the old pipeline's get_opening_energy() logic:
-        - Picks the value at the 3'-end position using the interaction length
-          as the u-column index.
-        - Quantizes to 0.1 resolution (match legacy behavior).
+        Picks the cell `site_cells` assigns to the hit (the stretch covering
+        ``[start, end]`` on its own transcript, interaction length as the
+        u-column) and quantizes to 0.1 kcal/mol.
 
         Args:
             chrom: Chromosome name.
@@ -970,23 +1018,12 @@ class GenomeAccessibilityService:
         profile = self._profiles[profile_key]
         seq_len = profile.n_pos
 
-        start0 = start - 1
-        end0 = end  # half-open
-
-        if start0 < 0 or end0 > seq_len:
-            return 10.0
-
-        interaction_len = end0 - start0
-        matrix_width = profile.n_u
-        col_idx = min(interaction_len, matrix_width) - 1
-        if col_idx < 0:
-            col_idx = 0
-        row_idx = end0 - 1 if strand == "+" else start0
-        raw_val = float(
-            profile.gather(
-                np.array([row_idx], dtype=np.int64), np.array([col_idx], dtype=np.int64)
-            )[0]
+        rows, cols, in_bounds = site_cells(
+            strand, np.array([start]), np.array([end]), seq_len, profile.n_u
         )
+        if not in_bounds[0]:
+            return 10.0
+        raw_val = float(profile.gather(rows, cols)[0])
 
         return int(round(raw_val * 10.0)) / 10.0
 
@@ -1017,18 +1054,9 @@ class GenomeAccessibilityService:
             seq_len = profile.n_pos
 
             idx = np.array(row_indices, dtype=np.int64)
-            s = starts[idx]
-            e = ends[idx]
-            start0 = s - 1
-            end0 = e
-            interaction_len = end0 - start0
-            in_bounds = (start0 >= 0) & (end0 <= seq_len)
-
-            matrix_width = profile.n_u
-            col_idx = np.minimum(interaction_len, matrix_width) - 1
-            col_idx = np.maximum(col_idx, 0)
-            row_idx = np.where(strand == "+", end0 - 1, start0)
-            row_idx = np.clip(row_idx, 0, seq_len - 1)
+            row_idx, col_idx, in_bounds = site_cells(
+                strand, starts[idx], ends[idx], seq_len, profile.n_u
+            )
             raw_vals = profile.gather(row_idx, col_idx)
 
             # Quantize to 0.1 resolution (match legacy query_single behaviour)
@@ -1159,17 +1187,10 @@ def gather_opening_energies(
             continue
         seq_len = max(e[3] for e in rgs)
 
-        # Same arithmetic as annotate_opening_energy_vectorized.
-        s = starts[sel]
-        e = ends[sel]
-        start0 = s - 1
-        end0 = e
-        interaction_len = end0 - start0
-        in_bounds = (start0 >= 0) & (end0 <= seq_len)
-        col_idx = np.minimum(interaction_len, n_u) - 1
-        col_idx = np.maximum(col_idx, 0)
-        row_idx = end0 - 1 if strand == "+" else start0
-        row_idx = np.clip(row_idx, 0, seq_len - 1)
+        # Same cells as annotate_opening_energy_vectorized.
+        row_idx, col_idx, in_bounds = site_cells(
+            strand, starts[sel], ends[sel], seq_len, n_u
+        )
 
         ib = np.flatnonzero(in_bounds)
         vals = np.full(ib.size, _MISSING_POSITION_ENERGY, dtype=np.float32)

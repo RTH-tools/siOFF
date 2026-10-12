@@ -8,6 +8,8 @@ from loguru import logger
 
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
+    _reverse_complement,
+    site_cells,
 )
 from sioff.services.helpers import read_fasta
 from sioff.services.risearch_service import RIsearchService
@@ -856,17 +858,15 @@ class ProbabilityService:
                 for col_idx, col_name in enumerate(u_cols):
                     profile[pos_0, col_idx] = df_acc[col_name].to_numpy()
 
-                start0 = t_start - 1
-                interaction_len = t_end - start0
-                matrix_width = profile.shape[1]
-                col_idx = min(interaction_len, matrix_width) - 1
-                if col_idx < 0:
-                    col_idx = 0
-                target_idx = (t_end - 1) if strand == "+" else start0
-                if 0 <= target_idx < profile.shape[0]:
-                    dG_open = (
-                        int(round(float(profile[target_idx, col_idx]) * 10.0)) / 10.0
-                    )
+                rows, cols, in_bounds = site_cells(
+                    strand,
+                    np.array([t_start]),
+                    np.array([t_end]),
+                    profile.shape[0],
+                    profile.shape[1],
+                )
+                if in_bounds[0]:
+                    dG_open = int(round(float(profile[rows[0], cols[0]]) * 10.0)) / 10.0
                 else:
                     dG_open = 10.0
 
@@ -887,20 +887,30 @@ class ProbabilityService:
                         f"Computing on-target accessibility on-the-fly (len={len(sequence)})"
                     )
 
+                    # A '-' hit sits on the reverse complement of the on-target
+                    # sequence: fold that molecule, whose rows are RC positions,
+                    # exactly as the genome-wide profiles store the '-' strand.
+                    folded = (
+                        _reverse_complement(sequence) if strand == "-" else sequence
+                    )
                     with tempfile.TemporaryDirectory() as tmpdir:
                         temp_service = GenomeAccessibilityService(Path(tmpdir))
                         profile = temp_service.compute_sequence_accessibility(
-                            sequence, temperature=self._temperature
+                            folded, temperature=self._temperature
                         )
 
-                        start0 = t_start - 1
-                        interaction_len = t_end - start0
-
                         if profile.size > 0 and profile.ndim == 2:
-                            col_idx = max(min(interaction_len, profile.shape[1]) - 1, 0)
-                            target_idx = (t_end - 1) if strand == "+" else start0
+                            rows, cols, in_bounds = site_cells(
+                                strand,
+                                np.array([t_start]),
+                                np.array([t_end]),
+                                profile.shape[0],
+                                profile.shape[1],
+                            )
+                            target_idx = int(rows[0])
+                            col_idx = int(cols[0])
 
-                            if 0 <= target_idx < profile.shape[0]:
+                            if in_bounds[0]:
                                 dG_open = float(profile[target_idx, col_idx])
                                 logger.info(
                                     f"On-target opening energy: {dG_open:.2f} kcal/mol"
