@@ -86,6 +86,7 @@ def off_targets(
     transcriptome_format: str = "auto",
     accessibility: Optional[Mapping[str, pl.DataFrame]] = None,
     accessibility_dir: Optional[Union[str, Path]] = None,
+    accessibility_cache_dir: Optional[Union[str, Path]] = None,
     genome_file: Optional[Union[str, Path]] = None,
     window_size: int = 80,
     max_span: int = 40,
@@ -187,8 +188,17 @@ def off_targets(
         only; mutually exclusive with ``accessibility_dir``. No CLI equivalent.
     accessibility_dir : str or pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility``. The only accessibility source the
-        directory form accepts. CLI: ``-a/--accessibility-dir``.
+        written by ``sioff accessibility`` (with
+        ``accessibility_strategy="memmap"``, it may instead hold only the
+        ``.access.npy`` cache files built from them). The only accessibility
+        source the directory form accepts. CLI: ``-a/--accessibility-dir``.
+    accessibility_cache_dir : str or pathlib.Path, optional
+        ``accessibility_strategy="memmap"`` only: directory of the
+        memory-mapped ``<chrom>_<plus|minus>.access.npy`` accessibility cache,
+        built there from the Parquet when missing and created if absent; the
+        directory form builds every missing contig before its workers start.
+        Default: ``accessibility_dir`` itself. Ignored (with a warning) by the
+        other strategies. CLI: ``--accessibility-cache-dir``.
     genome_file : str or pathlib.Path, optional
         Genome FASTA to fold on the fly; the profiles go to a temporary
         directory that is removed when the call returns. Ignored when
@@ -261,14 +271,18 @@ def off_targets(
         single-frame forms, and the number of spawned worker processes (one
         siRNA file at a time each) for the directory form. CLI:
         ``-j/--workers``, whose default is the CPU count.
-    accessibility_strategy : {"auto", "eager", "chrom-major"}, default "auto"
-        Directory form only: how opening energies are looked up from
-        ``accessibility_dir``. ``"chrom-major"`` streams each chromosome's
-        Parquet once per run for the hits of every siRNA, so memory per worker
-        stays about one Parquet row group; ``"eager"`` loads whole-chromosome
-        profiles in every worker (30 GB per chr1 strand on hg38); ``"auto"``
-        is chromosome-major with more than one worker. Results are identical.
-        CLI: ``--accessibility-strategy``.
+    accessibility_strategy : {"auto", "eager", "memmap", "chrom-major"}, default "auto"
+        How opening energies are looked up from ``accessibility_dir``.
+        ``"chrom-major"`` (directory form) streams each chromosome's Parquet
+        once per run for the hits of every siRNA, so memory per worker stays
+        about one Parquet row group, and writes nothing; ``"memmap"`` builds
+        a uint8 ``.access.npy`` cache per chromosome and strand (in
+        ``accessibility_cache_dir``) that every worker memory-maps, and is the
+        only strategy that writes cache files; ``"eager"`` loads
+        whole-chromosome profiles into memory (30 GB per chr1 strand on hg38).
+        ``"auto"`` is chromosome-major for the directory form and eager for the
+        single-frame forms, which have no chromosome-major path. Results are
+        identical. CLI: ``--accessibility-strategy``.
 
     Returns
     -------
@@ -354,6 +368,7 @@ def off_targets(
             expression_metric=expression_metric,
             transcriptome_format=transcriptome_format,
             accessibility_dir=_p(accessibility_dir),
+            accessibility_cache_dir=_p(accessibility_cache_dir),
             temperature=temperature,
             on_target_ids_file=_p(on_target_ids_file),
             on_target_expression=on_target_expression,
@@ -382,6 +397,7 @@ def off_targets(
         transcriptome_format=transcriptome_format,
         accessibility=accessibility,
         accessibility_dir=_p(accessibility_dir),
+        accessibility_cache_dir=_p(accessibility_cache_dir),
         genome_file=_p(genome_file),
         window_size=window_size,
         max_span=max_span,
@@ -399,6 +415,7 @@ def off_targets(
         sense_only=sense_only,
         predictions_type=predictions_type,
         n_workers=n_workers,
+        accessibility_strategy=accessibility_strategy,
     )
     return df
 

@@ -25,11 +25,16 @@ import pyarrow.parquet as pq
 import pytest
 from polars.testing import assert_frame_equal
 
+import sioff.core.off_targets as core
 from sioff.core.off_targets import (
     WorkerFailureError,
     compute_off_targets_directory,
 )
-from sioff.services.accessibility import GenomeAccessibilityService
+from sioff.services.accessibility import (
+    GenomeAccessibilityService,
+    cache_paths,
+    ensure_accessibility_cache,
+)
 
 N_U = 30
 # Small row groups so a contig spans several of them and the row-group walk
@@ -146,10 +151,17 @@ def hits(tmp_path_factory) -> tuple[Path, pl.DataFrame]:
 SORT_KEYS = ["sirna_id", "chrom", "start", "end", "strand"]
 
 
-def _run(hits_dir: Path, acc_dir: Path, strategy: str, n_workers: int):
+def _run(
+    hits_dir: Path,
+    acc_dir: Path,
+    strategy: str,
+    n_workers: int,
+    cache_dir: Path | None = None,
+):
     gen = compute_off_targets_directory(
         input_dir=hits_dir,
         accessibility_dir=acc_dir,
+        accessibility_cache_dir=cache_dir,
         alpha="0.8;1",
         gamma="0.9;1",
         theta="0.7",
@@ -201,15 +213,85 @@ def test_chrom_major_matches_direct_vectorized_lookup(hits, acc_dir):
     )
 
 
-def test_single_worker_auto_still_works(hits, acc_dir):
-    """``auto`` with one worker keeps the eager loader; results are identical."""
+def test_auto_is_chrom_major_even_with_one_worker(hits, acc_dir, monkeypatch):
+    """``auto`` with an accessibility dir never uses the eager loader (-j 1 too)."""
     hits_dir, _ = hits
     eager, _ = _run(hits_dir, acc_dir, "eager", n_workers=2)
+
+    def _no_eager(*_args, **_kwargs):
+        raise AssertionError("auto fell back to the eager per-worker loader")
+
+    monkeypatch.setattr(core, "_stream_eager", _no_eager)
     auto1, _ = _run(hits_dir, acc_dir, "auto", n_workers=1)
     assert_frame_equal(auto1, eager, check_exact=True)
 
 
-@pytest.mark.parametrize("strategy", ["eager", "chrom-major"])
+def _cache_files(d: Path) -> list[str]:
+    return sorted(p.name for p in d.iterdir() if ".access." in p.name)
+
+
+def test_eager_memmap_and_chrom_major_agree(hits, acc_dir, tmp_path):
+    """The three strategies give identical frames and partition functions.
+
+    Only ``memmap`` may create cache files, and only in its cache directory;
+    ``eager`` and ``chrom-major`` leave the accessibility directory untouched.
+    """
+    hits_dir, all_hits = hits
+    before = _cache_files(acc_dir)
+    eager, eager_z = _run(hits_dir, acc_dir, "eager", n_workers=2)
+    chrom_major, cm_z = _run(hits_dir, acc_dir, "chrom-major", n_workers=2)
+    assert _cache_files(acc_dir) == before == [], "eager/chrom-major wrote a cache"
+
+    cache_dir = tmp_path / "cache"
+    memmap, mm_z = _run(hits_dir, acc_dir, "memmap", n_workers=2, cache_dir=cache_dir)
+    assert eager.height == memmap.height == all_hits.height
+    assert_frame_equal(memmap, eager, check_exact=True)
+    assert_frame_equal(memmap, chrom_major, check_exact=True)
+    assert mm_z == eager_z == cm_z
+    assert _cache_files(acc_dir) == [], "memmap wrote into the accessibility dir"
+    assert _cache_files(cache_dir) == sorted(
+        cache_paths(cache_dir, c, s)[k].name
+        for c in CHROM_LEN
+        for s in "+-"
+        for k in (0, 1)
+    )
+
+    # Default cache dir is the accessibility dir itself (on a private copy).
+    acc_copy = tmp_path / "acc_copy"
+    acc_copy.mkdir()
+    for f in acc_dir.iterdir():
+        (acc_copy / f.name).write_bytes(f.read_bytes())
+    memmap_default, _ = _run(hits_dir, acc_copy, "memmap", n_workers=1)
+    assert_frame_equal(memmap_default, eager, check_exact=True)
+    assert _cache_files(acc_copy) == _cache_files(cache_dir)
+
+
+def test_memmap_serves_a_cache_only_dir_without_parquet(hits, acc_dir, tmp_path):
+    """A complete cache in --accessibility-cache-dir needs no Parquet at all."""
+    hits_dir, _ = hits
+    cache_only = tmp_path / "cache_only"
+    assert ensure_accessibility_cache(acc_dir, cache_only, workers=2) == [
+        "chrA",
+        "chrB",
+    ]
+    no_parquet = tmp_path / "no_parquet"
+    no_parquet.mkdir()
+    eager, eager_z = _run(hits_dir, acc_dir, "eager", n_workers=2)
+    memmap, mm_z = _run(
+        hits_dir, no_parquet, "memmap", n_workers=2, cache_dir=cache_only
+    )
+    assert_frame_equal(memmap, eager, check_exact=True)
+    assert mm_z == eager_z
+    assert not list(no_parquet.iterdir())
+
+
+def test_unknown_strategy_is_rejected(hits, acc_dir):
+    hits_dir, _ = hits
+    with pytest.raises(ValueError, match="accessibility_strategy"):
+        list(_run(hits_dir, acc_dir, "lazy", n_workers=1))
+
+
+@pytest.mark.parametrize("strategy", ["eager", "memmap", "chrom-major"])
 def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path, strategy):
     """A worker failure must surface as an error, never as a silent skip."""
     hits_dir, _ = hits
@@ -222,6 +304,7 @@ def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path, strate
     gen = compute_off_targets_directory(
         input_dir=broken,
         accessibility_dir=acc_dir,
+        accessibility_cache_dir=tmp_path / "cache" if strategy == "memmap" else None,
         alpha="0.8;1",
         n_workers=2,
         accessibility_strategy=strategy,
@@ -232,6 +315,8 @@ def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path, strate
             frames.append(df)
     assert len(frames) == 5, "good siRNAs must still be yielded"
     assert "risearch_corrupt.parquet" in str(info.value)
+    assert info.value.n_failed == 1 and info.value.n_total == 6
+    assert info.value.failed_names == ["risearch_corrupt.parquet"]
 
 
 def test_failed_worker_exits_nonzero_from_cli(hits, acc_dir, tmp_path, plain):
@@ -261,4 +346,9 @@ def test_failed_worker_exits_nonzero_from_cli(hits, acc_dir, tmp_path, plain):
         ],
     )
     assert result.exit_code != 0
-    assert "1/6" in plain(result.output) and "failed" in plain(result.output)
+    text = plain(result.output)
+    assert "1/6" in text and "failed" in text and "risearch_corrupt.parquet" in text
+    assert "No predictions to process" not in text
+    # The five good siRNAs were still written before the non-zero exit.
+    out = pl.read_csv(tmp_path / "out" / "output.tsv", separator="\t")
+    assert out["sirna_id"].n_unique() == 5

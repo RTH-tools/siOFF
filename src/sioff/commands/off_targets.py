@@ -109,7 +109,7 @@ def run(
         typer.Option(
             "-a",
             "--accessibility-dir",
-            help="Directory of per-chromosome accessibility Parquet files (from 'sioff accessibility').",
+            help="Directory of per-chromosome accessibility Parquet files (from 'sioff accessibility'), or of the .access.npy cache files built from them.",
             exists=True,
             file_okay=False,
         ),
@@ -119,14 +119,33 @@ def run(
         typer.Option(
             "--accessibility-strategy",
             help=(
-                "Directory mode: how opening energies are looked up from "
-                "--accessibility-dir. 'chrom-major' streams each chromosome's "
-                "Parquet once per run for all siRNAs (memory per worker ~ one row "
-                "group); 'eager' loads whole-chromosome profiles in every worker; "
-                "'auto' (default) is chrom-major with more than one worker."
+                "How opening energies are looked up from --accessibility-dir: "
+                "'chrom-major' (directory mode) streams each chromosome's Parquet "
+                "once per run for all siRNAs, memory per worker ~ one row group, "
+                "writes nothing; 'memmap' builds a uint8 .access.npy cache per "
+                "chromosome and strand (in --accessibility-cache-dir, default the "
+                "accessibility dir) that all workers memory-map, and is the only "
+                "strategy that writes cache files; 'eager' loads whole-chromosome "
+                "profiles in every worker (small genomes only). 'auto' (default) "
+                "is chrom-major in directory mode and eager for a single file."
             ),
         ),
     ] = "auto",
+    accessibility_cache_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--accessibility-cache-dir",
+            help=(
+                "With --accessibility-strategy memmap: directory of the "
+                "<chrom>_<plus|minus>.access.npy cache, built there from the Parquet "
+                "when missing and created if absent (default: the accessibility dir "
+                "itself). Use it when the accessibility dir is read-only or to stage "
+                "the cache on local disk; it may also hold a complete cache without "
+                "any Parquet. Ignored by the other strategies."
+            ),
+            file_okay=False,
+        ),
+    ] = None,
     output_file: Annotated[
         Optional[Path],
         typer.Option(
@@ -312,6 +331,7 @@ def run(
     from loguru import logger
 
     from sioff.core.off_targets import (
+        WorkerFailureError,
         _build_alpha_gamma_pairs,
         _downcast_schema,
         _parse_theta,
@@ -329,6 +349,7 @@ def run(
     target_index = _as_path(target_index)
     gtf_file = _as_path(gtf_file)
     accessibility_dir = _as_path(accessibility_dir)
+    accessibility_cache_dir = _as_path(accessibility_cache_dir)
     output_file = _as_path(output_file)
     genome_file = _as_path(genome_file)
     on_target_file = _as_path(on_target_file)
@@ -427,6 +448,7 @@ def run(
                 expression_metric=expression_metric,
                 transcriptome_format=transcriptome_format,
                 accessibility_dir=accessibility_dir,
+                accessibility_cache_dir=accessibility_cache_dir,
                 temperature=temperature,
                 on_target_ids_file=on_target_ids_file,
                 on_target_expression=on_target_expression,
@@ -441,6 +463,7 @@ def run(
 
             _drain_stage_totals: dict[str, float] = {}
             _drain_n = 0
+            _worker_error: Optional[WorkerFailureError] = None
             # contextlib.closing guarantees the generator's pool + temp-IPC are
             # torn down even if a write below raises mid-stream.
             with contextlib.closing(gen):
@@ -511,6 +534,11 @@ def run(
                                     _drain_stage_totals.get(k, 0.0) + v
                                 )
                             _drain_n += 1
+                    except WorkerFailureError as exc:
+                        # Raised after the last successful siRNA was yielded
+                        # (or at once for a failed accessibility contig); keep
+                        # what was written and report below.
+                        _worker_error = exc
                     finally:
                         # Flush the Parquet footer (CLI owns the writer).
                         if _pq_writer is not None:
@@ -534,7 +562,7 @@ def run(
                 console.print(
                     f"[green]✓[/green] Processed [bold]{total_rows}[/bold] predictions (no output file specified)"
                 )
-            else:
+            elif _worker_error is None:
                 console.print("[yellow]Warning:[/yellow] No predictions to process")
             if summary_count > 0:
                 console.print(
@@ -542,6 +570,13 @@ def run(
                 )
 
             profiler.print_summary(console)
+            if _worker_error is not None:
+                console.print(f"[bold red]Error:[/bold red] {_worker_error}")
+                for name, err in _worker_error.failures[:10]:
+                    console.print(f"  {name}: {err}", markup=False, highlight=False)
+                if _worker_error.n_failed > 10:
+                    console.print(f"  ... and {_worker_error.n_failed - 10} more")
+                raise typer.Exit(code=1)
             return {
                 "output": out_path,
                 "n_rows": total_rows,
@@ -588,6 +623,8 @@ def run(
                 expression_metric=expression_metric,
                 transcriptome_format=transcriptome_format,
                 accessibility_dir=accessibility_dir,
+                accessibility_cache_dir=accessibility_cache_dir,
+                accessibility_strategy=accessibility_strategy,
                 genome_file=genome_file,
                 window_size=window_size,
                 max_span=max_span,
@@ -727,6 +764,8 @@ def run(
         profiler.print_summary(console)
         return df
 
+    except typer.Exit:
+        raise
     except FileNotFoundError as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)

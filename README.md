@@ -297,6 +297,26 @@ separated values, each combination adds a `P_off_target:...` column),
 config for reproducibility — [`example_yaml/off-targets.example.yaml`](example_yaml/off-targets.example.yaml)
 documents every option; run it with `sioff -c my-config.yaml`.
 
+#### Accessibility lookup strategy (large genomes)
+
+`--accessibility-strategy` selects how the opening energies are read from
+`-a` in the directory (per-siRNA batch) mode. All three give identical results:
+
+| Strategy | What it does | Memory | Writes |
+|----------|--------------|--------|--------|
+| `chrom-major` (`auto`) | Three passes: intersect every siRNA, stream each chromosome's Parquet **once** for the hits of all siRNAs, then score. | ~ one Parquet row group per worker | nothing (a temp dir under `TMPDIR`) |
+| `memmap` | Builds a uint8 `{chrom}_{plus,minus}.access.npy` cache (+ `.access.exceptions.npz` sidecar) per chromosome and strand, once, in `--accessibility-cache-dir` (default: the accessibility dir), then every worker memory-maps it: one shared page-cache copy. | the pages the hits touch; 7.5 GB per chr1 strand while building | the cache files (the only strategy that does) |
+| `eager` | The original loader: each worker reads whole chromosomes into dense float32 arrays. | 30 GB per chr1 strand **per worker** — small genomes only | nothing |
+
+`auto` is `chrom-major` whenever `-a` is given (also with `-j 1`); a single
+predictions file (`-r file`) has no chromosome-major path and uses the eager
+loader unless `memmap` is requested. `memmap` suits repeated runs against the
+same genome: the cache is reused across runs, may live on node-local disk
+(`--accessibility-cache-dir /scratch/acc_cache`), and a cache directory that is
+complete needs no Parquet at all (`-a` may then point at an empty directory).
+A failed worker never passes silently: the successful siRNAs are written, then
+`off-targets` reports `N/M siRNAs failed ...; first error: ...` and exits 1.
+
 ### Orchestrated multi-step runs (local + Slurm)
 
 `scripts/run_pipeline.py` runs all stages in dependency order from one config —
@@ -349,7 +369,9 @@ Available on `sioff` itself, before any subcommand.
 | `--target-fasta / --genome` | Target FASTA for in-process RIsearch |
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
 | `-t / --transcriptome` | GTF, GFF3, BED6 or BED7 annotation file |
-| `-a / --accessibility-dir` | Directory of per-chromosome accessibility Parquet files (from `accessibility` command) |
+| `-a / --accessibility-dir` | Directory of per-chromosome accessibility Parquet files (from `accessibility` command); with `--accessibility-strategy memmap` it may hold only the `.access.npy` cache |
+| `--accessibility-strategy` | `auto` (default), `chrom-major`, `memmap` or `eager` — see [Accessibility lookup strategy](#accessibility-lookup-strategy-large-genomes) |
+| `--accessibility-cache-dir` | `memmap` only: where the `.access.npy` cache is read from / built (default: the accessibility dir) |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
 | `--alpha / --gamma / --theta` | Parameter sweep values (semicolon-separated, e.g. `0.8;1.0`) |

@@ -67,6 +67,12 @@ def test_shipped_off_targets_example_produces_rows(off_targets_config, tmp_path)
     assert result.returncode == 0, result.stderr
     out = tmp_path / "out.tsv"
     assert out.exists(), "example config produced no output file"
+    # The default strategy never builds the memory-mapped accessibility cache,
+    # so the run must leave the shipped examples/ tree untouched.
+    acc_dir = REPO_ROOT / "examples" / "data" / "accessibility"
+    assert not [f for f in acc_dir.iterdir() if ".access." in f.name], (
+        "the example run wrote accessibility cache files into the repo tree"
+    )
 
     df = pl.read_csv(out, separator="\t")
     assert df.height > 0, (

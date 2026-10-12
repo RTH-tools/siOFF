@@ -44,6 +44,7 @@ from loguru import logger
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
+    ensure_accessibility_cache,
     gather_opening_energies,
 )
 from sioff.services.annotation_parser import AnnotationParser
@@ -74,12 +75,17 @@ def _init_worker(
     on_target_map: dict,
     self_hyb_emin: dict,
     temperature: float = 37.0,
+    accessibility_cache_dir: str = "",
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
 
     The transcriptome is loaded from a pre-written Arrow IPC file (memory-mapped)
-    rather than being re-parsed from the original BED/GTF.  All workers share the
-    same physical memory pages via the OS page cache.
+    rather than being re-parsed from the original BED/GTF, so all workers share
+    the same physical memory pages via the OS page cache. ``accessibility_dir``
+    is empty for chromosome-major runs (workers never load profiles). With
+    ``accessibility_cache_dir`` the service memory-maps the uint8 cache the
+    parent built there before starting the pool (strategy ``memmap``); without
+    it, it is the eager whole-chromosome loader (strategy ``eager``).
     """
     os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
     # pyarrow decodes Parquet row groups in the chromosome-major pass; keep its
@@ -96,7 +102,13 @@ def _init_worker(
 
     acc_service = None
     if accessibility_dir:
-        acc_service = GenomeAccessibilityService(Path(accessibility_dir), max_cached=4)
+        acc_service = GenomeAccessibilityService(
+            Path(accessibility_dir),
+            max_cached=4,
+            cache_dir=Path(accessibility_cache_dir)
+            if accessibility_cache_dir
+            else None,
+        )
 
     _WORKER_PROB_SERVICE = ProbabilityService(acc_service, temperature=temperature)
 
@@ -228,6 +240,16 @@ class WorkerFailureError(RuntimeError):
             f"{len(failures)}/{n_total} {unit} failed in {stage}; "
             f"first error: {name}: {msg}"
         )
+
+    @property
+    def n_failed(self) -> int:
+        """Number of tasks that failed."""
+        return len(self.failures)
+
+    @property
+    def failed_names(self) -> list[str]:
+        """Names (siRNA files or contigs) of the failed tasks, in completion order."""
+        return [name for name, _ in self.failures]
 
 
 # ---------------------------------------------------------------------------
@@ -740,7 +762,37 @@ def _stream_eager(
         raise WorkerFailureError("per-siRNA workers", failures, len(all_files))
 
 
-ACCESSIBILITY_STRATEGIES = ("auto", "eager", "chrom-major")
+ACCESSIBILITY_STRATEGIES = ("auto", "eager", "memmap", "chrom-major")
+
+
+def _check_strategy(accessibility_strategy: str) -> None:
+    if accessibility_strategy not in ACCESSIBILITY_STRATEGIES:
+        raise ValueError(
+            f"accessibility_strategy must be one of {ACCESSIBILITY_STRATEGIES}, "
+            f"got {accessibility_strategy!r}"
+        )
+
+
+def _memmap_cache_dir(
+    accessibility_dir: Path, accessibility_cache_dir: Optional[Path]
+) -> Path:
+    # Where the "memmap" strategy keeps its cache: the given dir or the Parquet dir.
+    return (
+        Path(accessibility_cache_dir)
+        if accessibility_cache_dir is not None
+        else Path(accessibility_dir)
+    )
+
+
+def _warn_unused_cache_dir(
+    accessibility_cache_dir: Optional[Path], accessibility_strategy: str
+) -> None:
+    if accessibility_cache_dir is not None and accessibility_strategy != "memmap":
+        logger.warning(
+            f"accessibility_cache_dir={accessibility_cache_dir} is only used by "
+            f"accessibility_strategy='memmap' (got {accessibility_strategy!r}); "
+            "ignored"
+        )
 
 
 def _build_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]]:
@@ -853,6 +905,7 @@ def compute_off_targets_single(
     transcriptome_format: str = "auto",
     accessibility: Optional[Mapping[str, pl.DataFrame]] = None,
     accessibility_dir: Optional[Path] = None,
+    accessibility_cache_dir: Optional[Path] = None,
     genome_file: Optional[Path] = None,
     window_size: int = 80,
     max_span: int = 40,
@@ -874,6 +927,7 @@ def compute_off_targets_single(
     n_workers: int = 1,
     profiler: Optional[PipelineProfiler] = None,
     accessibility_progress_callback=None,
+    accessibility_strategy: str = "auto",
 ) -> tuple[pl.DataFrame, dict]:
     """Compute off-target probabilities for one set of RIsearch predictions.
 
@@ -946,7 +1000,15 @@ def compute_off_targets_single(
     accessibility_dir : pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
         written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``).
-        Mutually exclusive with ``accessibility``.
+        With ``accessibility_strategy="memmap"`` it may instead hold only the
+        ``.access.npy`` cache files built from them. Mutually exclusive with
+        ``accessibility``.
+    accessibility_cache_dir : pathlib.Path, optional
+        ``memmap`` only: where the memory-mapped ``<chrom>_<plus|minus>.access.npy``
+        cache is read from and, when missing, built (CLI
+        ``--accessibility-cache-dir``). Created if absent. Default:
+        ``accessibility_dir`` itself. Ignored (with a warning) by the other
+        strategies.
     genome_file : pathlib.Path, optional
         Genome FASTA to fold on the fly when no pre-computed profiles are
         supplied (CLI ``-f/--fasta``). Profiles are written to a temporary
@@ -1018,6 +1080,14 @@ def compute_off_targets_single(
     accessibility_progress_callback : callable, optional
         Called as ``callback(advance=1, description=str)`` after each
         chromosome is folded on the fly; only used with ``genome_file``.
+    accessibility_strategy : {"auto", "eager", "memmap", "chrom-major"}, default "auto"
+        How profiles in ``accessibility_dir`` are served (CLI
+        ``--accessibility-strategy``). ``"memmap"`` memory-maps the uint8
+        cache (see `sioff.services.accessibility.build_accessibility_cache`),
+        building it in ``accessibility_cache_dir`` when missing; every other
+        value loads whole-chromosome Parquet files into dense float32 arrays
+        and never writes cache files (the chromosome-major path exists only in
+        `compute_off_targets_directory`). Ignored without ``accessibility_dir``.
 
     Returns
     -------
@@ -1047,6 +1117,7 @@ def compute_off_targets_single(
         ``accessibility`` and ``accessibility_dir`` are given; when none of
         ``predictions``, ``risearch_file`` or ``sirna_fasta`` is given; when
         ``sirna_fasta`` is given without ``target_fasta``; when
+        ``accessibility_strategy`` is not one of the four values; when
         ``on_target_ids_file`` cannot be parsed. Also propagated when
         ``predictions`` lacks a required column or ``sirna_fasta`` contains
         duplicate IDs.
@@ -1061,6 +1132,7 @@ def compute_off_targets_single(
     """
     profiler = profiler if profiler is not None else PipelineProfiler(enabled=False)
     risearch_parser = RIsearchParser()
+    _check_strategy(accessibility_strategy)
 
     if predictions is not None and risearch_file is not None:
         raise ValueError(
@@ -1235,7 +1307,18 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
-        acc_service = GenomeAccessibilityService(Path(accessibility_dir), max_cached=4)
+        # "memmap" serves the shared uint8 cache (built on first use when it is
+        # missing); every other strategy is the eager whole-chromosome loader
+        # and never writes cache files.
+        _warn_unused_cache_dir(accessibility_cache_dir, accessibility_strategy)
+        cache_dir = (
+            _memmap_cache_dir(Path(accessibility_dir), accessibility_cache_dir)
+            if accessibility_strategy == "memmap"
+            else None
+        )
+        acc_service = GenomeAccessibilityService(
+            Path(accessibility_dir), max_cached=4, cache_dir=cache_dir
+        )
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif genome_file:
@@ -1270,6 +1353,7 @@ def compute_off_targets_directory(
     expression_metric: str = "RPKM",
     transcriptome_format: str = "auto",
     accessibility_dir: Optional[Path] = None,
+    accessibility_cache_dir: Optional[Path] = None,
     temperature: float = 37.0,
     on_target_ids_file: Optional[Path] = None,
     on_target_expression: float = 1000.0,
@@ -1295,17 +1379,27 @@ def compute_off_targets_directory(
     Heavy intermediate columns (``boltzmann_weight*``, ``Z_sirna*``, ``E_min``)
     are dropped from the yielded frames.
 
-    With ``accessibility_dir`` and more than one worker (``"auto"``), or with
-    ``accessibility_strategy="chrom-major"``, opening energies are gathered
-    chromosome-major: pass 1 loads and intersects every siRNA into a run temp
-    directory (under ``TMPDIR``), pass 2 streams each accessibility Parquet
-    once, row group by row group, for the hits of all siRNAs, and pass 3
-    scores each siRNA with the precomputed column. Peak memory per worker is
-    about one Parquet row group instead of a dense per-chromosome profile
-    (30 GB for chr1), and the genome is read once per run rather than once
-    per worker. ``"eager"`` keeps the per-worker loader (fine for small
-    genomes; it is what a single worker uses under ``"auto"``). Results are
-    identical either way.
+    Three strategies serve ``accessibility_dir`` (results are identical):
+
+    - ``"chrom-major"`` (what ``"auto"`` picks whenever ``accessibility_dir``
+      is given, at any worker count): pass 1 loads and intersects every siRNA
+      into a run temp directory (under ``TMPDIR``), pass 2 streams each
+      accessibility Parquet once, row group by row group, for the hits of all
+      siRNAs, and pass 3 scores each siRNA with the precomputed column. Peak
+      memory per worker is about one Parquet row group instead of a dense
+      per-chromosome profile (30 GB for chr1), the genome is read once per run
+      rather than once per worker, and nothing is written next to the Parquet.
+    - ``"memmap"``: the parent first builds, for every Parquet contig that
+      lacks one, the uint8 ``<chrom>_<plus|minus>.access.npy`` cache (plus its
+      exceptions sidecar) in ``accessibility_cache_dir`` with
+      `sioff.services.accessibility.ensure_accessibility_cache`; each worker
+      then memory-maps those files, so the OS page cache holds one shared copy
+      and a worker's resident set is the pages its hits touch. The only
+      strategy that writes cache files; an ``accessibility_dir`` (or cache
+      dir) holding only the cache files, without Parquet, works too.
+    - ``"eager"``: the per-worker whole-chromosome loader (a dense float32
+      profile per chromosome and strand in every worker; fine for small
+      genomes, hopeless on hg38).
 
     The process pool and the temporary Arrow-IPC copy of the transcriptome
     (memory-mapped by every worker) are held open across yields and cleaned up
@@ -1339,8 +1433,17 @@ def compute_off_targets_directory(
         ``"bed7"`` (CLI ``--transcriptome-format``).
     accessibility_dir : pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``).
-        Without it, opening energies are treated as zero.
+        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``);
+        with ``"memmap"`` it may instead hold only the ``.access.npy`` cache
+        files built from them. Without it, opening energies are treated as
+        zero.
+    accessibility_cache_dir : pathlib.Path, optional
+        ``memmap`` only: where the memory-mapped ``<chrom>_<plus|minus>.access.npy``
+        cache lives (CLI ``--accessibility-cache-dir``); created if absent.
+        Every contig that has a Parquet but no cache is built here, in the
+        parent, before the worker pool starts (``min(n_workers, 4)`` build
+        processes, one strand's cache in memory each). Default:
+        ``accessibility_dir``. Ignored (with a warning) by the other strategies.
     temperature : float, default 37.0
         Temperature in degrees Celsius for the partition function (CLI
         ``-T/--temperature``).
@@ -1370,10 +1473,10 @@ def compute_off_targets_directory(
         Number of worker processes (CLI ``-j/--workers``), capped at the number
         of input files. Polars threads per worker are set to
         ``n_workers // n_processes`` so the total stays within the budget.
-    accessibility_strategy : {"auto", "eager", "chrom-major"}, default "auto"
+    accessibility_strategy : {"auto", "eager", "memmap", "chrom-major"}, default "auto"
         How opening energies are looked up when ``accessibility_dir`` is given
-        (CLI ``--accessibility-strategy``); see above. Ignored without
-        ``accessibility_dir``.
+        (CLI ``--accessibility-strategy``); see above. ``"auto"`` is
+        ``"chrom-major"``. Ignored without ``accessibility_dir``.
 
     Yields
     ------
@@ -1395,10 +1498,13 @@ def compute_off_targets_directory(
     FileNotFoundError
         When ``input_dir`` contains no RIsearch prediction files.
     ValueError
-        When ``accessibility_strategy`` is not one of the three values.
+        When ``accessibility_strategy`` is not one of the four values.
     WorkerFailureError
         After the last successful siRNA, when any worker task failed; at once
         when a chromosome-major accessibility pass fails.
+    AccessibilityError
+        When the ``memmap`` cache cannot be built (unreadable Parquet,
+        unwritable cache directory).
 
     See Also
     --------
@@ -1406,20 +1512,25 @@ def compute_off_targets_directory(
         is a directory.
     compute_off_targets_single : Single-source variant with the full option set.
     """
-    if accessibility_strategy not in ACCESSIBILITY_STRATEGIES:
-        raise ValueError(
-            f"accessibility_strategy must be one of {ACCESSIBILITY_STRATEGIES}, "
-            f"got {accessibility_strategy!r}"
-        )
+    _check_strategy(accessibility_strategy)
     input_dir = Path(input_dir)
     risearch_parser = RIsearchParser()
     all_files = risearch_parser.list_directory_files(input_dir)
     if not all_files:
         raise FileNotFoundError(f"No RIsearch files found in {input_dir}")
-    chrom_major = accessibility_dir is not None and (
-        accessibility_strategy == "chrom-major"
-        or (accessibility_strategy == "auto" and n_workers > 1)
-    )
+    # Resolve "auto": chromosome-major whenever profiles come from a directory
+    # (also with one worker; the eager loader cannot hold a human chromosome).
+    strategy = "none" if accessibility_dir is None else accessibility_strategy
+    if strategy == "auto":
+        strategy = "chrom-major"
+    _warn_unused_cache_dir(accessibility_cache_dir, strategy)
+    chrom_major = strategy == "chrom-major"
+    # Only "memmap" ever builds cache files; the workers' service is the eager
+    # loader when cache_dir is None and the memory-mapped cache otherwise.
+    cache_dir: Optional[Path] = None
+    if strategy == "memmap":
+        assert accessibility_dir is not None
+        cache_dir = _memmap_cache_dir(Path(accessibility_dir), accessibility_cache_dir)
 
     # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
     # it instead of re-parsing the BED/GTF. Workers share pages via the OS cache.
@@ -1452,6 +1563,22 @@ def compute_off_targets_directory(
     if sirna_fasta is not None:
         self_hyb_emin = RIsearchService().self_hybridization_emin_batch(sirna_fasta)
 
+    # memmap: build the accessibility cache once, here, so workers only ever
+    # map finished files (and never each decode a whole chromosome).
+    if cache_dir is not None:
+        assert accessibility_dir is not None
+        _t0 = time.perf_counter()
+        built = ensure_accessibility_cache(
+            Path(accessibility_dir), cache_dir, workers=n_workers
+        )
+        if built:
+            logger.info(
+                f"[memmap] built accessibility cache for {len(built)} contig(s) "
+                f"in {cache_dir} in {time.perf_counter() - _t0:.1f}s"
+            )
+        else:
+            logger.info(f"[memmap] accessibility cache in {cache_dir} is complete")
+
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
     theta_vals = _parse_theta(theta)
 
@@ -1476,6 +1603,7 @@ def compute_off_targets_directory(
         on_target_map,
         self_hyb_emin,
         temperature,
+        str(cache_dir) if cache_dir is not None else "",
     )
 
     _run_tmp: Optional[str] = None
