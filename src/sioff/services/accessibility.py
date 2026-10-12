@@ -521,3 +521,186 @@ class GenomeAccessibilityService:
         return df.with_columns(
             pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
         )
+
+
+# ---------------------------------------------------------------------------
+# Streaming gather: one contig Parquet, read row group by row group.
+# ---------------------------------------------------------------------------
+_OUT_OF_BOUNDS_ENERGY = (
+    10.0  # the `np.full` default of annotate_opening_energy_vectorized
+)
+_MISSING_POSITION_ENERGY = 25.5  # the `np.full` default of _ensure_profile
+
+
+def _row_group_layout(pf: pq.ParquetFile) -> list[tuple[int, str, int, int, bool]]:
+    """Describe each row group as ``(index, strand, pos_min, pos_max, mixed)``.
+
+    Taken from the Parquet column statistics when they are present and the
+    row group holds a single strand (what ``_fold_full_chromosome`` writes);
+    otherwise the two key columns of that row group are read (cheap: ~5 B/row)
+    and a mixed-strand row group yields one entry per strand with
+    ``mixed=True`` so the reader masks rows by strand.
+    """
+    md = pf.metadata
+    names = pf.schema_arrow.names
+    i_pos = names.index("position")
+    i_strand = names.index("strand")
+    layout: list[tuple[int, str, int, int, bool]] = []
+    for rg in range(md.num_row_groups):
+        rgm = md.row_group(rg)
+        if rgm.num_rows == 0:
+            continue
+        ps = rgm.column(i_pos).statistics
+        ss = rgm.column(i_strand).statistics
+        if (
+            ps is not None
+            and ps.has_min_max
+            and ss is not None
+            and ss.has_min_max
+            and ss.min == ss.max
+        ):
+            strand = ss.min.decode() if isinstance(ss.min, bytes) else str(ss.min)
+            layout.append((rg, strand, int(ps.min), int(ps.max), False))
+            continue
+        tbl = pf.read_row_group(rg, columns=["position", "strand"])
+        pos = tbl.column("position").to_numpy()
+        strands = tbl.column("strand").to_numpy(zero_copy_only=False)
+        uniq = np.unique(strands)
+        for strand in uniq:
+            m = strands == strand if len(uniq) > 1 else slice(None)
+            p = pos[m]
+            layout.append((rg, str(strand), int(p.min()), int(p.max()), len(uniq) > 1))
+    return layout
+
+
+def gather_opening_energies(
+    parquet_path: Path,
+    strands: np.ndarray,
+    starts: np.ndarray,
+    ends: np.ndarray,
+) -> tuple[np.ndarray, dict]:
+    """Opening energies for hits on one contig, streamed from its Parquet file.
+
+    Bit-for-bit equivalent to ``annotate_opening_energy_vectorized`` restricted
+    to one contig, but never materialises the dense ``[max_pos, u]`` profile:
+    the needed positions are sorted, the row-group statistics select the row
+    groups that hold them, and each of those is read once with only the ``u``
+    columns the hits in it need (peak memory ~ one row group).
+
+    Parameters
+    ----------
+    parquet_path : pathlib.Path
+        ``{chrom}.accessibility.parquet`` written by ``sioff accessibility``.
+    strands : numpy.ndarray
+        ``'+'``/``'-'`` per hit (any array comparable to those strings).
+    starts, ends : numpy.ndarray
+        1-based inclusive RIsearch coordinates per hit.
+
+    Returns
+    -------
+    tuple[numpy.ndarray, dict]
+        ``energies`` (float32, one per hit, quantised to 0.1; 10.0 when out of
+        bounds or when the strand has no rows; 25.5 when the position is absent
+        from the file) and ``stats`` with ``row_groups_total``,
+        ``row_groups_read``, ``bytes_read`` (compressed column-chunk bytes
+        actually read) and ``bytes_file`` (all column chunks of the file).
+    """
+    pf = pq.ParquetFile(parquet_path)
+    md = pf.metadata
+    names = pf.schema_arrow.names
+    u_cols = sorted(
+        [c for c in names if c.startswith("u") and c[1:].isdigit()],
+        key=lambda x: int(x[1:]),
+    )
+    n_u = len(u_cols)
+    col_index = {c: names.index(c) for c in names}
+    layout = _row_group_layout(pf)
+
+    stats = {
+        "row_groups_total": md.num_row_groups,
+        "row_groups_read": 0,
+        "bytes_read": 0,
+        "bytes_file": sum(
+            md.row_group(rg).column(c).total_compressed_size
+            for rg in range(md.num_row_groups)
+            for c in range(md.num_columns)
+        ),
+    }
+
+    starts = np.asarray(starts).astype(np.int64)
+    ends = np.asarray(ends).astype(np.int64)
+    strands = np.asarray(strands)
+    out = np.full(len(starts), _OUT_OF_BOUNDS_ENERGY, dtype=np.float32)
+
+    for strand in ("+", "-"):
+        sel = np.flatnonzero(strands == strand)
+        if sel.size == 0:
+            continue
+        rgs = [e for e in layout if e[1] == strand]
+        if not rgs:
+            # The eager path raises "No data for strand" and skips the group.
+            continue
+        seq_len = max(e[3] for e in rgs)
+
+        # Same arithmetic as annotate_opening_energy_vectorized.
+        s = starts[sel]
+        e = ends[sel]
+        start0 = s - 1
+        end0 = e
+        interaction_len = end0 - start0
+        in_bounds = (start0 >= 0) & (end0 <= seq_len)
+        col_idx = np.minimum(interaction_len, n_u) - 1
+        col_idx = np.maximum(col_idx, 0)
+        row_idx = end0 - 1 if strand == "+" else start0
+        row_idx = np.clip(row_idx, 0, seq_len - 1)
+
+        ib = np.flatnonzero(in_bounds)
+        vals = np.full(ib.size, _MISSING_POSITION_ENERGY, dtype=np.float32)
+        want_pos = row_idx[ib] + 1  # back to the file's 1-based positions
+        want_col = col_idx[ib]
+        order = np.argsort(want_pos, kind="stable")
+        sorted_pos = want_pos[order]
+
+        for rg, _, pos_min, pos_max, mixed in rgs:
+            lo = int(np.searchsorted(sorted_pos, pos_min, side="left"))
+            hi = int(np.searchsorted(sorted_pos, pos_max, side="right"))
+            if lo == hi:
+                continue
+            sub = order[lo:hi]
+            cols_needed = np.unique(want_col[sub])
+            read_cols = ["position"] + (["strand"] if mixed else [])
+            read_cols += [u_cols[int(c)] for c in cols_needed]
+            tbl = pf.read_row_group(rg, columns=read_cols)
+            rgm = md.row_group(rg)
+            stats["row_groups_read"] += 1
+            stats["bytes_read"] += sum(
+                rgm.column(col_index[c]).total_compressed_size for c in read_cols
+            )
+
+            pos = tbl.column("position").to_numpy()
+            mask = None
+            if mixed:
+                mask = tbl.column("strand").to_numpy(zero_copy_only=False) == strand
+                pos = pos[mask]
+            reorder = None
+            if pos.size > 1 and not np.all(pos[1:] >= pos[:-1]):
+                reorder = np.argsort(pos, kind="stable")
+                pos = pos[reorder]
+
+            j = np.searchsorted(pos, sorted_pos[lo:hi], side="right") - 1
+            hit = (j >= 0) & (pos[np.maximum(j, 0)] == sorted_pos[lo:hi])
+            sub_cols = want_col[sub]
+            for c in cols_needed:
+                arr = tbl.column(u_cols[int(c)]).to_numpy()
+                if mask is not None:
+                    arr = arr[mask]
+                if reorder is not None:
+                    arr = arr[reorder]
+                m = hit & (sub_cols == c)
+                vals[sub[m]] = arr[j[m]]
+
+        # Quantize to 0.1 resolution (match legacy query_single behaviour)
+        vals = (np.round(vals * 10.0) / 10.0).astype(np.float32)
+        out[sel[ib]] = vals
+
+    return out, stats
