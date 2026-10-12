@@ -51,6 +51,17 @@ def off_targets_config(tmp_path: Path) -> Path:
         "the example config's output key changed shape"
     )
 
+    # The memory-mapped accessibility cache is built next to the Parquet by
+    # default, which here would be the repo's examples/ tree; send it to tmp_path.
+    text, redirected = re.subn(
+        r"(?m)^(\s*)accessibility_dir:(.*)$",
+        lambda m: (
+            f"{m.group(0)}\n{m.group(1)}accessibility_cache_dir: {tmp_path / 'acc_cache'}"
+        ),
+        text,
+    )
+    assert redirected == 1, "expected exactly one accessibility_dir key in the example"
+
     config = tmp_path / "off-targets.yaml"
     config.write_text(text)
     return config

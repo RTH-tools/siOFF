@@ -213,6 +213,7 @@ __marimo__/
 *.tsv
 *.gz
 *.npy
+*.access.exceptions.npz
 
 # Pipeline run logs
 logs/

@@ -55,8 +55,14 @@ off_targets:
   # ---------------------------------------------------------------------------
 
   # Directory of per-chromosome accessibility Parquet files produced by the
-  # "sioff accessibility" command ({chrom}.accessibility.parquet).
+  # "sioff accessibility" command ({chrom}.accessibility.parquet), or of the
+  # memory-mapped {chrom}_{plus,minus}.access.npy cache built from them.
   accessibility_dir: ../examples/data/accessibility
+
+  # Where that cache is read from and, when missing, built (created if absent).
+  # Defaults to accessibility_dir itself; set it when the accessibility
+  # directory is read-only or to stage the cache on node-local disk.
+  # accessibility_cache_dir: ./accessibility_cache
 
   # FASTA file for computing accessibility on-the-fly via ViennaRNA.
   # Slower than pre-computed profiles; uses window/span/unpaired parameters below.
