@@ -188,7 +188,9 @@ def test_cache_build_equals_eager_array(parquet_dir: Path, eager) -> None:
             side = np.load(exceptions)
             over = np.flatnonzero(dense.ravel() > 25.5)
             np.testing.assert_array_equal(side["index"], over)
-            np.testing.assert_array_equal(_bits(side["value"]), _bits(dense.ravel()[over]))
+            np.testing.assert_array_equal(
+                _bits(side["value"]), _bits(dense.ravel()[over])
+            )
 
 
 def test_cache_build_is_idempotent_and_can_be_restricted(parquet_dir: Path) -> None:
