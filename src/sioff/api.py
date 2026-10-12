@@ -103,6 +103,7 @@ def off_targets(
     sense_only: bool = False,
     predictions_type: str = "gw",
     n_workers: int = 1,
+    accessibility_strategy: str = "auto",
 ) -> Union[pl.DataFrame, Iterator[pl.DataFrame]]:
     """Analyse siRNA off-target predictions, returning results in memory.
 
@@ -260,6 +261,14 @@ def off_targets(
         single-frame forms, and the number of spawned worker processes (one
         siRNA file at a time each) for the directory form. CLI:
         ``-j/--workers``, whose default is the CPU count.
+    accessibility_strategy : {"auto", "eager", "chrom-major"}, default "auto"
+        Directory form only: how opening energies are looked up from
+        ``accessibility_dir``. ``"chrom-major"`` streams each chromosome's
+        Parquet once per run for the hits of every siRNA, so memory per worker
+        stays about one Parquet row group; ``"eager"`` loads whole-chromosome
+        profiles in every worker (30 GB per chr1 strand on hg38); ``"auto"``
+        is chromosome-major with more than one worker. Results are identical.
+        CLI: ``--accessibility-strategy``.
 
     Returns
     -------
@@ -354,6 +363,7 @@ def off_targets(
             sense_only=sense_only,
             predictions_type=predictions_type,
             n_workers=n_workers,
+            accessibility_strategy=accessibility_strategy,
         )
         # Yield bare per-siRNA DataFrames (the core yields (df, meta) tuples).
         # Closing this generator propagates GeneratorExit to core_gen, tearing

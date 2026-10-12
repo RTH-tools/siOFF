@@ -114,6 +114,19 @@ def run(
             file_okay=False,
         ),
     ] = None,
+    accessibility_strategy: Annotated[
+        str,
+        typer.Option(
+            "--accessibility-strategy",
+            help=(
+                "Directory mode: how opening energies are looked up from "
+                "--accessibility-dir. 'chrom-major' streams each chromosome's "
+                "Parquet once per run for all siRNAs (memory per worker ~ one row "
+                "group); 'eager' loads whole-chromosome profiles in every worker; "
+                "'auto' (default) is chrom-major with more than one worker."
+            ),
+        ),
+    ] = "auto",
     output_file: Annotated[
         Optional[Path],
         typer.Option(
@@ -423,6 +436,7 @@ def run(
                 sense_only=sense_only,
                 predictions_type=predictions_type,
                 n_workers=n_workers,
+                accessibility_strategy=accessibility_strategy,
             )
 
             _drain_stage_totals: dict[str, float] = {}
