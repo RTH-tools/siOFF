@@ -10,7 +10,6 @@ from typing import Dict, Mapping, Optional, Union, cast
 import numpy as np
 import polars as pl
 import pyarrow as pa
-import pyarrow.compute as pc
 import pyarrow.parquet as pq
 import RNA
 from loguru import logger
@@ -372,10 +371,11 @@ def _strand_row_groups(pf: pq.ParquetFile, strand: str) -> tuple[list[int], int]
             scan.append(i)
     for i in scan:
         t = pf.read_row_group(i, columns=["position", "strand"])
-        here = pc.filter(t.column("position"), pc.equal(t.column("strand"), strand))
-        m = pc.max(here).as_py() if len(here) else None
-        if m is not None:
-            max_pos = max(max_pos, int(m))
+        here = t.column("position").to_numpy()[
+            t.column("strand").to_numpy(zero_copy_only=False) == strand
+        ]
+        if here.size:
+            max_pos = max(max_pos, int(here.max()))
     return row_groups, max_pos
 
 
@@ -416,9 +416,7 @@ def _build_strand(
             columns=["position", "strand", *u_cols],
         )
         for batch in batches:
-            mask = pc.equal(batch.column("strand"), strand).to_numpy(
-                zero_copy_only=False
-            )
+            mask = batch.column("strand").to_numpy(zero_copy_only=False) == strand
             if not mask.any():
                 continue
             pos0 = batch.column("position").to_numpy().astype(np.int64) - 1
