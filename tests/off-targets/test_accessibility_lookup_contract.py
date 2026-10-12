@@ -332,3 +332,60 @@ def test_on_target_opening_energy_matches_rnaplfold(folded, tmp_path, source, st
         assert dg_open == pytest.approx(_oracle(folded, strand, s, e), abs=tol), (
             f"{source} {strand} [{s},{e}]"
         )
+
+
+# --------------------------------------------------------------------------
+# Guard: site_cells takes the minus profile's length as the contig length, so
+# a profile whose two strands disagree in length must be reported, not used
+# silently.
+# --------------------------------------------------------------------------
+
+
+@pytest.fixture
+def warnings_seen():
+    from loguru import logger
+
+    seen: list[str] = []
+    handler = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    yield seen
+    logger.remove(handler)
+
+
+@pytest.fixture
+def truncated(tmp_path):
+    """The synthetic profile with the last minus-strand position missing."""
+    rows = []
+    for strand, n in (("+", N), ("-", N - 1)):
+        for p in range(1, n + 1):
+            rows.append([p, strand] + [_cell(strand, p, u) for u in range(1, N_U + 1)])
+    df = pl.DataFrame(
+        rows,
+        schema={"position": pl.Int32, "strand": pl.Utf8}
+        | {f"u{u}": pl.Float32 for u in range(1, N_U + 1)},
+        orient="row",
+    )
+    pdir = tmp_path / "acc_trunc"
+    pdir.mkdir()
+    ppath = pdir / f"{CHROM}.accessibility.parquet"
+    df.write_parquet(ppath)
+    return pdir, ppath, tmp_path / "cache_trunc"
+
+
+def _length_warnings(seen):
+    return [m for m in seen if CHROM in m and "'+' covers" in m]
+
+
+@pytest.mark.parametrize("path", list(PATHS))
+def test_unequal_strand_lengths_are_reported(truncated, warnings_seen, path):
+    pdir, ppath, cdir = truncated
+    PATHS[path](pdir, ppath, cdir, [("-", 3, 7)])
+    hits = _length_warnings(warnings_seen)
+    assert hits, f"{path}: no warning for a minus strand shorter than the plus strand"
+    assert f"'+' covers {N} positions but '-' covers {N - 1}" in hits[0]
+
+
+@pytest.mark.parametrize("path", list(PATHS))
+def test_complete_profile_raises_no_length_warning(synthetic, warnings_seen, path):
+    pdir, ppath, cdir = synthetic
+    PATHS[path](pdir, ppath, cdir, [("-", 3, 7), ("+", 3, 7)])
+    assert not _length_warnings(warnings_seen)

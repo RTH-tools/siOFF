@@ -75,6 +75,32 @@ def site_cells(
     return rows, cols, in_bounds
 
 
+def check_strand_lengths(
+    chrom: str, plus_len: Optional[int], minus_len: Optional[int], source: str
+) -> bool:
+    """Warn when a contig's two strand profiles have different lengths.
+
+    `site_cells` maps a minus-strand hit to row ``N - s`` using the minus
+    profile's length as the contig length ``N``. That holds because the writer
+    emits every position of both strands; a profile that lost positions at an
+    end (truncated or hand-edited Parquet, a future writer change) would shift
+    every minus-strand lookup on the contig without any other symptom. Both
+    strands of one contig must have the same length, so a mismatch is the
+    cheapest observable sign of that. Unknown lengths (``None``) are skipped.
+
+    Returns ``True`` when the lengths agree or cannot be compared.
+    """
+    if plus_len is None or minus_len is None or plus_len == minus_len:
+        return True
+    logger.warning(
+        f"Accessibility profile for {chrom} ({source}): '+' covers {plus_len} "
+        f"positions but '-' covers {minus_len}. Minus-strand opening energies are "
+        "looked up relative to the contig length, so they are unreliable for this "
+        "contig; regenerate the profile with `sioff accessibility`."
+    )
+    return False
+
+
 def fold_sequence(
     sequence: str,
     window_size: int = 80,
@@ -462,10 +488,27 @@ def build_accessibility_cache(
     u_cols = _u_columns(pf.schema_arrow.names)
     if not u_cols:
         raise AccessibilityError(f"{parquet_path} has no u1..uN columns")
-    return {
+    built = {
         strand: _build_strand(pf, chrom, strand, u_cols, cache_dir, batch_rows)
         for strand in ("+", "-")
     }
+    check_strand_lengths(
+        chrom,
+        int(np.load(built["+"], mmap_mode="r").shape[0]),
+        int(np.load(built["-"], mmap_mode="r").shape[0]),
+        str(parquet_path),
+    )
+    return built
+
+
+def _layout_strand_lengths(
+    layout: list[tuple[int, str, int, int, bool]],
+) -> tuple[Optional[int], Optional[int]]:
+    """``(plus, minus)`` maximum positions from a `_row_group_layout`."""
+    lens: dict[str, int] = {}
+    for _, strand, _, pos_max, _ in layout:
+        lens[strand] = max(lens.get(strand, 0), int(pos_max))
+    return lens.get("+"), lens.get("-")
 
 
 def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
@@ -689,6 +732,7 @@ class GenomeAccessibilityService:
         self._frames: Mapping[str, pl.DataFrame] = frames if frames is not None else {}
         self._max_cached = max_cached
         self._profiles: OrderedDict[str, _Profile] = OrderedDict()
+        self._strands_checked: set[str] = set()
 
     def _require_dir(self) -> Path:
         """The Parquet directory; a frame-backed service has none."""
@@ -965,12 +1009,48 @@ class GenomeAccessibilityService:
 
         self._profiles[profile_key] = profile
         logger.info(f"Loaded accessibility profile for {chrom} {strand} from {source}")
+        if chrom not in self._strands_checked:
+            self._strands_checked.add(chrom)
+            check_strand_lengths(chrom, *self._strand_lengths(chrom), source)
 
         while len(self._profiles) > self._max_cached:
             evicted_key, _ = self._profiles.popitem(last=False)
             logger.debug(f"Evicted profile cache entry: {evicted_key}")
 
         return profile_key
+
+    def _strand_lengths(self, chrom: str) -> tuple[Optional[int], Optional[int]]:
+        """``(plus, minus)`` profile lengths from the cheapest available source.
+
+        In-memory frames: a group-by on ``position``. Parquet: row-group
+        statistics (no data read). Cache: the ``.npy`` headers. Any failure
+        yields ``None`` for that strand: this feeds a warning only and must
+        never break a lookup.
+        """
+        try:
+            if chrom in self._frames:
+                agg = (
+                    self._frames[chrom].group_by("strand").agg(pl.col("position").max())
+                )
+                lens = dict(zip(agg["strand"].to_list(), agg["position"].to_list()))
+                return lens.get("+"), lens.get("-")
+            if self.cache_dir is not None:
+                out: list[Optional[int]] = []
+                for strand in ("+", "-"):
+                    npy = cache_paths(self.cache_dir, chrom, strand)[0]
+                    out.append(
+                        int(np.load(npy, mmap_mode="r").shape[0])
+                        if npy.is_file()
+                        else None
+                    )
+                return out[0], out[1]
+            path = self._find_profile(chrom)
+            if path is None:
+                return None, None
+            return _layout_strand_lengths(_row_group_layout(pq.ParquetFile(path)))
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            logger.debug(f"could not determine strand lengths for {chrom}: {exc}")
+            return None, None
 
     def query(self, chrom: str, start: int, end: int, strand: str = "+") -> np.ndarray:
         """Return profile rows ``[start, end)`` (0-based, half-open) of one strand.
@@ -1160,6 +1240,9 @@ def gather_opening_energies(
     n_u = len(u_cols)
     col_index = {c: names.index(c) for c in names}
     layout = _row_group_layout(pf)
+    check_strand_lengths(
+        _chrom_of(parquet_path), *_layout_strand_lengths(layout), str(parquet_path)
+    )
 
     stats = {
         "row_groups_total": md.num_row_groups,
