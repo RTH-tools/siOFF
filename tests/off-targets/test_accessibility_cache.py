@@ -301,3 +301,71 @@ def test_build_is_atomic(parquet_dir: Path) -> None:
     ensure_accessibility_cache(parquet_dir, parquet_dir)
     leftovers = [f for f in os.listdir(parquet_dir) if ".tmp" in f]
     assert leftovers == []
+
+
+# --- the option reaches both public forms --------------------------------------
+
+
+def _rounded_profiles() -> dict[str, pl.DataFrame]:
+    """sioff.accessibility profiles rounded to 0.1, as the Parquet writer does."""
+    import sioff
+
+    profiles = sioff.accessibility(
+        Path(__file__).parent / "data" / "genome.fa",
+        window_size=40,
+        max_span=20,
+        unpaired_prob=10,
+    )
+    return {
+        chrom: frame.with_columns(
+            [
+                ((pl.col(c) * 10.0).round(0) / 10.0).cast(pl.Float32)
+                for c in frame.columns
+                if c.startswith("u")
+            ]
+        )
+        for chrom, frame in profiles.items()
+    }
+
+
+def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
+    import sioff
+
+    profiles = _rounded_profiles()
+    acc_dir = tmp_path / "acc"
+    acc_dir.mkdir()
+    for chrom, frame in profiles.items():
+        frame.write_parquet(acc_dir / f"{chrom}.accessibility.parquet")
+    predictions = Path(__file__).parent / "data" / "risearch_genome_example.out"
+
+    from_frames = sioff.off_targets(risearch_file=predictions, accessibility=profiles)
+
+    cache_dir = tmp_path / "cache"
+    single = sioff.off_targets(
+        risearch_file=predictions,
+        accessibility_dir=acc_dir,
+        accessibility_cache_dir=cache_dir,
+    )
+    assert isinstance(single, pl.DataFrame)
+    assert single.sort(single.columns).equals(from_frames.sort(from_frames.columns))
+    assert cache_paths(cache_dir, "chr1", "+")[0].exists()
+    assert not list(acc_dir.glob("*.npy")), "cache written into the Parquet dir"
+
+    # Directory form: the cache is built up front, before the pool starts.
+    in_dir = tmp_path / "in"
+    in_dir.mkdir()
+    (in_dir / predictions.name).write_bytes(predictions.read_bytes())
+    cache_dir2 = tmp_path / "cache2"
+    gen = sioff.off_targets(
+        risearch_file=in_dir,
+        accessibility_dir=acc_dir,
+        accessibility_cache_dir=cache_dir2,
+        n_workers=1,
+    )
+    first = next(gen)
+    assert cache_paths(cache_dir2, "chr1", "-")[0].exists()
+    frames = [first, *gen]
+    assert len(frames) == 1
+    batch = frames[0]
+    common = [c for c in single.columns if c in batch.columns]
+    assert batch.select(common).sort(common).equals(single.select(common).sort(common))

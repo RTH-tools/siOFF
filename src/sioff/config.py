@@ -19,6 +19,7 @@ class OffTargetsConfig:
     feature: str = "exon"
     expression_metric: str = "RPKM"
     accessibility_dir: Optional[str] = None
+    accessibility_cache_dir: Optional[str] = None
     output: Optional[str] = None
     fasta: Optional[str] = None
     window: int = 80
@@ -85,6 +86,7 @@ def _resolve_paths(cfg: DictConfig, base_dir: Path) -> DictConfig:
             "risearch_file",
             "transcriptome",
             "accessibility_dir",
+            "accessibility_cache_dir",
             "output",
             "fasta",
             "on_target",
@@ -120,6 +122,7 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
         "risearch_file",
         "transcriptome",
         "accessibility_dir",
+        "accessibility_cache_dir",
         "output",
         "fasta",
         "on_target",

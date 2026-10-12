@@ -86,6 +86,7 @@ def off_targets(
     transcriptome_format: str = "auto",
     accessibility: Optional[Mapping[str, pl.DataFrame]] = None,
     accessibility_dir: Optional[Union[str, Path]] = None,
+    accessibility_cache_dir: Optional[Union[str, Path]] = None,
     genome_file: Optional[Union[str, Path]] = None,
     window_size: int = 80,
     max_span: int = 40,
@@ -186,8 +187,15 @@ def off_targets(
         only; mutually exclusive with ``accessibility_dir``. No CLI equivalent.
     accessibility_dir : str or pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility``. The only accessibility source the
-        directory form accepts. CLI: ``-a/--accessibility-dir``.
+        written by ``sioff accessibility``, or of the ``.access.npy`` cache
+        files built from them. The only accessibility source the directory
+        form accepts. CLI: ``-a/--accessibility-dir``.
+    accessibility_cache_dir : str or pathlib.Path, optional
+        Directory of the memory-mapped ``<chrom>_<plus|minus>.access.npy``
+        accessibility cache, built there from the Parquet when missing and
+        created if absent; the directory form builds every missing contig
+        before its workers start. Default: ``accessibility_dir`` itself.
+        CLI: ``--accessibility-cache-dir``.
     genome_file : str or pathlib.Path, optional
         Genome FASTA to fold on the fly; the profiles go to a temporary
         directory that is removed when the call returns. Ignored when
@@ -345,6 +353,7 @@ def off_targets(
             expression_metric=expression_metric,
             transcriptome_format=transcriptome_format,
             accessibility_dir=_p(accessibility_dir),
+            accessibility_cache_dir=_p(accessibility_cache_dir),
             temperature=temperature,
             on_target_ids_file=_p(on_target_ids_file),
             on_target_expression=on_target_expression,
@@ -372,6 +381,7 @@ def off_targets(
         transcriptome_format=transcriptome_format,
         accessibility=accessibility,
         accessibility_dir=_p(accessibility_dir),
+        accessibility_cache_dir=_p(accessibility_cache_dir),
         genome_file=_p(genome_file),
         window_size=window_size,
         max_span=max_span,

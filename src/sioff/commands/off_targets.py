@@ -109,8 +109,16 @@ def run(
         typer.Option(
             "-a",
             "--accessibility-dir",
-            help="Directory of per-chromosome accessibility Parquet files (from 'sioff accessibility').",
+            help="Directory of per-chromosome accessibility Parquet files (from 'sioff accessibility'), or of the .access.npy cache files built from them.",
             exists=True,
+            file_okay=False,
+        ),
+    ] = None,
+    accessibility_cache_dir: Annotated[
+        Optional[Path],
+        typer.Option(
+            "--accessibility-cache-dir",
+            help="Directory for the memory-mapped <chrom>_<plus|minus>.access.npy accessibility cache; built there from the Parquet when missing and created if absent (default: the accessibility dir itself). Use it when the accessibility dir is read-only or to stage the cache on local disk.",
             file_okay=False,
         ),
     ] = None,
@@ -316,6 +324,7 @@ def run(
     target_index = _as_path(target_index)
     gtf_file = _as_path(gtf_file)
     accessibility_dir = _as_path(accessibility_dir)
+    accessibility_cache_dir = _as_path(accessibility_cache_dir)
     output_file = _as_path(output_file)
     genome_file = _as_path(genome_file)
     on_target_file = _as_path(on_target_file)
@@ -414,6 +423,7 @@ def run(
                 expression_metric=expression_metric,
                 transcriptome_format=transcriptome_format,
                 accessibility_dir=accessibility_dir,
+                accessibility_cache_dir=accessibility_cache_dir,
                 temperature=temperature,
                 on_target_ids_file=on_target_ids_file,
                 on_target_expression=on_target_expression,
@@ -574,6 +584,7 @@ def run(
                 expression_metric=expression_metric,
                 transcriptome_format=transcriptome_format,
                 accessibility_dir=accessibility_dir,
+                accessibility_cache_dir=accessibility_cache_dir,
                 genome_file=genome_file,
                 window_size=window_size,
                 max_span=max_span,

@@ -39,7 +39,10 @@ import polars as pl
 from loguru import logger
 
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
-from sioff.services.accessibility import GenomeAccessibilityService
+from sioff.services.accessibility import (
+    GenomeAccessibilityService,
+    ensure_accessibility_cache,
+)
 from sioff.services.annotation_parser import AnnotationParser
 from sioff.services.intersection_service import IntersectionService
 from sioff.services.probability import ProbabilityService
@@ -68,12 +71,15 @@ def _init_worker(
     on_target_map: dict,
     self_hyb_emin: dict,
     temperature: float = 37.0,
+    accessibility_cache_dir: str = "",
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
 
     The transcriptome is loaded from a pre-written Arrow IPC file (memory-mapped)
-    rather than being re-parsed from the original BED/GTF.  All workers share the
-    same physical memory pages via the OS page cache.
+    rather than being re-parsed from the original BED/GTF, and accessibility
+    profiles are memory-mapped from the uint8 cache the parent built before
+    starting the pool. All workers share the same physical memory pages via
+    the OS page cache.
     """
     os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
 
@@ -87,7 +93,13 @@ def _init_worker(
 
     acc_service = None
     if accessibility_dir:
-        acc_service = GenomeAccessibilityService(Path(accessibility_dir), max_cached=4)
+        acc_service = GenomeAccessibilityService(
+            Path(accessibility_dir),
+            max_cached=4,
+            cache_dir=Path(accessibility_cache_dir)
+            if accessibility_cache_dir
+            else None,
+        )
 
     _WORKER_PROB_SERVICE = ProbabilityService(acc_service, temperature=temperature)
 
@@ -310,6 +322,7 @@ def compute_off_targets_single(
     transcriptome_format: str = "auto",
     accessibility: Optional[Mapping[str, pl.DataFrame]] = None,
     accessibility_dir: Optional[Path] = None,
+    accessibility_cache_dir: Optional[Path] = None,
     genome_file: Optional[Path] = None,
     window_size: int = 80,
     max_span: int = 40,
@@ -402,8 +415,14 @@ def compute_off_targets_single(
         ``accessibility_dir``.
     accessibility_dir : pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``).
+        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``), or
+        of the ``.access.npy`` cache files built from them.
         Mutually exclusive with ``accessibility``.
+    accessibility_cache_dir : pathlib.Path, optional
+        Where the memory-mapped ``<chrom>_<plus|minus>.access.npy`` cache is
+        read from and, when missing, built (CLI
+        ``--accessibility-cache-dir``). Created if absent. Default:
+        ``accessibility_dir`` itself.
     genome_file : pathlib.Path, optional
         Genome FASTA to fold on the fly when no pre-computed profiles are
         supplied (CLI ``-f/--fasta``). Profiles are written to a temporary
@@ -692,7 +711,9 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
-        acc_service = GenomeAccessibilityService(Path(accessibility_dir), max_cached=4)
+        acc_service = GenomeAccessibilityService(
+            Path(accessibility_dir), max_cached=4, cache_dir=accessibility_cache_dir
+        )
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif genome_file:
@@ -727,6 +748,7 @@ def compute_off_targets_directory(
     expression_metric: str = "RPKM",
     transcriptome_format: str = "auto",
     accessibility_dir: Optional[Path] = None,
+    accessibility_cache_dir: Optional[Path] = None,
     temperature: float = 37.0,
     on_target_ids_file: Optional[Path] = None,
     on_target_expression: float = 1000.0,
@@ -781,8 +803,15 @@ def compute_off_targets_directory(
         ``"bed7"`` (CLI ``--transcriptome-format``).
     accessibility_dir : pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``).
-        Without it, opening energies are treated as zero.
+        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``), or
+        of the ``.access.npy`` cache files built from them. Without it,
+        opening energies are treated as zero.
+    accessibility_cache_dir : pathlib.Path, optional
+        Where the memory-mapped ``<chrom>_<plus|minus>.access.npy`` cache
+        lives (CLI ``--accessibility-cache-dir``); created if absent. Every
+        contig that has a Parquet but no cache is built here, in the parent,
+        before the worker pool starts (``min(n_workers, 4)`` build processes,
+        one strand's cache in memory each). Default: ``accessibility_dir``.
     temperature : float, default 37.0
         Temperature in degrees Celsius for the partition function (CLI
         ``-T/--temperature``).
@@ -876,6 +905,21 @@ def compute_off_targets_directory(
     if sirna_fasta is not None:
         self_hyb_emin = RIsearchService().self_hybridization_emin_batch(sirna_fasta)
 
+    # Build the memory-mapped accessibility cache once, here, so workers only
+    # ever map finished files (and never each decode a whole chromosome).
+    if accessibility_dir:
+        _t0 = time.perf_counter()
+        built = ensure_accessibility_cache(
+            Path(accessibility_dir),
+            accessibility_cache_dir,
+            workers=n_workers,
+        )
+        if built:
+            logger.info(
+                f"Built accessibility cache for {len(built)} contig(s) in "
+                f"{time.perf_counter() - _t0:.1f}s"
+            )
+
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
     theta_vals = _parse_theta(theta)
 
@@ -892,6 +936,7 @@ def compute_off_targets_directory(
         on_target_map,
         self_hyb_emin,
         temperature,
+        str(accessibility_cache_dir) if accessibility_cache_dir else "",
     )
 
     try:
