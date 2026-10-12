@@ -307,6 +307,7 @@ def run(
     from loguru import logger
 
     from sioff.core.off_targets import (
+        WorkerPoolError,
         _build_alpha_gamma_pairs,
         _downcast_schema,
         _parse_theta,
@@ -437,6 +438,7 @@ def run(
 
             _drain_stage_totals: dict[str, float] = {}
             _drain_n = 0
+            _pool_error: Optional[WorkerPoolError] = None
             # contextlib.closing guarantees the generator's pool + temp-IPC are
             # torn down even if a write below raises mid-stream.
             with contextlib.closing(gen):
@@ -507,6 +509,10 @@ def run(
                                     _drain_stage_totals.get(k, 0.0) + v
                                 )
                             _drain_n += 1
+                    except WorkerPoolError as exc:
+                        # Raised after the last successful siRNA was yielded;
+                        # keep what was written and report below.
+                        _pool_error = exc
                     finally:
                         # Flush the Parquet footer (CLI owns the writer).
                         if _pq_writer is not None:
@@ -530,7 +536,7 @@ def run(
                 console.print(
                     f"[green]✓[/green] Processed [bold]{total_rows}[/bold] predictions (no output file specified)"
                 )
-            else:
+            elif _pool_error is None:
                 console.print("[yellow]Warning:[/yellow] No predictions to process")
             if summary_count > 0:
                 console.print(
@@ -538,6 +544,13 @@ def run(
                 )
 
             profiler.print_summary(console)
+            if _pool_error is not None:
+                console.print(f"[bold red]Error:[/bold red] {_pool_error}")
+                for name, err in list(_pool_error.failures.items())[:10]:
+                    console.print(f"  {name}: {err}", markup=False, highlight=False)
+                if _pool_error.n_failed > 10:
+                    console.print(f"  ... and {_pool_error.n_failed - 10} more")
+                raise typer.Exit(code=1)
             return {
                 "output": out_path,
                 "n_rows": total_rows,
@@ -724,6 +737,8 @@ def run(
         profiler.print_summary(console)
         return df
 
+    except typer.Exit:
+        raise
     except FileNotFoundError as e:
         console.print(f"[bold red]Error:[/bold red] {e}")
         raise typer.Exit(code=1)

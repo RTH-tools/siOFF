@@ -64,6 +64,38 @@ _WORKER_ON_TARGET_MAP: dict = {}
 _WORKER_SELF_HYB_EMIN: dict = {}
 
 
+class WorkerPoolError(RuntimeError):
+    """Raised by `compute_off_targets_directory` when worker tasks failed.
+
+    Raised once every file was attempted and at least one worker task failed
+    (an exception in the worker, or a worker killed, e.g. by the OOM killer).
+    Successful siRNAs are yielded before this is raised, so a caller that
+    streams results to disk keeps them; the CLI reports the summary and exits
+    non-zero instead of pretending there was nothing to process.
+
+    Attributes
+    ----------
+    failures : dict[str, str]
+        File name -> error message, in completion order.
+    n_total : int
+        Number of files submitted to the pool.
+    """
+
+    def __init__(self, failures: dict[str, str], n_total: int):
+        self.failures = failures
+        self.n_total = n_total
+        first_name, first_err = next(iter(failures.items()))
+        super().__init__(
+            f"{len(failures)}/{n_total} siRNA files failed in worker processes; "
+            f"first error ({first_name}): {first_err}"
+        )
+
+    @property
+    def n_failed(self) -> int:
+        """Number of files whose worker task failed."""
+        return len(self.failures)
+
+
 def _init_worker(
     ipc_path: str,
     accessibility_dir: str,
@@ -766,8 +798,10 @@ def compute_off_targets_directory(
     worker process (``spawn`` rather than ``fork`` avoids Rayon/Polars
     thread-pool deadlocks): it is loaded, optionally filtered to the sense
     strand, intersected with the transcriptome, and scored with the per-siRNA
-    partition function. Files whose worker fails are logged and skipped, and
-    files with no remaining predictions are skipped silently. Heavy intermediate
+    partition function. Files with no remaining predictions are skipped
+    silently. A file whose worker fails is logged and skipped, and once every
+    file has been attempted the generator raises `WorkerPoolError` summarising
+    the failures (after yielding every successful siRNA). Heavy intermediate
     columns (``boltzmann_weight*``, ``Z_sirna*``, ``E_min``) are dropped from
     the yielded frames.
 
@@ -861,6 +895,8 @@ def compute_off_targets_directory(
     ------
     FileNotFoundError
         When ``input_dir`` contains no RIsearch prediction files.
+    WorkerPoolError
+        After the last file, when one or more worker tasks failed.
 
     See Also
     --------
@@ -959,6 +995,8 @@ def compute_off_targets_directory(
                 for f in all_files
             }
 
+            n_total = len(futures)
+            failures: dict[str, str] = {}
             for future in as_completed(futures):
                 # Pop the future immediately so its held result (arrow table +
                 # metadata) can be GC'd as soon as the loop variable rotates.
@@ -967,6 +1005,7 @@ def compute_off_targets_directory(
                     arrow_table, batch_metadata = future.result()
                 except Exception as exc:
                     logger.error(f"Worker failed for {f.name}: {exc}")
+                    failures[f.name] = str(exc)
                     continue
 
                 if arrow_table is None:
@@ -977,6 +1016,9 @@ def compute_off_targets_directory(
                 df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
                 del arrow_table  # Arrow copy no longer needed; Polars owns the data
                 yield df_chunk, batch_metadata
+
+            if failures:
+                raise WorkerPoolError(failures, n_total)
     finally:
         # Clean up the temp Arrow IPC dir used to share the transcriptome.
         if _ipc_tmp:
