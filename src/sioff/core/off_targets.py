@@ -35,11 +35,17 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Generator, Mapping, Optional, cast
 
+import numpy as np
 import polars as pl
+import pyarrow as pa
+import pyarrow.ipc
 from loguru import logger
 
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
-from sioff.services.accessibility import GenomeAccessibilityService
+from sioff.services.accessibility import (
+    GenomeAccessibilityService,
+    gather_opening_energies,
+)
 from sioff.services.annotation_parser import AnnotationParser
 from sioff.services.intersection_service import IntersectionService
 from sioff.services.probability import ProbabilityService
@@ -76,6 +82,9 @@ def _init_worker(
     same physical memory pages via the OS page cache.
     """
     os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
+    # pyarrow decodes Parquet row groups in the chromosome-major pass; keep its
+    # pool inside the same per-worker budget.
+    pa.set_cpu_count(max(1, polars_max_threads))
 
     global _WORKER_DF_TRANS, _WORKER_INTERSECTOR, _WORKER_PROB_SERVICE
     global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN
@@ -198,6 +207,506 @@ def _process_one_sirna(
     }
 
     return arrow, meta
+
+
+# ---------------------------------------------------------------------------
+# Chromosome-major accessibility: three passes over a run temp dir.
+#
+#   pass 1 (siRNA-parallel)  load + filter + intersect -> <tmp>/pass1/<i>.arrow
+#                            and a per-chromosome key file <tmp>/pass1/<i>.keys.arrow
+#   pass 2 (contig-parallel) stream each accessibility Parquet ONCE, gather the
+#                            opening energies of every siRNA's hits on it ->
+#                            <tmp>/pass2/<chrom>.arrow (one batch per siRNA)
+#   pass 3 (siRNA-parallel)  join energies on row_id, partition function, yield
+#
+# The eager per-worker loader materialises a dense [max_pos, 30] float32 profile
+# per chromosome and strand (chr1: 30 GB) in every worker; this path never
+# holds more than one Parquet row group per worker.
+# ---------------------------------------------------------------------------
+_KEYS_SCHEMA = pa.schema(
+    [
+        ("row_id", pa.int64()),
+        ("minus", pa.int8()),
+        ("start", pa.int64()),
+        ("end", pa.int64()),
+    ]
+)
+_ENERGY_SCHEMA = pa.schema([("row_id", pa.int64()), ("opening_energy", pa.float32())])
+_DEFAULT_OPENING_ENERGY = 10.0  # annotate_opening_energy_vectorized's np.full default
+
+
+def _release_memory() -> None:
+    """Return freed pages to the OS so worker RSS stays flat across tasks."""
+    gc.collect()
+    try:
+        ctypes.CDLL("libc.so.6").malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _load_filtered_predictions(
+    file_path_str: str, sense_only: bool, self_hyb_emin: dict
+) -> pl.DataFrame:
+    parser = RIsearchParser()
+    df = parser.load_single_file(Path(file_path_str))
+    if sense_only:
+        df = df.filter(pl.col("strand") == "+")
+    if df.height == 0:
+        return df
+    # Apply self-hybridisation E_min override (one value per siRNA file)
+    if self_hyb_emin and "raw_e_min" in df.columns:
+        sirna_id = str(df["sirna_id"][0])
+        if sirna_id in self_hyb_emin:
+            df = df.with_columns(
+                pl.lit(self_hyb_emin[sirna_id]).cast(pl.Float32).alias("raw_e_min")
+            )
+    return df
+
+
+def _write_keys(df: pl.DataFrame, path: Path) -> dict[str, int]:
+    """Write (row_id, minus, start, end) as one IPC record batch per chromosome.
+
+    ``onTarget`` rows are left out (the eager path skips them, leaving the
+    10.0 default).
+
+    Returns
+    -------
+    dict[str, int]
+        ``chrom -> batch index``, so pass 2 can memory-map the file and read
+        only its contig's batch.
+    """
+    keys = (
+        df.select(
+            pl.int_range(pl.len(), dtype=pl.Int64).alias("row_id"),
+            pl.col("chrom").cast(pl.Utf8).alias("chrom"),
+            (pl.col("strand").cast(pl.Utf8) == "-").cast(pl.Int8).alias("minus"),
+            pl.col("start").cast(pl.Int64),
+            pl.col("end").cast(pl.Int64),
+        )
+        .filter(pl.col("chrom") != "onTarget")
+        .sort("chrom", maintain_order=True)
+    )
+    batches: dict[str, int] = {}
+    with pa.OSFile(str(path), "wb") as sink:
+        with pa.ipc.new_file(sink, _KEYS_SCHEMA) as writer:
+            for (chrom,), part in keys.group_by("chrom", maintain_order=True):
+                tbl = part.drop("chrom").to_arrow().cast(_KEYS_SCHEMA).combine_chunks()
+                for batch in tbl.to_batches():
+                    writer.write_batch(batch)
+                    batches[str(chrom)] = len(batches)
+    return batches
+
+
+def _pass1_prepare_sirna(
+    file_path_str: str,
+    idx: int,
+    sense_only: bool,
+    predictions_type: str,
+    pass1_dir: str,
+) -> tuple[int, Optional[dict[str, int]], int, dict]:
+    """Load, filter and intersect one siRNA file; persist it for passes 2 and 3.
+
+    Returns
+    -------
+    tuple
+        ``(idx, chrom_batches, n_rows, timings)``; ``chrom_batches`` is
+        ``None`` when no predictions remain (nothing is written).
+    """
+    _m = sys.modules[__name__]
+    df_trans = _m._WORKER_DF_TRANS
+    intersector = _m._WORKER_INTERSECTOR
+    self_hyb_emin = _m._WORKER_SELF_HYB_EMIN
+
+    _t_start = time.perf_counter()
+    df = _load_filtered_predictions(file_path_str, sense_only, self_hyb_emin)
+    _t_load = time.perf_counter()
+    if df.height == 0:
+        return idx, None, 0, {}
+
+    _intersect_subtimings: dict = {}
+    if df_trans is not None and intersector is not None:
+        df = intersector.intersect(
+            df,
+            df_trans,
+            mode=predictions_type,
+            workers=1,
+            _timings=_intersect_subtimings,
+        )
+        if df.height == 0:
+            return idx, None, 0, {}
+    _t_intersect = time.perf_counter()
+
+    out = Path(pass1_dir)
+    df.write_ipc(out / f"{idx}.arrow", compression="lz4")
+    chrom_batches = _write_keys(df, out / f"{idx}.keys.arrow")
+    _t_end = time.perf_counter()
+    n_rows = df.height
+    del df
+    _release_memory()
+    timings = {
+        "load_s": _t_load - _t_start,
+        "intersect_s": _t_intersect - _t_load,
+        "pass1_write_s": _t_end - _t_intersect,
+        **_intersect_subtimings,
+    }
+    return idx, chrom_batches, n_rows, timings
+
+
+def _pass2_gather_contig(
+    chrom: str,
+    accessibility_path: str,
+    sources: list[tuple[int, str, int]],
+    out_path: str,
+) -> tuple[str, dict[int, int], dict]:
+    """Stream one contig's accessibility Parquet and gather every siRNA's hits.
+
+    ``sources`` lists ``(sirna_idx, keys_path, batch_index)``. Writes
+    ``out_path`` with one ``(row_id, opening_energy)`` batch per siRNA.
+
+    Returns
+    -------
+    tuple
+        ``(chrom, sirna_idx -> batch index, stats)``; ``stats`` carries the
+        `gather_opening_energies` counters plus hit counts and timings.
+    """
+    _t0 = time.perf_counter()
+    owner, row_id, minus, start, end = [], [], [], [], []
+    for sirna_idx, keys_path, batch_index in sources:
+        with pa.memory_map(keys_path, "r") as source:
+            batch = pa.ipc.open_file(source).get_batch(batch_index)
+            row_id.append(batch.column("row_id").to_numpy())
+            minus.append(batch.column("minus").to_numpy())
+            start.append(batch.column("start").to_numpy())
+            end.append(batch.column("end").to_numpy())
+        owner.append(np.full(batch.num_rows, sirna_idx, dtype=np.int64))
+    owner_a = np.concatenate(owner)
+    row_id_a = np.concatenate(row_id)
+    strands = np.where(np.concatenate(minus) == 1, "-", "+")
+    _t_keys = time.perf_counter()
+
+    energies, stats = gather_opening_energies(
+        Path(accessibility_path), strands, np.concatenate(start), np.concatenate(end)
+    )
+    _t_gather = time.perf_counter()
+
+    order = np.lexsort((row_id_a, owner_a))
+    owner_a, row_id_a, energies = owner_a[order], row_id_a[order], energies[order]
+    bounds = np.flatnonzero(np.diff(owner_a)) + 1
+    batches: dict[int, int] = {}
+    with pa.OSFile(out_path, "wb") as sink:
+        with pa.ipc.new_file(sink, _ENERGY_SCHEMA) as writer:
+            for lo, hi in zip(
+                np.concatenate(([0], bounds)), np.concatenate((bounds, [len(owner_a)]))
+            ):
+                writer.write_batch(
+                    pa.RecordBatch.from_arrays(
+                        [pa.array(row_id_a[lo:hi]), pa.array(energies[lo:hi])],
+                        schema=_ENERGY_SCHEMA,
+                    )
+                )
+                batches[int(owner_a[lo])] = len(batches)
+    _t_end = time.perf_counter()
+    stats.update(
+        {
+            "n_hits": int(len(owner_a)),
+            "n_sirnas": len(batches),
+            "keys_s": _t_keys - _t0,
+            "gather_s": _t_gather - _t_keys,
+            "write_s": _t_end - _t_gather,
+            "total_s": _t_end - _t0,
+        }
+    )
+    _release_memory()
+    return chrom, batches, stats
+
+
+def _pass3_finish_sirna(
+    idx: int,
+    pass1_path: str,
+    energy_sources: list[tuple[str, int]],
+    alpha_gamma_pairs: list,
+    theta_vals: list,
+    on_target_expression: float,
+) -> tuple:
+    """Join the gathered energies onto the pass-1 frame and score the siRNA.
+
+    Rows no pass-2 file covers (contig without an accessibility file,
+    ``onTarget``) keep the eager path's 10.0 default.
+
+    Returns
+    -------
+    tuple
+        ``(pyarrow.Table, meta)`` as `_process_one_sirna` returns them.
+    """
+    _m = sys.modules[__name__]
+    prob_service = _m._WORKER_PROB_SERVICE
+    on_target_map = _m._WORKER_ON_TARGET_MAP
+
+    _t_start = time.perf_counter()
+    df = pl.read_ipc(pass1_path)
+    energies = np.full(df.height, _DEFAULT_OPENING_ENERGY, dtype=np.float32)
+    for energy_path, batch_index in energy_sources:
+        with pa.memory_map(energy_path, "r") as source:
+            batch = pa.ipc.open_file(source).get_batch(batch_index)
+            energies[batch.column("row_id").to_numpy()] = batch.column(
+                "opening_energy"
+            ).to_numpy()
+    df = df.with_columns(pl.Series("opening_energy", energies, dtype=pl.Float32))
+    _t_join = time.perf_counter()
+
+    df, meta = prob_service.calculate_probabilities_per_sirna(
+        df,
+        alpha_gamma_pairs=alpha_gamma_pairs,
+        theta_values=theta_vals,
+        on_target_map=on_target_map,
+        on_target_expression=on_target_expression,
+        precomputed_opening_energy=True,
+    )
+    _t_prob = time.perf_counter()
+
+    drop_cols = [
+        c
+        for c in df.columns
+        if c.startswith("boltzmann_weight") or c.startswith("Z_sirna") or c == "E_min"
+    ]
+    if drop_cols:
+        df = df.drop(drop_cols)
+    arrow = df.to_arrow()
+    _t_end = time.perf_counter()
+    del df
+    _release_memory()
+
+    meta["_timings"] = {
+        "pass3_join_s": _t_join - _t_start,
+        "prob_s": _t_prob - _t_join,
+        "serialize_s": _t_end - _t_prob,
+    }
+    return arrow, meta
+
+
+def _dir_size(path: Path) -> int:
+    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
+
+
+def _stream_chrom_major(
+    pool: ProcessPoolExecutor,
+    all_files: list[Path],
+    accessibility_dir: Path,
+    run_tmp: Path,
+    alpha_gamma_pairs: list,
+    theta_vals: list,
+    on_target_expression: float,
+    sense_only: bool,
+    predictions_type: str,
+) -> Generator[tuple[pl.DataFrame, dict], None, None]:
+    pass1_dir = run_tmp / "pass1"
+    pass2_dir = run_tmp / "pass2"
+    pass1_dir.mkdir()
+    pass2_dir.mkdir()
+    n_files = len(all_files)
+    names = {i: f.name for i, f in enumerate(all_files)}
+
+    # ---- pass 1: siRNA-parallel load + intersect -> temp files ----
+    t1 = time.perf_counter()
+    failures: list[tuple[str, str]] = []
+    pass1_timings: dict[int, dict] = {}
+    contig_sources: dict[str, list[tuple[int, str, int]]] = {}
+    contig_rows: dict[str, int] = {}
+    ready: list[int] = []
+    futures = {
+        pool.submit(
+            _pass1_prepare_sirna,
+            str(f),
+            i,
+            sense_only,
+            predictions_type,
+            str(pass1_dir),
+        ): i
+        for i, f in enumerate(all_files)
+    }
+    for future in as_completed(futures):
+        i = futures.pop(future)
+        try:
+            idx, chrom_batches, n_rows, timings = future.result()
+        except Exception as exc:
+            logger.error(f"Pass 1 failed for {names[i]}: {exc}")
+            failures.append((names[i], str(exc)))
+            continue
+        if chrom_batches is None:
+            continue
+        ready.append(idx)
+        pass1_timings[idx] = timings
+        keys_path = str(pass1_dir / f"{idx}.keys.arrow")
+        for chrom, batch_index in chrom_batches.items():
+            contig_sources.setdefault(chrom, []).append((idx, keys_path, batch_index))
+        for chrom in chrom_batches:
+            contig_rows[chrom] = contig_rows.get(chrom, 0) + n_rows
+    t1_end = time.perf_counter()
+    logger.info(
+        f"[chrom-major] pass 1: {len(ready)}/{n_files} siRNAs intersected in "
+        f"{t1_end - t1:.1f}s, {len(contig_sources)} contigs with hits, "
+        f"temp {_dir_size(pass1_dir) / 1e9:.2f} GB"
+    )
+
+    # ---- pass 2: contig-parallel streaming gather ----
+    # Contigs are scheduled largest-first (hit rows is a proxy for row groups
+    # touched) so the biggest chromosomes do not land at the tail.
+    present = {
+        c: accessibility_dir / f"{c}.accessibility.parquet" for c in contig_sources
+    }
+    missing = sorted(c for c, p in present.items() if not p.exists())
+    if missing:
+        logger.warning(
+            f"[chrom-major] {len(missing)} contig(s) have hits but no accessibility "
+            f"file; their rows keep opening energy {_DEFAULT_OPENING_ENERGY} "
+            f"(first: {', '.join(missing[:5])})"
+        )
+    order = sorted(
+        (c for c in contig_sources if present[c].exists()),
+        key=lambda c: contig_rows[c],
+        reverse=True,
+    )
+    energy_sources: dict[int, list[tuple[str, int]]] = {i: [] for i in ready}
+    bytes_read = bytes_total = rg_read = rg_total = 0
+    futures2 = {
+        pool.submit(
+            _pass2_gather_contig,
+            c,
+            str(present[c]),
+            contig_sources[c],
+            str(pass2_dir / f"{c}.arrow"),
+        ): c
+        for c in order
+    }
+    for future in as_completed(futures2):
+        c = futures2.pop(future)
+        try:
+            chrom, batches, stats = future.result()
+        except Exception as exc:
+            logger.error(f"Pass 2 failed for {c}: {exc}")
+            continue
+        out_path = str(pass2_dir / f"{chrom}.arrow")
+        for idx, batch_index in batches.items():
+            energy_sources[idx].append((out_path, batch_index))
+        bytes_read += stats["bytes_read"]
+        bytes_total += stats["bytes_file"]
+        rg_read += stats["row_groups_read"]
+        rg_total += stats["row_groups_total"]
+        logger.debug(
+            f"[chrom-major] {chrom}: {stats['n_hits']:,} hits, "
+            f"{stats['row_groups_read']}/{stats['row_groups_total']} row groups, "
+            f"{stats['bytes_read'] / 1e6:.1f}/{stats['bytes_file'] / 1e6:.1f} MB, "
+            f"{stats['total_s']:.1f}s (gather {stats['gather_s']:.1f}s)"
+        )
+    t2_end = time.perf_counter()
+    logger.info(
+        f"[chrom-major] pass 2: {len(order)} contigs in {t2_end - t1_end:.1f}s, "
+        f"{rg_read}/{rg_total} row groups read, {bytes_read / 1e9:.2f} GB of "
+        f"{bytes_total / 1e9:.2f} GB (touched files), temp "
+        f"{_dir_size(pass2_dir) / 1e9:.2f} GB"
+    )
+
+    # ---- pass 3: siRNA-parallel scoring ----
+    futures3 = {
+        pool.submit(
+            _pass3_finish_sirna,
+            i,
+            str(pass1_dir / f"{i}.arrow"),
+            energy_sources[i],
+            alpha_gamma_pairs,
+            theta_vals,
+            on_target_expression,
+        ): i
+        for i in ready
+    }
+    n_yielded = 0
+    for future in as_completed(futures3):
+        i = futures3.pop(future)
+        try:
+            arrow_table, meta = future.result()
+        except Exception as exc:
+            logger.error(f"Pass 3 failed for {names[i]}: {exc}")
+            failures.append((names[i], str(exc)))
+            continue
+        timings = {**pass1_timings.get(i, {}), **meta.get("_timings", {})}
+        timings["total_s"] = sum(
+            v
+            for k, v in timings.items()
+            if k.endswith("_s")
+            and k
+            in {
+                "load_s",
+                "intersect_s",
+                "pass1_write_s",
+                "pass3_join_s",
+                "prob_s",
+                "serialize_s",
+            }
+        )
+        meta["_timings"] = timings
+        df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
+        del arrow_table
+        n_yielded += 1
+        yield df_chunk, meta
+    t3_end = time.perf_counter()
+    logger.info(
+        f"[chrom-major] pass 3: {n_yielded} siRNAs scored in {t3_end - t2_end:.1f}s; "
+        f"total {t3_end - t1:.1f}s"
+    )
+
+
+def _stream_eager(
+    pool: ProcessPoolExecutor,
+    all_files: list[Path],
+    alpha_gamma_pairs: list,
+    theta_vals: list,
+    on_target_expression: float,
+    sense_only: bool,
+    predictions_type: str,
+) -> Generator[tuple[pl.DataFrame, dict], None, None]:
+    """One task per siRNA; each worker looks accessibility up with its own loader.
+
+    Yields
+    ------
+    tuple[polars.DataFrame, dict]
+        ``(df, meta)`` per siRNA, in completion order.
+    """
+    failures: list[tuple[str, str]] = []
+    futures = {
+        pool.submit(
+            _process_one_sirna,
+            str(f),
+            alpha_gamma_pairs,
+            theta_vals,
+            on_target_expression,
+            sense_only,
+            predictions_type,
+        ): f
+        for f in all_files
+    }
+
+    for future in as_completed(futures):
+        # Pop the future immediately so its held result (arrow table +
+        # metadata) can be GC'd as soon as the loop variable rotates.
+        f = futures.pop(future)
+        try:
+            arrow_table, batch_metadata = future.result()
+        except Exception as exc:
+            logger.error(f"Worker failed for {f.name}: {exc}")
+            failures.append((f.name, str(exc)))
+            continue
+
+        if arrow_table is None:
+            continue
+
+        # arrow_table is a pyarrow Table, so from_arrow returns a DataFrame
+        # (not a Series).
+        df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
+        del arrow_table  # Arrow copy no longer needed; Polars owns the data
+        yield df_chunk, batch_metadata
+
+
+ACCESSIBILITY_STRATEGIES = ("auto", "eager", "chrom-major")
 
 
 def _build_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]]:
@@ -736,6 +1245,7 @@ def compute_off_targets_directory(
     sense_only: bool = False,
     predictions_type: str = "gw",
     n_workers: int = 1,
+    accessibility_strategy: str = "auto",
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
     """Compute off-target probabilities for a directory of per-siRNA files.
 
@@ -748,6 +1258,18 @@ def compute_off_targets_directory(
     files with no remaining predictions are skipped silently. Heavy intermediate
     columns (``boltzmann_weight*``, ``Z_sirna*``, ``E_min``) are dropped from
     the yielded frames.
+
+    With ``accessibility_dir`` and more than one worker (``"auto"``), or with
+    ``accessibility_strategy="chrom-major"``, opening energies are gathered
+    chromosome-major: pass 1 loads and intersects every siRNA into a run temp
+    directory (under ``TMPDIR``), pass 2 streams each accessibility Parquet
+    once, row group by row group, for the hits of all siRNAs, and pass 3
+    scores each siRNA with the precomputed column. Peak memory per worker is
+    about one Parquet row group instead of a dense per-chromosome profile
+    (30 GB for chr1), and the genome is read once per run rather than once
+    per worker. ``"eager"`` keeps the per-worker loader (fine for small
+    genomes; it is what a single worker uses under ``"auto"``). Results are
+    identical either way.
 
     The process pool and the temporary Arrow-IPC copy of the transcriptome
     (memory-mapped by every worker) are held open across yields and cleaned up
@@ -812,6 +1334,10 @@ def compute_off_targets_directory(
         Number of worker processes (CLI ``-j/--workers``), capped at the number
         of input files. Polars threads per worker are set to
         ``n_workers // n_processes`` so the total stays within the budget.
+    accessibility_strategy : {"auto", "eager", "chrom-major"}, default "auto"
+        How opening energies are looked up when ``accessibility_dir`` is given
+        (CLI ``--accessibility-strategy``); see above. Ignored without
+        ``accessibility_dir``.
 
     Yields
     ------
@@ -832,6 +1358,8 @@ def compute_off_targets_directory(
     ------
     FileNotFoundError
         When ``input_dir`` contains no RIsearch prediction files.
+    ValueError
+        When ``accessibility_strategy`` is not one of the three values.
 
     See Also
     --------
@@ -839,11 +1367,20 @@ def compute_off_targets_directory(
         is a directory.
     compute_off_targets_single : Single-source variant with the full option set.
     """
+    if accessibility_strategy not in ACCESSIBILITY_STRATEGIES:
+        raise ValueError(
+            f"accessibility_strategy must be one of {ACCESSIBILITY_STRATEGIES}, "
+            f"got {accessibility_strategy!r}"
+        )
     input_dir = Path(input_dir)
     risearch_parser = RIsearchParser()
     all_files = risearch_parser.list_directory_files(input_dir)
     if not all_files:
         raise FileNotFoundError(f"No RIsearch files found in {input_dir}")
+    chrom_major = accessibility_dir is not None and (
+        accessibility_strategy == "chrom-major"
+        or (accessibility_strategy == "auto" and n_workers > 1)
+    )
 
     # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
     # it instead of re-parsing the BED/GTF. Workers share pages via the OS cache.
@@ -884,16 +1421,18 @@ def compute_off_targets_directory(
     polars_threads_per_worker = max(1, n_workers // n_proc)
 
     # spawn: each worker starts a fresh interpreter, avoiding fork+Rayon deadlocks.
+    # Chromosome-major workers never build the eager per-worker loader.
     _ctx = multiprocessing.get_context("spawn")
     _init_args = (
         str(_ipc_path) if gtf_file else "",
-        str(accessibility_dir) if accessibility_dir else "",
+        str(accessibility_dir) if (accessibility_dir and not chrom_major) else "",
         polars_threads_per_worker,
         on_target_map,
         self_hyb_emin,
         temperature,
     )
 
+    _run_tmp: Optional[str] = None
     try:
         with ProcessPoolExecutor(
             max_workers=n_proc,
@@ -901,38 +1440,38 @@ def compute_off_targets_directory(
             initializer=_init_worker,
             initargs=_init_args,
         ) as pool:
-            futures = {
-                pool.submit(
-                    _process_one_sirna,
-                    str(f),
+            if chrom_major:
+                assert accessibility_dir is not None
+                _run_tmp = tempfile.mkdtemp(prefix="sioff_chrom_major_")
+                logger.info(
+                    f"[chrom-major] {len(all_files)} siRNAs, {n_proc} workers, "
+                    f"temp dir {_run_tmp}"
+                )
+                yield from _stream_chrom_major(
+                    pool,
+                    all_files,
+                    Path(accessibility_dir),
+                    Path(_run_tmp),
                     alpha_gamma_pairs,
                     theta_vals,
                     on_target_expression,
                     sense_only,
                     predictions_type,
-                ): f
-                for f in all_files
-            }
-
-            for future in as_completed(futures):
-                # Pop the future immediately so its held result (arrow table +
-                # metadata) can be GC'd as soon as the loop variable rotates.
-                f = futures.pop(future)
-                try:
-                    arrow_table, batch_metadata = future.result()
-                except Exception as exc:
-                    logger.error(f"Worker failed for {f.name}: {exc}")
-                    continue
-
-                if arrow_table is None:
-                    continue
-
-                # arrow_table is a pyarrow Table, so from_arrow returns a DataFrame
-                # (not a Series).
-                df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
-                del arrow_table  # Arrow copy no longer needed; Polars owns the data
-                yield df_chunk, batch_metadata
+                )
+            else:
+                yield from _stream_eager(
+                    pool,
+                    all_files,
+                    alpha_gamma_pairs,
+                    theta_vals,
+                    on_target_expression,
+                    sense_only,
+                    predictions_type,
+                )
     finally:
-        # Clean up the temp Arrow IPC dir used to share the transcriptome.
+        # Clean up the temp Arrow IPC dir used to share the transcriptome and
+        # the chromosome-major run directory.
         if _ipc_tmp:
             shutil.rmtree(_ipc_tmp, ignore_errors=True)
+        if _run_tmp:
+            shutil.rmtree(_run_tmp, ignore_errors=True)
