@@ -16,7 +16,7 @@ from sioff.commands import accessibility, off_targets, risearch
 
 app = typer.Typer(
     name="sioff",
-    help="siRNA off-target discovery pipeline — analyze RIsearch2 predictions.",
+    help="siRNA off-target discovery pipeline — analyze RIsearch3 predictions.",
     add_completion=False,
 )
 app.command(name="accessibility")(accessibility.run)
