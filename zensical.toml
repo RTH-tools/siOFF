@@ -6,7 +6,7 @@
 
 [project]
 site_name = "siOFF"
-site_description = "siOFF — siRNA off-target discovery pipeline for analyzing RIsearch2 predictions"
+site_description = "siOFF — siRNA off-target discovery pipeline for analyzing RIsearch3 predictions"
 site_url = "https://lorenzo-22.github.io/siOFF/"
 repo_url = "https://github.com/lorenzo-22/siOFF"
 repo_name = "lorenzo-22/siOFF"

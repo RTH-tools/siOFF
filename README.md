@@ -17,7 +17,7 @@ pipeline originally distributed with
 [RIsearch2](https://rth.dk/resources/risearch)
 ([Alkan *et al.*, Nucleic Acids Research 2017](https://doi.org/10.1093/nar/gkw1325)).
 It keeps the same thermodynamic model and still reads legacy RIsearch2
-prediction files, but replaces the original Perl/C toolchain with a single
+prediction files, but replaces the original C toolchain with a single
 Python package built on Polars, adds in-process bindings for
 [RIsearch 3](https://github.com/saiden89/risearch) (Rust/PyO3, on
 [PyPI](https://pypi.org/project/risearch/) and
@@ -489,7 +489,7 @@ import it.
 series whose API and results change between alphas; the pin is bumped
 deliberately, with the test suite and a fixture comparison, not automatically.
 
-The previous generation of this pipeline, RIsearch2 and its Perl scripts, is at
+The previous generation of this pipeline, built on RIsearch2, is at
 [rth.dk/resources/risearch](https://rth.dk/resources/risearch); siOFF reads its
 output files unchanged.
 
