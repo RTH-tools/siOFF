@@ -55,8 +55,29 @@ off_targets:
   # ---------------------------------------------------------------------------
 
   # Directory of per-chromosome accessibility Parquet files produced by the
-  # "sioff accessibility" command ({chrom}.accessibility.parquet).
+  # "sioff accessibility" command ({chrom}.accessibility.parquet). With
+  # accessibility_strategy: memmap it may instead hold only the memory-mapped
+  # {chrom}_{plus,minus}.access.npy cache built from them.
   accessibility_dir: ../examples/data/accessibility
+
+  # How opening energies are read from accessibility_dir. Default: "auto".
+  # Options: "auto" | "chrom-major" | "memmap" | "eager"
+  #   chrom-major: directory mode; streams each chromosome's Parquet once per
+  #                run for all siRNAs (memory per worker ~ one row group).
+  #   memmap:      builds a uint8 .access.npy cache per chromosome and strand
+  #                that every worker memory-maps; the only strategy that writes
+  #                cache files.
+  #   eager:       loads whole chromosomes into memory in every worker (small
+  #                genomes only).
+  #   auto:        chrom-major for a directory of per-siRNA files, eager for a
+  #                single predictions file.
+  # accessibility_strategy: auto
+
+  # memmap only: where the cache is read from and, when missing, built
+  # (created if absent). Defaults to accessibility_dir itself; set it when the
+  # accessibility directory is read-only or to stage the cache on node-local
+  # disk. A complete cache here needs no Parquet in accessibility_dir.
+  # accessibility_cache_dir: ./accessibility_cache
 
   # FASTA file for computing accessibility on-the-fly via ViennaRNA.
   # Slower than pre-computed profiles; uses window/span/unpaired parameters below.

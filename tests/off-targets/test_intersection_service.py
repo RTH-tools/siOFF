@@ -91,3 +91,46 @@ class TestIntersectionService:
 
         result = service.intersect(risearch_df, transcriptome_df)
         assert result.filter(pl.col("sirna_id") == "si3").height == 0
+
+
+@pytest.mark.parametrize("workers", [1, 3])
+def test_intersect_row_order_follows_input(service: IntersectionService, workers):
+    """Rows come out grouped by (chrom, strand) in first-appearance order.
+
+    The row order feeds the float32 summation order of the partition
+    functions, so it must not depend on hash order or thread scheduling (it
+    used to: P_off_target drifted by a few ULP between runs on the same input).
+    """
+    preds = pl.DataFrame(
+        {
+            "sirna_id": ["s"] * 6,
+            "chrom": ["chr2", "chr1", "chr1", "chr2", "chr1", "chr1"],
+            "start": [100, 100, 200, 110, 300, 210],
+            "end": [120, 120, 220, 130, 320, 230],
+            "strand": ["+", "-", "+", "+", "-", "+"],
+            "energy": [-15.0, -14.0, -13.0, -12.0, -11.0, -10.0],
+        }
+    )
+    trans = pl.DataFrame(
+        {
+            "chrom": ["chr2", "chr1", "chr1"],
+            "start": [50, 50, 50],
+            "end": [500, 500, 500],
+            "strand": ["+", "-", "+"],
+            "gene_id": ["g2p", "g1m", "g1p"],
+            "transcript_id": ["t2p", "t1m", "t1p"],
+            "exp_value": [1.0, 1.0, 1.0],
+        }
+    )
+    result = service.intersect(preds, trans, workers=workers)
+    assert result.height == 6
+    assert list(zip(result["chrom"], result["strand"])) == [
+        ("chr2", "+"),
+        ("chr2", "+"),
+        ("chr1", "-"),
+        ("chr1", "-"),
+        ("chr1", "+"),
+        ("chr1", "+"),
+    ]
+    # Within a pair, input order is kept.
+    assert result["energy"].to_list() == [-15.0, -12.0, -14.0, -11.0, -13.0, -10.0]

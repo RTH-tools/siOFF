@@ -1,7 +1,7 @@
 """Service for intersecting RIsearch predictions with transcriptome annotations."""
 
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator, Optional
 
 import numpy as np
@@ -65,6 +65,7 @@ class IntersectionService:
             right_on="transcript_id",
             how="inner",
             suffix="_trans",
+            maintain_order="left",
         )
 
         if "transcript_id" not in joined.columns:
@@ -79,7 +80,16 @@ class IntersectionService:
         workers: int = 1,
         _timings: Optional[dict] = None,
     ) -> pl.DataFrame:
-        chrom_strand_pairs = risearch_df.select(["chrom", "strand"]).unique().to_dicts()
+        # maintain_order: the pairs decide the order of the concatenated result
+        # and, through it, the float32 summation order of the partition
+        # functions downstream. Without it, polars returns the pairs in a
+        # hash order that varies between runs, so P_off_target drifted by a
+        # few ULP from run to run on identical input.
+        chrom_strand_pairs = (
+            risearch_df.select(["chrom", "strand"])
+            .unique(maintain_order=True)
+            .to_dicts()
+        )
 
         _t_part_preds = time.perf_counter()
         preds_by_pair: dict[tuple, pl.DataFrame] = {
@@ -148,6 +158,7 @@ class IntersectionService:
                             "transcript_id",
                         ],
                         keep="first",
+                        maintain_order=True,
                     )
                 ]
             return []
@@ -158,11 +169,12 @@ class IntersectionService:
             # Cap at 8: beyond that, peak memory from concurrent chromosome-sized DataFrames outweighs speedup.
             safe_workers = min(workers, 8)
             with ThreadPoolExecutor(max_workers=safe_workers) as pool:
-                futures = {
-                    pool.submit(_process_pair, pair): pair
-                    for pair in chrom_strand_pairs
-                }
-                for future in as_completed(futures):
+                futures = [
+                    pool.submit(_process_pair, pair) for pair in chrom_strand_pairs
+                ]
+                # Collect in submission order (not completion order) so the
+                # result's row order does not depend on thread scheduling.
+                for future in futures:
                     all_results.extend(future.result())
         else:
             for pair in chrom_strand_pairs:
@@ -249,7 +261,11 @@ class IntersectionService:
                 yield result.slice(offset, _BATCH_SIZE)
             return
 
-        chrom_strand_pairs = risearch_df.select(["chrom", "strand"]).unique().to_dicts()
+        chrom_strand_pairs = (
+            risearch_df.select(["chrom", "strand"])
+            .unique(maintain_order=True)
+            .to_dicts()
+        )
 
         for pair in chrom_strand_pairs:
             chrom = pair["chrom"]

@@ -8,6 +8,8 @@ from loguru import logger
 
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
+    _reverse_complement,
+    site_cells,
 )
 from sioff.services.helpers import read_fasta
 from sioff.services.risearch_service import RIsearchService
@@ -17,6 +19,14 @@ R = 0.001987
 # Default temperature in Kelvin (37 C) — kept for backward compatibility
 T = 310.15
 RT = R * T
+
+
+def _require_opening_energy(df: pl.DataFrame) -> None:
+    if "opening_energy" not in df.columns:
+        raise ValueError(
+            "precomputed_opening_energy=True but the frame has no 'opening_energy' "
+            "column"
+        )
 
 
 class ProbabilityService:
@@ -41,13 +51,20 @@ class ProbabilityService:
         on_target_expression: float = 1000.0,
         on_target_accessibility_path: Optional[Path] = None,
         on_target_risearch_path: Optional[Path] = None,
+        precomputed_opening_energy: bool = False,
     ) -> Tuple[pl.DataFrame, Dict]:
-        """Z = Σ(Expr_i × exp(-dG_total_i / RT)); P(t) = W_t / Z."""
+        """Z = Σ(Expr_i × exp(-dG_total_i / RT)); P(t) = W_t / Z.
+
+        With ``precomputed_opening_energy`` the frame must already carry an
+        ``opening_energy`` column and no accessibility lookup is performed.
+        """
         if "energy" not in df.columns:
             logger.warning("No 'energy' column found. Cannot calculate probabilities.")
             return df, {}
 
-        if self.accessibility_service:
+        if precomputed_opening_energy:
+            _require_opening_energy(df)
+        elif self.accessibility_service:
             df = self._annotate_opening_energy(df)
 
         if "opening_energy" in df.columns:
@@ -162,11 +179,16 @@ class ProbabilityService:
         on_target_map: Optional[dict[str, str]] = None,
         on_target_expression: float = 1000.0,
         on_target_fasta_data: Optional[dict[str, dict]] = None,
+        precomputed_opening_energy: bool = False,
     ) -> Tuple[pl.DataFrame, Dict]:
         """Per-siRNA partition-function probabilities with optional alpha/gamma/theta sweeps.
 
         Mode A (in_predictions): on-target rows already in df, tagged by ID match.
         Mode B (fasta): on-target energy comes from on_target_fasta_data; rows excluded from df.
+
+        With ``precomputed_opening_energy`` the frame must already carry an
+        ``opening_energy`` column (e.g. gathered chromosome-major by the
+        directory core) and the accessibility service is not consulted.
         """
         if "energy" not in df.columns:
             logger.warning("No 'energy' column found. Cannot calculate probabilities.")
@@ -174,7 +196,9 @@ class ProbabilityService:
 
         if "sirna_id" not in df.columns:
             logger.info("No sirna_id column; falling back to single partition function")
-            return self.calculate_probabilities(df)
+            return self.calculate_probabilities(
+                df, precomputed_opening_energy=precomputed_opening_energy
+            )
 
         unique_sirnas = df["sirna_id"].unique()
         if (
@@ -185,13 +209,17 @@ class ProbabilityService:
             and not on_target_fasta_data
         ):
             logger.info("Single siRNA detected; using standard calculation")
-            return self.calculate_probabilities(df)
+            return self.calculate_probabilities(
+                df, precomputed_opening_energy=precomputed_opening_energy
+            )
 
         logger.info(
             f"Processing {len(unique_sirnas)} siRNAs with per-siRNA partition functions"
         )
 
-        if self.accessibility_service:
+        if precomputed_opening_energy:
+            _require_opening_energy(df)
+        elif self.accessibility_service:
             df = self._annotate_opening_energy(df)
 
         if "opening_energy" in df.columns:
@@ -830,17 +858,15 @@ class ProbabilityService:
                 for col_idx, col_name in enumerate(u_cols):
                     profile[pos_0, col_idx] = df_acc[col_name].to_numpy()
 
-                start0 = t_start - 1
-                interaction_len = t_end - start0
-                matrix_width = profile.shape[1]
-                col_idx = min(interaction_len, matrix_width) - 1
-                if col_idx < 0:
-                    col_idx = 0
-                target_idx = (t_end - 1) if strand == "+" else start0
-                if 0 <= target_idx < profile.shape[0]:
-                    dG_open = (
-                        int(round(float(profile[target_idx, col_idx]) * 10.0)) / 10.0
-                    )
+                rows, cols, in_bounds = site_cells(
+                    strand,
+                    np.array([t_start]),
+                    np.array([t_end]),
+                    profile.shape[0],
+                    profile.shape[1],
+                )
+                if in_bounds[0]:
+                    dG_open = int(round(float(profile[rows[0], cols[0]]) * 10.0)) / 10.0
                 else:
                     dG_open = 10.0
 
@@ -861,20 +887,30 @@ class ProbabilityService:
                         f"Computing on-target accessibility on-the-fly (len={len(sequence)})"
                     )
 
+                    # A '-' hit sits on the reverse complement of the on-target
+                    # sequence: fold that molecule, whose rows are RC positions,
+                    # exactly as the genome-wide profiles store the '-' strand.
+                    folded = (
+                        _reverse_complement(sequence) if strand == "-" else sequence
+                    )
                     with tempfile.TemporaryDirectory() as tmpdir:
                         temp_service = GenomeAccessibilityService(Path(tmpdir))
                         profile = temp_service.compute_sequence_accessibility(
-                            sequence, temperature=self._temperature
+                            folded, temperature=self._temperature
                         )
 
-                        start0 = t_start - 1
-                        interaction_len = t_end - start0
-
                         if profile.size > 0 and profile.ndim == 2:
-                            col_idx = max(min(interaction_len, profile.shape[1]) - 1, 0)
-                            target_idx = (t_end - 1) if strand == "+" else start0
+                            rows, cols, in_bounds = site_cells(
+                                strand,
+                                np.array([t_start]),
+                                np.array([t_end]),
+                                profile.shape[0],
+                                profile.shape[1],
+                            )
+                            target_idx = int(rows[0])
+                            col_idx = int(cols[0])
 
-                            if 0 <= target_idx < profile.shape[0]:
+                            if in_bounds[0]:
                                 dG_open = float(profile[target_idx, col_idx])
                                 logger.info(
                                     f"On-target opening energy: {dG_open:.2f} kcal/mol"
