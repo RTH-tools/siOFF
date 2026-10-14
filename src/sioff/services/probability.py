@@ -756,7 +756,9 @@ class ProbabilityService:
                         }
                     )
                 )
-                merged = merged.join(other, on=["chrom", "transcript_id"], how="outer")
+                merged = merged.join(
+                    other, on=["chrom", "transcript_id"], how="full", coalesce=True
+                )
 
             merged = merged.sort(["chrom", "transcript_id"])
 

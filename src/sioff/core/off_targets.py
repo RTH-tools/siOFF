@@ -96,7 +96,8 @@ def _init_worker(
     global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN
 
     if ipc_path:
-        _WORKER_DF_TRANS = pl.read_ipc(Path(ipc_path), memory_map=True)
+        # polars 2.0 dropped read_ipc's `memory_map` argument.
+        _WORKER_DF_TRANS = pl.read_ipc(Path(ipc_path))
         _WORKER_INTERSECTOR = IntersectionService()
         _WORKER_INTERSECTOR.preload_transcriptome(_WORKER_DF_TRANS)
 
@@ -1246,8 +1247,8 @@ def compute_off_targets_single(
             )
             on_target_map = dict(
                 zip(
-                    mapping_df.get_column("column_1"),
-                    mapping_df.get_column("column_2"),
+                    mapping_df.to_series(0),
+                    mapping_df.to_series(1),
                 )
             )
         except Exception as e:

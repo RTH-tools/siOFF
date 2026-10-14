@@ -70,12 +70,14 @@ can be skipped entirely if you already have
 
 ### Prerequisites
 
-- **Python ≥ 3.11** (tested on 3.11–3.14)
+- **Python ≥ 3.11** (tested on 3.11–3.15)
 - **[uv](https://docs.astral.sh/uv/)** (recommended) or pip
 - `risearch` and ViennaRNA are installed automatically as Python dependencies
   (pinned `3.0.0a4` and `2.7.2`) — no system-level install needed. Prebuilt
   `risearch` wheels cover Linux x86_64 and Apple Silicon macOS; other platforms
-  build it from source, which needs a **Rust toolchain** ([rustup](https://rustup.rs))
+  build it from source, which needs a **Rust toolchain** ([rustup](https://rustup.rs)).
+  On Python 3.15, ViennaRNA has no prebuilt wheel yet and is compiled from
+  source during install (needs a C/C++ compiler; takes several minutes).
 
 ### Install
 
@@ -88,36 +90,13 @@ pip install sioff          # or: uv pip install sioff
 sioff --help
 ```
 
-On a CPU without AVX2 (roughly pre-2013 Intel, e.g. Sandy/Ivy Bridge Xeons)
-the default polars runtime crashes with an illegal instruction; polars warns
-"Missing required CPU features" at import. Install the compat runtime instead:
-
-```bash
-pip install "sioff[lts-cpu]"   # SSE4-only polars runtime, for siOFF and risearch alike
-```
-
-With both runtimes installed polars picks the compat one; set
-`POLARS_PREFER_PKG=32` to force the AVX2 runtime on a machine that has it.
-
 The PyPI distribution name and the import name are both **`sioff`**. One install
 gives you the complete pipeline: `off-targets` / `accessibility` on pre-computed
 RIsearch predictions **and** the in-process `index` / `search` commands (plus
 the `--sirna-fasta` in-process mode of `off-targets`).
 
-For development, from a clone:
-
-```bash
-git clone https://github.com/RTH-tools/siOFF.git
-cd siOFF
-uv sync                    # runtime deps + dev tooling (ruff, pyrefly, pytest)
-uv run sioff --help
-```
-
-`uv sync` also installs the compat polars runtime (the `lts` dependency group,
-on by default because the development server has no AVX2). On a modern machine
-use `uv sync --no-group lts` for the AVX2 runtime; CI does the same.
-
-See [RIsearch](#risearch) for how the in-process engine is pinned.
+Older CPU without AVX2, or setting up a development clone? See
+[Advanced installation](#advanced-installation).
 
 ---
 
@@ -126,26 +105,36 @@ See [RIsearch](#risearch) for how the in-process engine is pinned.
 The repository ships a small, internally consistent example dataset in
 [`examples/data/`](examples/data): a 6 kb toy genome, 5 siRNAs, an annotation
 with expression values, pre-computed RIsearch predictions, and pre-computed
-accessibility profiles. This run never calls `risearch` (no `risearch`
-needed) and takes a few seconds:
+accessibility profiles.
+
+The example data is part of the repository, not of the PyPI package, so clone
+the repository to get it and run the commands below from the clone's root:
+
+```bash
+git clone https://github.com/RTH-tools/siOFF.git
+cd siOFF
+```
+
+The installed `sioff` works from there (in a [development
+install](#development-install), prefix the commands with `uv run`). This run
+never calls `risearch` and takes a few seconds:
 
 ```bash
 # Pre-computed predictions file
-# use uv run sioff if you set up siOFF with uv as explained abovee
 sioff off-targets \
   -r examples/data/predictions.out \
   -t examples/data/annotation.gtf \
   -a examples/data/accessibility \
   -o example_run/off_targets.tsv
 ```
-This should produce the example_run/offtargets.tsv file and print a summary like
+This should produce the `example_run/off_targets.tsv` file and print a summary like
 
 ```
 Calculating probabilities...
-✓ Loaded 233 predictions from predictions.out
+✓ Loaded 231 predictions from predictions.out
   └─ Energy range: -42.74 to -10.01 kcal/mol
 ✓ Loaded 7 features from annotation.gtf
-✓ Found 86 intersecting off-target candidates
+✓ Found 85 intersecting off-target candidates
                              Top 10 Candidates (By P_off_target)
 ┏━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
 ┃ sirna_id ┃ chrom ┃ gene_id ┃ transcript_id ┃ energy ┃ dG_total ┃ P_off_target ┃ exp_value ┃
@@ -153,13 +142,13 @@ Calculating probabilities...
 │ siRNA_3  │ chr1  │ gene_4  │ transcript_4  │ -42.74 │ -36.94   │ 1            │ 2000      │
 │ siRNA_2  │ chr1  │ gene_2  │ transcript_2  │ -32.26 │ -26.66   │ 1            │ 300       │
 │ siRNA_1  │ chr1  │ gene_1  │ transcript_1  │ -38.9  │ -32.7    │ 1            │ 1500      │
-│ siRNA_5  │ chr1  │ gene_7  │ transcript_7  │ -29.44 │ -23.34   │ 0.9954       │ 1200      │
+│ siRNA_5  │ chr1  │ gene_7  │ transcript_7  │ -29.43 │ -23.33   │ 0.9954       │ 1200      │
 │ siRNA_4  │ chr1  │ gene_6  │ transcript_6  │ -34.15 │ -28.35   │ 0.7272       │ 600       │
 │ siRNA_4  │ chr1  │ gene_5  │ transcript_5  │ -34.15 │ -28.85   │ 0.2728       │ 100       │
-│ siRNA_5  │ chr1  │ gene_1  │ transcript_1  │ -22.59 │ -19.89   │ 0.004643     │ 1500      │
-│ siRNA_1  │ chr1  │ gene_4  │ transcript_4  │ -29.64 │ -23.74   │ 6.429e-07    │ 2000      │
-│ siRNA_2  │ chr1  │ gene_7  │ transcript_7  │ -21.59 │ -16.09   │ 1.415e-07    │ 1200      │
-│ siRNA_5  │ chr1  │ gene_4  │ transcript_4  │ -14.73 │ -9.634   │ 3.662e-10    │ 2000      │
+│ siRNA_5  │ chr1  │ gene_1  │ transcript_1  │ -22.58 │ -19.88   │ 0.004587     │ 1500      │
+│ siRNA_1  │ chr1  │ gene_4  │ transcript_4  │ -29.65 │ -23.75   │ 6.553e-07    │ 2000      │
+│ siRNA_2  │ chr1  │ gene_7  │ transcript_7  │ -21.54 │ -16.04   │ 1.3e-07      │ 1200      │
+│ siRNA_5  │ chr1  │ gene_4  │ transcript_4  │ -14.65 │ -9.555   │ 3.228e-10    │ 2000      │
 └──────────┴───────┴─────────┴───────────────┴────────┴──────────┴──────────────┴───────────┘
 ```
 
@@ -288,12 +277,25 @@ If you already have RIsearch output, skip this step and pass the file (or a
 directory of per-siRNA Parquet files, which enables parallel per-siRNA
 processing) to `-r`.
 
-Otherwise, let `off-targets` run RIsearch in-process via `-s/--sirna-fasta` +
-`--target-fasta` (as in the full example above). For a full genome, build the
-index once with `sioff index genome.fa` (suffix-array construction is the
-expensive part) and pass it with `-idx`; search parameters (seed length,
-energy threshold, extension, energy matrix) are documented under
-[`sioff search`](#search).
+Otherwise, generate the predictions with RIsearch in two commands: build the
+target index once (suffix-array construction is the expensive part; reuse
+`genome.idx` for every later search against this genome), then search your
+siRNAs against it:
+
+```bash
+sioff index genome.fa -o genome.idx
+sioff search sirnas.fa genome.idx -t genome.fa -o predictions.tsv
+```
+
+`predictions.tsv` is what Step 3 reads with `-r`. The defaults are seed length
+6, energy threshold −10 kcal/mol, extension 20 nt and the Turner 2004 energy
+matrix; change them with `-s`, `-E`, `-e` and `-z` (see
+[`sioff search`](#search)).
+
+Alternatively, skip the separate file: `off-targets` runs the same search
+in-process when given `-s/--sirna-fasta sirnas.fa --target-fasta genome.fa`
+(plus `-idx genome.idx` to reuse the index) instead of `-r`, as in the
+[full example](#full-example-recompute-everything-from-fasta).
 
 ### Step 2 — Accessibility profiles
 
@@ -317,7 +319,7 @@ uses hybridization energy and expression only.
 
 ```bash
 sioff off-targets \
-  -r predictions.out \
+  -r predictions.tsv \
   -t annotation.gtf \
   -a accessibility/ \
   --expression-metric RPKM \
@@ -453,23 +455,45 @@ Available on `sioff` itself, before any subcommand.
 
 siOFF can be used as a library — `import sioff`, then call the commands as plain functions; they return their results in-memory.
 
+The example below runs on the bundled example data; like the
+[Quick start](#quick-start-run-the-bundled-example), run it from the root of a
+clone of the repository.
+
 ```python
+from pathlib import Path
+
 import sioff
 
+data = Path("examples/data")
+
 # Off-target analysis on a pre-computed predictions file → polars.DataFrame
-df = sioff.off_targets(risearch_file="predictions.tsv", gtf_file="annotations.gtf")
+df = sioff.off_targets(
+    risearch_file=data / "predictions.out",
+    gtf_file=data / "annotation.gtf",
+    accessibility_dir=data / "accessibility",
+)
+print(
+    df.sort("P_off_target", descending=True)
+    .select("sirna_id", "gene_id", "energy", "dG_total", "P_off_target")
+    .head()
+)
 
 # Pre-compute per-chromosome accessibility profiles → dict[chrom -> polars.DataFrame]
-profiles = sioff.accessibility(genome="genome.fa")
+profiles = sioff.accessibility(genome=data / "genome.fa")
 
 # Build a RIsearch index → Path (risearch bindings, in-process)
-idx = sioff.index("target.fa")
+Path("example_run").mkdir(exist_ok=True)
+idx = sioff.index(data / "genome.fa", output="example_run/genome.idx")
 
 # Run a RIsearch search → polars.DataFrame (risearch bindings, in-process)
-hits = sioff.search("query.fa", "target.fa.idx", target="target.fa")
+hits = sioff.search(data / "sirnas.fa", idx, target=data / "genome.fa")
 
 # ... and feed hits and profiles straight into the analysis, no intermediate files
-df = sioff.off_targets(predictions=hits, accessibility=profiles, gtf_file="annotations.gtf")
+df = sioff.off_targets(
+    predictions=hits,
+    accessibility=profiles,
+    gtf_file=data / "annotation.gtf",
+)
 ```
 
 **Notes**
@@ -529,6 +553,40 @@ pipeline's default behaviour.
 
 `--legacy-format` additionally writes the RIsearch2 pipeline's `.results`
 files, for byte-level comparison with old runs.
+
+---
+
+## Advanced installation
+
+### CPUs without AVX2
+
+On a CPU without AVX2 (roughly pre-2013 Intel, e.g. Sandy/Ivy Bridge Xeons)
+the default polars runtime crashes with an illegal instruction; polars warns
+"Missing required CPU features" at import. Install the compat runtime instead:
+
+```bash
+pip install "sioff[lts-cpu]"   # SSE4-only polars runtime, for siOFF and risearch alike
+```
+
+With both runtimes installed polars picks the compat one; set
+`POLARS_PREFER_PKG=32` to force the AVX2 runtime on a machine that has it.
+
+### Development install
+
+From a clone:
+
+```bash
+git clone https://github.com/RTH-tools/siOFF.git
+cd siOFF
+uv sync                    # runtime deps + dev tooling (ruff, pyrefly, pytest)
+uv run sioff --help
+```
+
+`uv sync` also installs the compat polars runtime (the `lts` dependency group,
+on by default because the development server has no AVX2). On a modern machine
+use `uv sync --no-group lts` for the AVX2 runtime; CI does the same.
+
+See [RIsearch](#risearch) for how the in-process engine is pinned.
 
 ---
 

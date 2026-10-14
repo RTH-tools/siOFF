@@ -18,6 +18,7 @@ classifiers = [
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
   "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: 3.15",
   "Topic :: Scientific/Engineering :: Bio-Informatics",
   "Intended Audience :: Science/Research",
 ]
@@ -30,9 +31,11 @@ dependencies = [
   # Plain polars, deliberately without the `rtcompat` extra: polars prefers the
   # compat (SSE4-only) runtime over the AVX2 one whenever both are installed,
   # so listing `polars[rtcompat]` here would make every install run the slow
-  # runtime. Old CPUs opt in with the `lts-cpu` extra below. Same floor as
-  # risearch.
-  "polars>=1.43.2",
+  # runtime. Old CPUs opt in with the `lts-cpu` extra below.
+  # Floor 2.0.0 for Python 3.15: 3.15 no longer stores the implicit `None` in
+  # `co_consts`, and polars < 2.0 uses that to find the Series methods it
+  # forwards to Expr, so on 3.15 `Series.unique()` & co. silently return None.
+  "polars>=2.0.0",
   "pyarrow",
   "pyyaml",
   "rich>=14.3.0",
