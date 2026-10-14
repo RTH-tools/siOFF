@@ -14,6 +14,52 @@ from sioff.models import PredictionsMode
 _BATCH_SIZE = 50_000
 
 
+_SITE_KEY = ["sirna_id", "chrom", "start", "end", "strand", "energy"]
+
+
+def _one_row_per_site_and_feature(df: pl.DataFrame) -> pl.DataFrame:
+    """Collapse the overlap rows of one binding site to one row per feature ID.
+
+    A site can overlap several annotation rows with the same transcript_id:
+
+    * GTF/GFF (gene_id != transcript_id): the rows are exons of one transcript
+      (a site spanning an exon boundary). The transcript is one molecule and
+      counts once; the first row is kept.
+    * BED (one ID column, so gene_id == transcript_id): each distinct row is a
+      distinct feature of that ID -- e.g. a gene-keyed file with one row per
+      transcript exon and per-transcript TPM -- so the site's weight is the sum
+      of exp_value over the distinct rows covering it. An exact duplicate row
+      (same start, end and value) is the same feature listed twice and counts
+      once. Keeping an arbitrary single row instead made the weight depend on
+      row order (an on-target site's weight could be 0 or the top isoform's TPM).
+
+    Row order of the result follows the first occurrence of each site/feature,
+    and values are summed in (trans_start, trans_end, exp_value) order, so the
+    result does not depend on the order the interval index returned the rows in.
+    """
+    key = _SITE_KEY + ["transcript_id"]
+    if df.height == 0 or not df.select(pl.struct(key).is_duplicated().any()).item():
+        return df
+    df = df.with_row_index("_row")
+    first = df.unique(subset=key, keep="first", maintain_order=True)
+    bed = df.filter(pl.col("gene_id") == pl.col("transcript_id"))
+    if bed.height == 0:
+        return first.drop("_row")
+    summed = (
+        bed.unique(subset=key + ["trans_start", "trans_end", "exp_value"])
+        .sort(key + ["trans_start", "trans_end", "exp_value"])
+        .group_by(key, maintain_order=True)
+        .agg(pl.col("exp_value").sum().alias("_exp_sum"))
+    )
+    out = first.join(summed, on=key, how="left", nulls_equal=True)
+    out = out.with_columns(
+        pl.coalesce("_exp_sum", "exp_value")
+        .cast(df.schema["exp_value"])
+        .alias("exp_value")
+    )
+    return out.sort("_row").drop("_row", "_exp_sum")
+
+
 class IntersectionService:
     """Service to intersect off-target predictions with genomic features."""
 
@@ -145,21 +191,8 @@ class IntersectionService:
             _match_time[0] += time.perf_counter() - _tm
 
             if results:
-                combined = pl.concat(results, how="diagonal")
                 return [
-                    combined.unique(
-                        subset=[
-                            "sirna_id",
-                            "chrom",
-                            "start",
-                            "end",
-                            "strand",
-                            "energy",
-                            "transcript_id",
-                        ],
-                        keep="first",
-                        maintain_order=True,
-                    )
+                    _one_row_per_site_and_feature(pl.concat(results, how="diagonal"))
                 ]
             return []
 
