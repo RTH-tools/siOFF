@@ -131,10 +131,10 @@ This should produce the `example_run/off_targets.tsv` file and print a summary l
 
 ```
 Calculating probabilities...
-✓ Loaded 233 predictions from predictions.out
+✓ Loaded 231 predictions from predictions.out
   └─ Energy range: -42.74 to -10.01 kcal/mol
 ✓ Loaded 7 features from annotation.gtf
-✓ Found 86 intersecting off-target candidates
+✓ Found 85 intersecting off-target candidates
                              Top 10 Candidates (By P_off_target)
 ┏━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
 ┃ sirna_id ┃ chrom ┃ gene_id ┃ transcript_id ┃ energy ┃ dG_total ┃ P_off_target ┃ exp_value ┃
@@ -142,13 +142,13 @@ Calculating probabilities...
 │ siRNA_3  │ chr1  │ gene_4  │ transcript_4  │ -42.74 │ -36.94   │ 1            │ 2000      │
 │ siRNA_2  │ chr1  │ gene_2  │ transcript_2  │ -32.26 │ -26.66   │ 1            │ 300       │
 │ siRNA_1  │ chr1  │ gene_1  │ transcript_1  │ -38.9  │ -32.7    │ 1            │ 1500      │
-│ siRNA_5  │ chr1  │ gene_7  │ transcript_7  │ -29.44 │ -23.34   │ 0.9954       │ 1200      │
+│ siRNA_5  │ chr1  │ gene_7  │ transcript_7  │ -29.43 │ -23.33   │ 0.9954       │ 1200      │
 │ siRNA_4  │ chr1  │ gene_6  │ transcript_6  │ -34.15 │ -28.35   │ 0.7272       │ 600       │
 │ siRNA_4  │ chr1  │ gene_5  │ transcript_5  │ -34.15 │ -28.85   │ 0.2728       │ 100       │
-│ siRNA_5  │ chr1  │ gene_1  │ transcript_1  │ -22.59 │ -19.89   │ 0.004643     │ 1500      │
-│ siRNA_1  │ chr1  │ gene_4  │ transcript_4  │ -29.64 │ -23.74   │ 6.429e-07    │ 2000      │
-│ siRNA_2  │ chr1  │ gene_7  │ transcript_7  │ -21.59 │ -16.09   │ 1.415e-07    │ 1200      │
-│ siRNA_5  │ chr1  │ gene_4  │ transcript_4  │ -14.73 │ -9.634   │ 3.662e-10    │ 2000      │
+│ siRNA_5  │ chr1  │ gene_1  │ transcript_1  │ -22.58 │ -19.88   │ 0.004587     │ 1500      │
+│ siRNA_1  │ chr1  │ gene_4  │ transcript_4  │ -29.65 │ -23.75   │ 6.553e-07    │ 2000      │
+│ siRNA_2  │ chr1  │ gene_7  │ transcript_7  │ -21.54 │ -16.04   │ 1.3e-07      │ 1200      │
+│ siRNA_5  │ chr1  │ gene_4  │ transcript_4  │ -14.65 │ -9.555   │ 3.228e-10    │ 2000      │
 └──────────┴───────┴─────────┴───────────────┴────────┴──────────┴──────────────┴───────────┘
 ```
 
