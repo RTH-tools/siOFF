@@ -107,7 +107,7 @@ the `--sirna-fasta` in-process mode of `off-targets`).
 For development, from a clone:
 
 ```bash
-git clone git@github.com:RTH-tools/siOFF.git
+git clone https://github.com/RTH-tools/siOFF.git
 cd siOFF
 uv sync                    # runtime deps + dev tooling (ruff, pyrefly, pytest)
 uv run sioff --help
