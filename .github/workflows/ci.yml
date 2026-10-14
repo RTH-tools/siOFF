@@ -67,7 +67,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.11", "3.12", "3.13", "3.14"]
+        python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
         # macOS on the oldest and newest Python. `macos-latest` (Apple Silicon)
         # is the runner risearch itself tests and builds its wheels on, so this
         # covers exactly the platform its published wheel targets. An Intel run
@@ -77,7 +77,7 @@ jobs:
           - os: macos-latest
             python-version: "3.11"
           - os: macos-latest
-            python-version: "3.14"
+            python-version: "3.15"
     steps:
       - uses: actions/checkout@v4
       - name: Install uv + Python
@@ -86,7 +86,8 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: true
       # --frozen resolves the correct per-version dependency set from the
-      # single universal uv.lock for this matrix.python-version.
+      # single universal uv.lock for this matrix.python-version. On 3.15,
+      # viennarna, ncls and pyyaml have no wheels yet and build from source.
       - run: uv sync --frozen --no-group lts
       # risearch comes from PyPI now, so the in-process index/search tests run
       # here too instead of auto-skipping.

@@ -5,6 +5,7 @@ from typing import Annotated, Any, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
@@ -571,7 +572,9 @@ def run(
 
             profiler.print_summary(console)
             if _worker_error is not None:
-                console.print(f"[bold red]Error:[/bold red] {_worker_error}")
+                console.print(
+                    f"[bold red]Error:[/bold red] {escape(str(_worker_error))}"
+                )
                 for name, err in _worker_error.failures[:10]:
                     console.print(f"  {name}: {err}", markup=False, highlight=False)
                 if _worker_error.n_failed > 10:
@@ -767,10 +770,10 @@ def run(
     except typer.Exit:
         raise
     except FileNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {e}")
+        console.print(f"[bold red]Error:[/bold red] {escape(str(e))}")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[bold red]Failed:[/bold red] {e}")
+        console.print(f"[bold red]Failed:[/bold red] {escape(str(e))}")
         if verbose:
             console.print_exception()
         raise typer.Exit(code=1)

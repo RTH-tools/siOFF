@@ -1,5 +1,6 @@
 """Service for parsing RIsearch2 output files."""
 
+import gzip
 from pathlib import Path
 
 import polars as pl
@@ -8,14 +9,12 @@ from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
 
 _VALID_SUFFIXES = {".gz", ".tsv", ".out", ".parquet"}
 
-_TSV_SELECT = [
-    pl.col("column_1").alias("sirna_id"),
-    pl.col("column_4").alias("chrom"),
-    pl.col("column_5").cast(pl.Int32).alias("start"),
-    pl.col("column_6").cast(pl.Int32).alias("end"),
-    pl.col("column_7").alias("strand"),
-    pl.col("column_8").cast(pl.Float32).alias("energy"),
-]
+
+def _has_search_header(path: Path) -> bool:
+    """True for the headered TSV written by ``sioff search -o``."""
+    opener = gzip.open if path.suffix == ".gz" else open
+    with opener(path, "rt") as fh:
+        return fh.readline().rstrip("\r\n").split("\t") == RISEARCH_COLUMNS
 
 
 def _check_file(path: Path) -> None:
@@ -27,18 +26,26 @@ class RIsearchParser:
     """Parser for RIsearch2 prediction output files."""
 
     def load(self, path: Path) -> pl.DataFrame:
-        """Load RIsearch2 TSV output into a validated DataFrame."""
+        """Load RIsearch2 TSV output (or ``sioff search -o`` output) into a validated DataFrame."""
         _check_file(path)
-        df = pl.read_csv(
-            path,
-            separator="\t",
-            has_header=False,
-            columns=[0, 3, 4, 5, 6, 7],
-            new_columns=RISEARCH_COLUMNS,
-            schema_overrides=RISEARCH_SCHEMA,
-            truncate_ragged_lines=True,
+        if _has_search_header(path):
+            df = pl.read_csv(path, separator="\t", infer_schema=False)
+        else:
+            # RIsearch2 layout, no header: pick columns by position. Read them
+            # as text, then name and cast: polars >= 2.0 rejects `new_columns`
+            # shorter than the file is wide.
+            df = pl.read_csv(
+                path,
+                separator="\t",
+                has_header=False,
+                columns=[0, 3, 4, 5, 6, 7],
+                infer_schema=False,
+                truncate_ragged_lines=True,
+            )
+            df = df.rename(dict(zip(df.columns, RISEARCH_COLUMNS, strict=True)))
+        return df.cast(pl.Schema(RISEARCH_SCHEMA)).filter(
+            pl.col("sirna_id").is_not_null()
         )
-        return df.filter(pl.col("sirna_id").is_not_null())
 
     def summary(self, df: pl.DataFrame) -> dict:
         """Generate summary statistics for loaded predictions."""
@@ -59,11 +66,7 @@ class RIsearchParser:
         if file_path.suffix == ".parquet":
             return pl.read_parquet(file_path)
 
-        df = (
-            pl.scan_csv(file_path, separator="\t", has_header=False)
-            .select(_TSV_SELECT)
-            .collect()
-        )
+        df = self.load(file_path)
         raw_emin = df.group_by("sirna_id").agg(
             pl.col("energy").min().alias("raw_e_min")
         )

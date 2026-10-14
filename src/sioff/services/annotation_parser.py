@@ -98,9 +98,9 @@ class AnnotationParser:
                 separator="\t",
                 has_header=False,
                 columns=range(7),
-                new_columns=headers,
                 truncate_ragged_lines=True,
             )
+            df = df.rename(dict(zip(df.columns, headers, strict=True)))
             return df.select(
                 [
                     pl.col("chrom"),
@@ -119,10 +119,10 @@ class AnnotationParser:
                 separator="\t",
                 has_header=False,
                 columns=range(6),
-                new_columns=headers,
+                infer_schema=False,
                 truncate_ragged_lines=True,
-                schema_overrides={h: pl.Utf8 for h in headers},
             )
+            df = df.rename(dict(zip(df.columns, headers, strict=True)))
             return df.select(
                 [
                     pl.col("chrom"),
