@@ -210,12 +210,14 @@ stages you will run on your own data.
 
 ```bash
 # 1 · Fold: accessibility profiles, one Parquet file per chromosome
+# run with --verbose to see the steps involved
 sioff accessibility \
   -f examples/data/genome.fa \
   -o example_run/accessibility
 
 # 2 · Predict + 3 · Score in one command: RIsearch runs in-process
 #     on the siRNA FASTA, then sites are annotated and scored
+# run with --verbose to see the steps involved
 sioff off-targets \
   -s examples/data/sirnas.fa \
   --target-fasta examples/data/genome.fa \
