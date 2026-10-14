@@ -264,7 +264,16 @@ Standalone prediction (stage 1 by itself) is also available as
 3. **Annotation with expression** — GTF, GFF3, BED6 or BED7. Expression is
    read from an attribute of your choice (`--expression-metric`, default
    `RPKM`) — annotate your GTF with RPKM/TPM values from your expression data
-   first. Sites that don't overlap any feature are dropped.
+   first. Sites that don't overlap any feature are dropped. A site counts once
+   per transcript: with GTF/GFF3, a site touching two exons of one transcript
+   counts that transcript once. A BED file has a single ID column (used as both
+   gene and transcript ID), so each distinct row is treated as a separate
+   feature of that ID: a site's weight is the **sum** of the values of the
+   distinct rows with that ID covering it (an exact duplicate line counts
+   once). A gene-keyed BED with one row per transcript exon and per-transcript
+   TPM therefore weights a site by the summed TPM of the isoforms covering it;
+   for a gene-level BED, merge each gene's exons first so every position
+   appears once.
 4. Either **pre-computed [RIsearch](https://github.com/RTH-tools/risearch)
    predictions** (TSV / `.out.gz` / directory
    of per-siRNA Parquet files) **or** a siRNA FASTA plus target FASTA so siOFF
