@@ -6,7 +6,7 @@ never passed it, so bumping the pin moved E_min from -40.2956 to -33.2956
 without a line of siOFF changing.
 
 Pinning it means a future upstream default change is a no-op for us, and any
-deliberate change is a visible diff in this repo. See saiden89/risearch#27 for
+deliberate change is a visible diff in this repo. See RTH-tools/risearch#27 for
 why the parameter is not comparable across versions anyway (units, sign and
 effect on the reported energy all differ).
 """

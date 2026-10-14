@@ -1,14 +1,14 @@
 # siOFF
 
-[![CI](https://github.com/lorenzo-22/siOFF/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/lorenzo-22/siOFF/actions/workflows/ci.yml?query=branch%3Amain)
-[![Release](https://img.shields.io/github/v/release/lorenzo-22/siOFF?include_prereleases&sort=semver)](https://github.com/lorenzo-22/siOFF/releases)
+[![CI](https://github.com/RTH-tools/siOFF/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/RTH-tools/siOFF/actions/workflows/ci.yml?query=branch%3Amain)
+[![Release](https://img.shields.io/github/v/release/RTH-tools/siOFF?include_prereleases&sort=semver)](https://github.com/RTH-tools/siOFF/releases)
 [![PyPI](https://img.shields.io/pypi/v/sioff)](https://pypi.org/project/sioff/)
-[![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](https://github.com/lorenzo-22/siOFF/blob/main/LICENSE)
-[![Python](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2Florenzo-22%2FsiOFF%2Fmain%2Fpyproject.toml)](https://github.com/lorenzo-22/siOFF/blob/main/pyproject.toml)
+[![License](https://img.shields.io/badge/license-BUSL--1.1-blue)](https://github.com/RTH-tools/siOFF/blob/main/LICENSE)
+[![Python](https://img.shields.io/python/required-version-toml?tomlFilePath=https%3A%2F%2Fraw.githubusercontent.com%2FRTH-tools%2FsiOFF%2Fmain%2Fpyproject.toml)](https://github.com/RTH-tools/siOFF/blob/main/pyproject.toml)
 
 siOFF — siRNA off-target discovery pipeline.
 
-Documentation (usage guide, changelog and API reference): <https://lorenzo-22.github.io/siOFF/>
+Documentation (usage guide, changelog and API reference): <https://rth-tools.github.io/siOFF/>
 
 A bioinformatics pipeline for **siRNA off-target discovery and probability quantification**. Integrates RNA-RNA interaction predictions with transcriptome annotations, RNA accessibility profiling, and thermodynamic modeling to rank off-target binding sites.
 
@@ -19,7 +19,7 @@ pipeline originally distributed with
 It keeps the same thermodynamic model and still reads legacy RIsearch2
 prediction files, but replaces the original C toolchain with a single
 Python package built on Polars, adds in-process bindings for
-[RIsearch 3](https://github.com/saiden89/risearch) (Rust/PyO3, on
+[RIsearch 3](https://github.com/RTH-tools/risearch) (Rust/PyO3, on
 [PyPI](https://pypi.org/project/risearch/) and
 [crates.io](https://crates.io/crates/risearch)),
 Parquet-based accessibility profiles, and a Slurm-aware orchestrator. A
@@ -61,7 +61,7 @@ flowchart LR
 Rounded nodes are data, rectangles are pipeline stages. Stages 1 and 2 are
 independent and can run in parallel; stage 3 combines their outputs. Stage 1
 can be skipped entirely if you already have
-[RIsearch](https://github.com/saiden89/risearch) prediction files —
+[RIsearch](https://github.com/RTH-tools/risearch) prediction files —
 `sioff off-targets` reads them directly.
 
 ---
@@ -107,7 +107,7 @@ the `--sirna-fasta` in-process mode of `off-targets`).
 For development, from a clone:
 
 ```bash
-git clone git@github.com:lorenzo-22/siOFF.git
+git clone git@github.com:RTH-tools/siOFF.git
 cd siOFF
 uv sync                    # runtime deps + dev tooling (ruff, pyrefly, pytest)
 uv run sioff --help
@@ -238,7 +238,7 @@ Standalone prediction (stage 1 by itself) is also available as
    read from an attribute of your choice (`--expression-metric`, default
    `RPKM`) — annotate your GTF with RPKM/TPM values from your expression data
    first. Sites that don't overlap any feature are dropped.
-4. Either **pre-computed [RIsearch](https://github.com/saiden89/risearch)
+4. Either **pre-computed [RIsearch](https://github.com/RTH-tools/risearch)
    predictions** (TSV / `.out.gz` / directory
    of per-siRNA Parquet files) **or** a siRNA FASTA plus target FASTA so siOFF
    can run RIsearch itself in-process.
@@ -499,10 +499,10 @@ files, for byte-level comparison with old runs.
 ## RIsearch
 
 The in-process `index` / `search` engine is
-[`risearch`](https://github.com/saiden89/risearch)
+[`risearch`](https://github.com/RTH-tools/risearch)
 ([PyPI](https://pypi.org/project/risearch/),
 [crates.io](https://crates.io/crates/risearch),
-[docs](https://saiden89.github.io/risearch/)): the RIsearch core rewritten in
+[docs](https://rth-tools.github.io/risearch/)): the RIsearch core rewritten in
 Rust with PyO3 bindings, called in-process with no subprocess or intermediate
 files. `off-targets` and `accessibility` on pre-computed predictions never
 import it.

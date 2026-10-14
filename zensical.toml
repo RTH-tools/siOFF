@@ -1,4 +1,4 @@
-# Configuration for the API documentation site (https://lorenzo-22.github.io/siOFF/),
+# Configuration for the API documentation site (https://rth-tools.github.io/siOFF/),
 # built by zensical + mkdocstrings from the docstrings of the public surface.
 # Build locally with `uv sync --group docs && uv run zensical build --clean`;
 # `.github/workflows/docs.yml` publishes it on every push to main.
@@ -7,9 +7,9 @@
 [project]
 site_name = "siOFF"
 site_description = "siOFF — siRNA off-target discovery pipeline for analyzing RIsearch3 predictions"
-site_url = "https://lorenzo-22.github.io/siOFF/"
-repo_url = "https://github.com/lorenzo-22/siOFF"
-repo_name = "lorenzo-22/siOFF"
+site_url = "https://rth-tools.github.io/siOFF/"
+repo_url = "https://github.com/RTH-tools/siOFF"
+repo_name = "RTH-tools/siOFF"
 docs_dir = "docs"
 nav = [
   { "Overview" = "index.md" },

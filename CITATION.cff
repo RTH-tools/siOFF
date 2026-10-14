@@ -7,7 +7,7 @@ abstract: >-
 type: software
 license: BUSL-1.1
 version: 0.1.0
-repository-code: "https://github.com/lorenzo-22/siOFF"
+repository-code: "https://github.com/RTH-tools/siOFF"
 authors:
   - family-names: Roncelli
     given-names: Stefano
@@ -21,7 +21,7 @@ authors:
   - family-names: Gorodkin
     given-names: Jan
     orcid: "https://orcid.org/0000-0001-5823-4000"
-# Kept in sync with saiden89/risearch's CITATION.cff — the two describe the same
+# Kept in sync with RTH-tools/risearch's CITATION.cff — the two describe the same
 # manuscript and must not disagree. Add `year:`, `volume:`, `pages:` and `doi:`
 # here and there together on acceptance.
 preferred-citation:

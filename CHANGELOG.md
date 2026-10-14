@@ -16,7 +16,7 @@ below describe changes relative to the last internal pre-release build.
 
 ### Added
 
-- API reference site at <https://lorenzo-22.github.io/siOFF/>, rendered from the
+- API reference site at <https://rth-tools.github.io/siOFF/>, rendered from the
   docstrings with Zensical and mkdocstrings and published by GitHub Actions on
   every push to `main`. The public API (`sioff.off_targets`, `sioff.accessibility`,
   `sioff.index`, `sioff.search`) and the `sioff.core` layer now carry complete
@@ -48,4 +48,4 @@ below describe changes relative to the last internal pre-release build.
 - The `t99` (Turner 1999) energy parameter set, dropped upstream in risearch
   3.0.0a3. Use `t04`.
 
-[0.1.0]: https://github.com/lorenzo-22/siOFF/releases/tag/v0.1.0
+[0.1.0]: https://github.com/RTH-tools/siOFF/releases/tag/v0.1.0
