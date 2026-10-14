@@ -42,7 +42,7 @@ body = """
     {% for commit in entry.commits %}
         - {% if commit.scope %}*({{ commit.scope }})* {% endif %}\
             {% if commit.breaking %}[**breaking**] {% endif %}\
-            {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/lorenzo-22/siOFF/commit/{{ commit.id }}))\
+            {{ commit.message | upper_first }} ([{{ commit.id | truncate(length=7, end="") }}](https://github.com/RTH-tools/siOFF/commit/{{ commit.id }}))\
     {% endfor %}
 {% endfor %}
 """
@@ -60,7 +60,7 @@ require_conventional = false
 split_commits = false
 commit_preprocessors = [
     # Squash-merged PRs carry "(#19)" in the subject: turn it into a link.
-    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/lorenzo-22/siOFF/pull/${2}))" },
+    { pattern = '\((\w+\s)?#([0-9]+)\)', replace = "([#${2}](https://github.com/RTH-tools/siOFF/pull/${2}))" },
 ]
 protect_breaking_commits = false
 commit_parsers = [

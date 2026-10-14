@@ -2,7 +2,7 @@ name: Docs
 
 # Build the API documentation site from the docstrings (zensical + mkdocstrings,
 # configured in zensical.toml) and publish it to GitHub Pages at
-# https://lorenzo-22.github.io/siOFF/.
+# https://rth-tools.github.io/siOFF/.
 #
 # One-time setup on the repository: Settings -> Pages -> Build and deployment ->
 # Source must be "GitHub Actions" (not "Deploy from a branch"), otherwise the

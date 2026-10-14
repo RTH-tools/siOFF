@@ -197,7 +197,7 @@ class RIsearchService:
                 # pin bump with no siOFF change. 0.0 matches the original C
                 # default (`extPen = 0`). Not exposed as a flag: its semantics
                 # differ across versions (units, sign, and whether it reaches
-                # the reported energy at all) — see saiden89/risearch#27.
+                # the reported energy at all) — see RTH-tools/risearch#27.
                 penalty=0.0,
             )
         except Exception as e:

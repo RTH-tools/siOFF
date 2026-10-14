@@ -46,11 +46,11 @@ dependencies = [
 ]
 
 [project.urls]
-Homepage = "https://github.com/lorenzo-22/siOFF"
-Documentation = "https://lorenzo-22.github.io/siOFF/"
-Repository = "https://github.com/lorenzo-22/siOFF"
-Issues = "https://github.com/lorenzo-22/siOFF/issues"
-Changelog = "https://github.com/lorenzo-22/siOFF/blob/main/CHANGELOG.md"
+Homepage = "https://github.com/RTH-tools/siOFF"
+Documentation = "https://rth-tools.github.io/siOFF/"
+Repository = "https://github.com/RTH-tools/siOFF"
+Issues = "https://github.com/RTH-tools/siOFF/issues"
+Changelog = "https://github.com/RTH-tools/siOFF/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 # CPUs without AVX2/FMA/BMI2 (e.g. Sandy/Ivy Bridge Xeons): `pip install
@@ -80,7 +80,7 @@ dev = [
 # AVX2 runtime (or keep the group and set POLARS_PREFER_PKG=32). CI runs
 # `--no-group lts` so it tests what a default install gets.
 lts = ["polars[rtcompat]"]
-# API documentation site (https://lorenzo-22.github.io/siOFF/), built from the
+# API documentation site (https://rth-tools.github.io/siOFF/), built from the
 # docstrings by zensical + mkdocstrings. Not a default group: install with
 # `uv sync --group docs`. Mirrors the sibling risearch project's setup.
 docs = [
