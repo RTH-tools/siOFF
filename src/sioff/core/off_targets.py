@@ -96,8 +96,7 @@ def _init_worker(
     global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN
 
     if ipc_path:
-        # polars memory-maps uncompressed IPC by default (polars 2.0 dropped
-        # the `memory_map` argument).
+        # polars 2.0 dropped read_ipc's `memory_map` argument.
         _WORKER_DF_TRANS = pl.read_ipc(Path(ipc_path))
         _WORKER_INTERSECTOR = IntersectionService()
         _WORKER_INTERSECTOR.preload_transcriptome(_WORKER_DF_TRANS)

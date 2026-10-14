@@ -29,7 +29,9 @@ class RIsearchParser:
         """Load RIsearch2 TSV output (or ``sioff search -o`` output) into a validated DataFrame."""
         _check_file(path)
         if _has_search_header(path):
-            df = pl.read_csv(path, separator="\t", infer_schema=False)
+            df = pl.read_csv(path, separator="\t", infer_schema=False).select(
+                RISEARCH_COLUMNS
+            )
         else:
             # RIsearch2 layout, no header: pick columns by position. Read them
             # as text, then name and cast: polars >= 2.0 rejects `new_columns`

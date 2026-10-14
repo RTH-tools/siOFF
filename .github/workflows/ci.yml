@@ -68,7 +68,7 @@ jobs:
       matrix:
         os: [ubuntu-latest]
         python-version: ["3.11", "3.12", "3.13", "3.14", "3.15"]
-        # macOS on the oldest and newest Python. `macos-latest` (Apple Silicon)
+        # macOS on the oldest and the two newest Pythons. `macos-latest` (Apple Silicon)
         # is the runner risearch itself tests and builds its wheels on, so this
         # covers exactly the platform its published wheel targets. An Intel run
         # (macos-15-intel, risearch built from source) passed once on
@@ -76,6 +76,9 @@ jobs:
         include:
           - os: macos-latest
             python-version: "3.11"
+          - os: macos-latest
+            python-version: "3.14"
+          # 3.15: viennarna, ncls, pyyaml and pydantic-core build from source.
           - os: macos-latest
             python-version: "3.15"
     steps:
