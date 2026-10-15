@@ -34,17 +34,17 @@ off_targets:
   # Transcriptome annotation (optional)
   # ---------------------------------------------------------------------------
 
-  # Transcriptome annotation file: GTF, GFF3, BED6, or BED7.
+  # Transcriptome annotation file: GTF or GFF3 (BED is not supported).
   # Join predictions to gene/transcript features and expression values.
   transcriptome: ../examples/data/annotation.gtf
 
   # File format for the transcriptome file. Default: "auto".
-  # Options: "auto" | "gtf" | "gff3" | "bed6" | "bed7"
-  # "auto" picks BED by extension, then distinguishes GTF from GFF3 by the
+  # Options: "auto" | "gtf" | "gff3"
+  # "auto" distinguishes GTF from GFF3 by the
   # attribute column: GTF writes `key "value";`, GFF3 writes `key=value;`.
   transcriptome_format: gtf
 
-  # Feature type to extract from GTF/GFF3 (ignored for BED). Default: "exon"
+  # Feature type to extract from GTF/GFF3. Default: "exon"
   feature: exon
 
   # Column / attribute in the annotation file that holds expression values. Default: "RPKM"

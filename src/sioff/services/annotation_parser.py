@@ -1,4 +1,4 @@
-"""Service for parsing annotation files (GTF/GFF/BED) into genomic feature DataFrames."""
+"""Service for parsing annotation files (GTF/GFF3) into genomic feature DataFrames."""
 
 import gzip
 import re
@@ -10,7 +10,7 @@ from sioff.models import GTF_SCHEMA
 
 
 class AnnotationParser:
-    """Parser for annotation files (GTF/GFF/BED) — extracts gene/transcript locations and expression."""
+    """Parser for annotation files (GTF/GFF3) — extracts gene/transcript locations and expression."""
 
     def load_gtf(
         self,
@@ -19,26 +19,33 @@ class AnnotationParser:
         score_col: str = "RPKM",
         format: str = "auto",
     ) -> pl.DataFrame:
-        """Load GTF/GFF or BED file; return DataFrame with chrom/start/end/strand/gene_id/transcript_id/exp_value."""
+        """Load a GTF or GFF3 file; return DataFrame with chrom/start/end/strand/gene_id/transcript_id/exp_value.
+
+        BED is not accepted: it has a single ID column, so overlapping rows of one
+        ID cannot be told apart as exons of one transcript (count once) or as
+        different transcripts (each counts), and a binding site's expression
+        weight would be ambiguous.
+        """
         if not path.exists():
             raise FileNotFoundError(f"Transcriptome file not found: {path}")
 
         fmt = format.lower()
-        if fmt == "auto":
-            if path.suffix.lower() in [".bed", ".bed.gz"]:
-                return self._load_bed(path)
-            else:
-                return self._load_gtf_impl(path, feature, score_col, self._sniff(path))
-        elif fmt == "bed6":
-            return self._load_bed(path, force_bed6=True)
-        elif fmt == "bed7":
-            return self._load_bed(path, force_bed7=True)
-        elif fmt in ("gff", "gff3"):
+        name = path.name.lower()
+        if fmt in ("bed", "bed6", "bed7") or (
+            fmt == "auto" and (name.endswith(".bed") or name.endswith(".bed.gz"))
+        ):
+            raise ValueError(
+                f"{path}: BED annotations are not supported. A BED file has one ID "
+                "column, so siOFF cannot tell exons of one transcript (counted once) "
+                "from different transcripts (each counted); provide a GTF or GFF3 "
+                "with gene_id, transcript_id and the expression attribute "
+                "(--expression-metric) on each exon."
+            )
+        if fmt in ("gff", "gff3"):
             return self._load_gtf_impl(path, feature, score_col, "gff3")
-        elif fmt == "gtf":
+        if fmt == "gtf":
             return self._load_gtf_impl(path, feature, score_col, "gtf")
-        else:
-            return self._load_gtf_impl(path, feature, score_col, self._sniff(path))
+        return self._load_gtf_impl(path, feature, score_col, self._sniff(path))
 
     @staticmethod
     def _sniff(path: Path) -> str:
@@ -67,76 +74,6 @@ class AnnotationParser:
         except OSError:
             pass
         return "gtf"
-
-    def _load_bed(
-        self, path: Path, force_bed6: bool = False, force_bed7: bool = False
-    ) -> pl.DataFrame:
-        if force_bed6:
-            num_cols = 6
-        elif force_bed7:
-            num_cols = 7
-        else:
-            opener = gzip.open if str(path).endswith(".gz") else open
-            try:
-                with opener(path, "rt") as f:
-                    num_cols = len(f.readline().strip().split("\t"))
-            except Exception:
-                num_cols = 6
-
-        if num_cols >= 7:
-            headers = [
-                "chrom",
-                "start",
-                "end",
-                "transcript_id",
-                "score_placeholder",
-                "strand",
-                "exp_value",
-            ]
-            df = pl.read_csv(
-                path,
-                separator="\t",
-                has_header=False,
-                columns=range(7),
-                truncate_ragged_lines=True,
-            )
-            df = df.rename(dict(zip(df.columns, headers, strict=True)))
-            return df.select(
-                [
-                    pl.col("chrom"),
-                    pl.col("start"),
-                    pl.col("end"),
-                    pl.col("strand"),
-                    pl.col("transcript_id").alias("gene_id"),
-                    pl.col("transcript_id"),
-                    pl.col("exp_value").cast(pl.Float32, strict=False).fill_null(0.0),
-                ]
-            )
-        else:
-            headers = ["chrom", "start", "end", "transcript_id", "score", "strand"]
-            df = pl.read_csv(
-                path,
-                separator="\t",
-                has_header=False,
-                columns=range(6),
-                infer_schema=False,
-                truncate_ragged_lines=True,
-            )
-            df = df.rename(dict(zip(df.columns, headers, strict=True)))
-            return df.select(
-                [
-                    pl.col("chrom"),
-                    pl.col("start").cast(pl.Int64),
-                    pl.col("end").cast(pl.Int64),
-                    pl.col("strand"),
-                    pl.col("transcript_id").alias("gene_id"),
-                    pl.col("transcript_id"),
-                    pl.col("score")
-                    .cast(pl.Float32, strict=False)
-                    .fill_null(0.0)
-                    .alias("exp_value"),
-                ]
-            )
 
     def _load_gtf_impl(
         self, path: Path, feature: str, score_col: str, fmt: str = "gtf"
@@ -177,7 +114,11 @@ class AnnotationParser:
             )
         else:
             gene_id = extract_attr("gene_id").alias("gene_id")
-            transcript_id = extract_attr("transcript_id").alias("transcript_id")
+            # An exon row without transcript_id stands for its gene's single
+            # transcript; a null would merge unrelated genes at the same site.
+            transcript_id = pl.coalesce(
+                extract_attr("transcript_id"), extract_attr("gene_id")
+            ).alias("transcript_id")
 
         out = df.select(
             [

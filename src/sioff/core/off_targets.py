@@ -80,7 +80,7 @@ def _init_worker(
     """Initialise per-worker state; called once per spawned worker process.
 
     The transcriptome is loaded from a pre-written Arrow IPC file (memory-mapped)
-    rather than being re-parsed from the original BED/GTF, so all workers share
+    rather than being re-parsed from the original GTF/GFF3, so all workers share
     the same physical memory pages via the OS page cache. ``accessibility_dir``
     is empty for chromosome-major runs (workers never load profiles). With
     ``accessibility_cache_dir`` the service memory-maps the uint8 cache the
@@ -980,7 +980,7 @@ def compute_off_targets_single(
         ``-idx/--target-index``); speeds up repeated runs. When omitted the
         index is built (or reused) next to ``target_fasta``.
     gtf_file : pathlib.Path, optional
-        Transcriptome annotation, GTF/GFF3 or BED (CLI ``-t/--transcriptome``).
+        Transcriptome annotation, GTF or GFF3 (CLI ``-t/--transcriptome``).
         When given, predictions are intersected with its features and annotated
         with ``transcript_id``, ``gene_id`` and ``exp_value``.
     feature_type : str, default "exon"
@@ -989,8 +989,8 @@ def compute_off_targets_single(
         Annotation attribute used as the expression score (CLI
         ``--expression-metric``).
     transcriptome_format : str, default "auto"
-        Annotation format: ``"auto"``, ``"gtf"``, ``"gff3"``, ``"bed6"`` or
-        ``"bed7"`` (CLI ``--transcriptome-format``). ``"auto"`` detects the
+        Annotation format: ``"auto"``, ``"gtf"`` or ``"gff3"``; BED is rejected
+        (CLI ``--transcriptome-format``). ``"auto"`` detects the
         format from the file, distinguishing GTF from GFF3 by the attribute
         column.
     accessibility : Mapping[str, polars.DataFrame], optional
@@ -1421,7 +1421,7 @@ def compute_off_targets_directory(
         ``E_min`` is computed for every siRNA and overrides the per-file
         ``raw_e_min`` before clamping (matching the legacy ``E_min`` semantics).
     gtf_file : pathlib.Path, optional
-        Transcriptome annotation, GTF/GFF3 or BED (CLI ``-t/--transcriptome``).
+        Transcriptome annotation, GTF or GFF3 (CLI ``-t/--transcriptome``).
         Loaded once, serialised to a temporary Arrow IPC file and memory-mapped
         by each worker for the intersection.
     feature_type : str, default "exon"
@@ -1430,8 +1430,8 @@ def compute_off_targets_directory(
         Annotation attribute used as the expression score (CLI
         ``--expression-metric``).
     transcriptome_format : str, default "auto"
-        Annotation format: ``"auto"``, ``"gtf"``, ``"gff3"``, ``"bed6"`` or
-        ``"bed7"`` (CLI ``--transcriptome-format``).
+        Annotation format: ``"auto"``, ``"gtf"`` or ``"gff3"``; BED is rejected
+        (CLI ``--transcriptome-format``).
     accessibility_dir : pathlib.Path, optional
         Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
         written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``);
@@ -1534,7 +1534,7 @@ def compute_off_targets_directory(
         cache_dir = _memmap_cache_dir(Path(accessibility_dir), accessibility_cache_dir)
 
     # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
-    # it instead of re-parsing the BED/GTF. Workers share pages via the OS cache.
+    # it instead of re-parsing the GTF/GFF3. Workers share pages via the OS cache.
     _ipc_tmp: Optional[str] = None
     _ipc_path: Optional[Path] = None
     if gtf_file:
