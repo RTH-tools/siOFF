@@ -37,6 +37,45 @@ def _one_row_per_site_and_feature(df: pl.DataFrame) -> pl.DataFrame:
     return df.unique(subset=_SITE_TRANSCRIPT_KEY, keep="first", maintain_order=True)
 
 
+def sort_for_preload(transcriptome_df: pl.DataFrame) -> pl.DataFrame:
+    """Order rows by (chrom, strand, start), the layout `preload_transcriptome` slices.
+
+    The sort is stable, so rows with equal keys keep their input order and the
+    result is deterministic.
+    """
+    return transcriptome_df.sort(["chrom", "strand", "start"], maintain_order=True)
+
+
+def _sorted_partition_slices(
+    df: pl.DataFrame,
+) -> dict[tuple, tuple[int, int]] | None:
+    """``{(chrom, strand): (offset, length)}`` if each pair is one start-sorted run, else None."""
+    if df.height == 0:
+        return {}
+    runs = (
+        df.select("chrom", "strand", "start")
+        .with_row_index("_row")
+        .group_by(["chrom", "strand"], maintain_order=True)
+        .agg(
+            pl.col("_row").first().alias("offset"),
+            pl.len().alias("length"),
+            (pl.col("_row").last() - pl.col("_row").first() + 1).alias("span"),
+            pl.col("start").diff().min().fill_null(0).alias("min_step"),
+        )
+    )
+    ok = runs.select(
+        ((pl.col("span") == pl.col("length")) & (pl.col("min_step") >= 0)).all()
+    ).item()
+    if not ok:
+        return None
+    return {
+        (c, st): (int(o), int(n))
+        for c, st, o, n in runs.select(
+            "chrom", "strand", "offset", "length"
+        ).iter_rows()
+    }
+
+
 class IntersectionService:
     """Service to intersect off-target predictions with genomic features."""
 
@@ -47,18 +86,36 @@ class IntersectionService:
         self._trans_ncls_index: dict[tuple, dict] | None = None
 
     def preload_transcriptome(self, transcriptome_df: pl.DataFrame) -> None:
-        """Pre-partition transcriptome and build NCLS indices for all (chrom,strand) pairs."""
-        self._trans_partition = {
-            (k, v): sub_df
-            for (k, v), sub_df in transcriptome_df.partition_by(
-                ["chrom", "strand"], as_dict=True
-            ).items()
-        }
+        """Pre-partition transcriptome and build NCLS indices for all (chrom,strand) pairs.
+
+        When the rows are already grouped by (chrom, strand) and sorted by start
+        within each group -- as the off-target driver writes them -- every
+        partition is a zero-copy slice of ``transcriptome_df``. A table read
+        from a memory-mapped Arrow IPC file then stays in the shared page cache
+        instead of being copied into each worker process (with a GENCODE GTF
+        that copy was ~0.8 GB per worker). Otherwise the table is partitioned
+        and each partition sorted, which copies it.
+        """
+        slices = _sorted_partition_slices(transcriptome_df)
+        if slices is not None:
+            self._trans_partition = {
+                key: transcriptome_df.slice(offset, length)
+                for key, (offset, length) in slices.items()
+            }
+            presorted = True
+        else:
+            self._trans_partition = {
+                (k, v): sub_df
+                for (k, v), sub_df in transcriptome_df.partition_by(
+                    ["chrom", "strand"], as_dict=True
+                ).items()
+            }
+            presorted = False
         self._trans_ncls_index = {}
         for key, sub_df in self._trans_partition.items():
             if sub_df.height > 0:
                 self._trans_ncls_index[key] = self._build_transcript_index(
-                    sub_df.sort("start")
+                    sub_df if presorted else sub_df.sort("start", maintain_order=True)
                 )
 
     def intersect(
