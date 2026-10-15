@@ -32,7 +32,7 @@ flowchart LR
     subgraph inputs [Inputs]
         Q([siRNA FASTA])
         G([Genome / transcriptome FASTA])
-        A([Annotation GTF/BED<br>with expression])
+        A([Annotation GTF/GFF3<br>with expression])
     end
 
     subgraph s1 [1 · Predict]
@@ -250,19 +250,14 @@ Standalone prediction (stage 1 by itself) is also available as
    with the annotation by genomic coordinates; `--type tw`
    (transcriptome-wide) matches the prediction's target ID against
    `transcript_id` directly.
-3. **Annotation with expression** — GTF, GFF3, BED6 or BED7. Expression is
+3. **Annotation with expression** — GTF or GFF3. Expression is
    read from an attribute of your choice (`--expression-metric`, default
    `RPKM`) — annotate your GTF with RPKM/TPM values from your expression data
    first. Sites that don't overlap any feature are dropped. A site counts once
-   per transcript: with GTF/GFF3, a site touching two exons of one transcript
-   counts that transcript once. A BED file has a single ID column (used as both
-   gene and transcript ID), so each distinct row is treated as a separate
-   feature of that ID: a site's weight is the **sum** of the values of the
-   distinct rows with that ID covering it (an exact duplicate line counts
-   once). A gene-keyed BED with one row per transcript exon and per-transcript
-   TPM therefore weights a site by the summed TPM of the isoforms covering it;
-   for a gene-level BED, merge each gene's exons first so every position
-   appears once.
+   per transcript: a site touching two exons of one transcript counts that
+   transcript once, and every transcript containing the site contributes its
+   own expression. BED is not accepted: with a single ID column it cannot say
+   which rows belong to the same transcript.
 4. Either **pre-computed [RIsearch](https://github.com/RTH-tools/risearch)
    predictions** (TSV / `.out.gz` / directory
    of per-siRNA Parquet files) **or** a siRNA FASTA plus target FASTA so siOFF
@@ -406,7 +401,7 @@ Available on `sioff` itself, before any subcommand.
 | `-s / --sirna-fasta` | siRNA FASTA — runs RIsearch in-process via PyO3 bindings |
 | `--target-fasta / --genome` | Target FASTA for in-process RIsearch |
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
-| `-t / --transcriptome` | GTF, GFF3, BED6 or BED7 annotation file |
+| `-t / --transcriptome` | GTF or GFF3 annotation file |
 | `-a / --accessibility-dir` | Directory of per-chromosome accessibility Parquet files (from `accessibility` command); with `--accessibility-strategy memmap` it may hold only the `.access.npy` cache |
 | `--accessibility-strategy` | `auto` (default), `chrom-major`, `memmap` or `eager` — see [Accessibility lookup strategy](#accessibility-lookup-strategy-large-genomes) |
 | `--accessibility-cache-dir` | `memmap` only: where the `.access.npy` cache is read from / built (default: the accessibility dir) |

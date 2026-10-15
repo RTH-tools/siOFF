@@ -79,7 +79,7 @@ def run(
         typer.Option(
             "-t",
             "--transcriptome",
-            help="Path to transcriptome annotation file (.gtf) or .bed file.",
+            help="Path to transcriptome annotation file (GTF or GFF3, optionally gzipped).",
             exists=True,
             readable=True,
         ),
@@ -102,7 +102,7 @@ def run(
         str,
         typer.Option(
             "--transcriptome-format",
-            help="Transcriptome file format: auto, gtf, gff3, bed6, or bed7 (default: auto-detect; gtf vs gff3 is detected from the attribute column).",
+            help="Transcriptome file format: auto, gtf or gff3 (default: auto-detect from the attribute column). BED is not supported: it cannot tell exons of one transcript from different transcripts.",
         ),
     ] = "auto",
     accessibility_dir: Annotated[

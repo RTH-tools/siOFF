@@ -167,7 +167,7 @@ def off_targets(
         repeated runs. When omitted the index is built (or reused) next to
         ``target_fasta`` with an ``.idx`` suffix. CLI: ``-idx/--target-index``.
     gtf_file : str or pathlib.Path, optional
-        Transcriptome annotation (GTF, GFF3, BED6 or BED7). Predictions are
+        Transcriptome annotation (GTF or GFF3). Predictions are
         intersected with its features, which adds ``transcript_id``,
         ``gene_id`` and the expression column ``exp_value``. Without it no
         intersection is performed and every prediction is kept with unit
@@ -178,7 +178,7 @@ def off_targets(
         Annotation attribute used as the expression score (``exp_value``).
         CLI: ``--expression-metric``.
     transcriptome_format : str, default "auto"
-        One of ``"auto"``, ``"gtf"``, ``"gff3"``, ``"bed6"`` or ``"bed7"``.
+        One of ``"auto"``, ``"gtf"`` or ``"gff3"``; BED is rejected.
         ``"auto"`` detects the format from the file, telling GTF from GFF3 by
         the attribute column. CLI: ``--transcriptome-format``.
     accessibility : dict[str, polars.DataFrame], optional
