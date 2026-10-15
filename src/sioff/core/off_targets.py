@@ -48,7 +48,10 @@ from sioff.services.accessibility import (
     gather_opening_energies,
 )
 from sioff.services.annotation_parser import AnnotationParser
-from sioff.services.intersection_service import IntersectionService
+from sioff.services.intersection_service import (
+    IntersectionService,
+    sort_for_preload,
+)
 from sioff.services.probability import ProbabilityService
 from sioff.services.profiling import PipelineProfiler
 from sioff.services.risearch_parser import RIsearchParser
@@ -66,6 +69,24 @@ _WORKER_INTERSECTOR: Optional[object] = None
 _WORKER_PROB_SERVICE: Optional[object] = None
 _WORKER_ON_TARGET_MAP: dict = {}
 _WORKER_SELF_HYB_EMIN: dict = {}
+
+
+def _read_shared_ipc(path: Path) -> pl.DataFrame:
+    """Polars view of an uncompressed Arrow IPC file, memory-mapped (no copy).
+
+    Parameters
+    ----------
+    path : pathlib.Path
+        Arrow IPC file written uncompressed.
+
+    Returns
+    -------
+    polars.DataFrame
+        Columns backed by the memory map, so processes reading the same file
+        share its pages.
+    """
+    table = pyarrow.ipc.open_file(pa.memory_map(str(path))).read_all()
+    return cast(pl.DataFrame, pl.from_arrow(table, rechunk=False))
 
 
 def _init_worker(
@@ -96,8 +117,12 @@ def _init_worker(
     global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN
 
     if ipc_path:
-        # polars 2.0 dropped read_ipc's `memory_map` argument.
-        _WORKER_DF_TRANS = pl.read_ipc(Path(ipc_path))
+        # Memory-map the transcriptome the parent wrote (sorted, uncompressed,
+        # classic Arrow string layout) through pyarrow: the columns stay views of
+        # the shared page cache, and preload_transcriptome slices them without a
+        # copy. polars 2.0's read_ipc copies the file into each worker (~0.85 GB
+        # private per worker for a GENCODE GTF, against ~0.12 GB this way).
+        _WORKER_DF_TRANS = _read_shared_ipc(Path(ipc_path))
         _WORKER_INTERSECTOR = IntersectionService()
         _WORKER_INTERSECTOR.preload_transcriptome(_WORKER_DF_TRANS)
 
@@ -1545,9 +1570,15 @@ def compute_off_targets_directory(
             score_col=expression_metric,
             format=transcriptome_format,
         )
+        # Sorted by (chrom, strand, start) so each worker's partitions are
+        # zero-copy slices of the memory-mapped file, and uncompressed so the
+        # file can be memory-mapped at all; see preload_transcriptome.
+        df_trans = sort_for_preload(df_trans)
         _ipc_tmp = tempfile.mkdtemp(prefix="risearch_ipc_")
         _ipc_path = Path(_ipc_tmp) / "transcriptome.arrow"
-        df_trans.write_ipc(_ipc_path)
+        df_trans.write_ipc(
+            _ipc_path, compression="uncompressed", compat_level=pl.CompatLevel.oldest()
+        )
 
     on_target_map: dict[str, str] = {}
     if on_target_ids_file is not None:
