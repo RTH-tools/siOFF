@@ -92,6 +92,7 @@ def off_targets(
     max_span: int = 40,
     unpaired_prob: int = 30,
     temperature: float = 37.0,
+    matrix: Union[str, Path] = "t04",
     on_target_file: Optional[Union[str, Path]] = None,
     on_target_risearch_file: Optional[Union[str, Path]] = None,
     query_file: Optional[Union[str, Path]] = None,
@@ -218,6 +219,11 @@ def off_targets(
         Folding temperature in degrees Celsius. Affects both on-the-fly
         accessibility and the ``RT`` term of the partition function. CLI:
         ``-T/--temperature``.
+    matrix : str or pathlib.Path, default "t04"
+        Energy parameter set for the in-process search and for the
+        self-hybridisation E_min of ``sirna_fasta``: a bundled id or the path of
+        a DSM TSV table. Use the set the predictions were searched with; E_min
+        is the reference energy of the alpha/gamma clamp. CLI: ``-z/--matrix``.
     on_target_file : str or pathlib.Path, optional
         On-target sequence FASTA for the single-siRNA partition function; its
         hybridisation energy against ``query_file`` is computed in-process with
@@ -370,6 +376,7 @@ def off_targets(
             accessibility_dir=_p(accessibility_dir),
             accessibility_cache_dir=_p(accessibility_cache_dir),
             temperature=temperature,
+            matrix=matrix,
             on_target_ids_file=_p(on_target_ids_file),
             on_target_expression=on_target_expression,
             alpha=alpha,
@@ -403,6 +410,7 @@ def off_targets(
         max_span=max_span,
         unpaired_prob=unpaired_prob,
         temperature=temperature,
+        matrix=matrix,
         on_target_file=_p(on_target_file),
         on_target_risearch_file=_p(on_target_risearch_file),
         query_file=_p(query_file),

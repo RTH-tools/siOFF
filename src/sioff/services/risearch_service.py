@@ -234,11 +234,16 @@ class RIsearchService:
         logger.info(f"Search complete: {df.height} hits")
         return df
 
-    def self_hybridization_emin(self, sequence: str, sirna_id: str = "query") -> float:
+    def self_hybridization_emin(
+        self, sequence: str, sirna_id: str = "query", matrix: Union[str, Path] = "t04"
+    ) -> float:
         """Compute E_min by searching a siRNA against itself.
 
         seed_length = len(seq) - 1 ensures only near-full-length hybridisations,
         replicating ``risearch2.x -q siRNA.fa -i siRNA.pksuf -s len-1 -e 0``.
+        ``matrix`` is the energy parameter set (bundled id or DSM TSV path) and
+        should be the one the predictions were searched with, since E_min is the
+        reference energy their alpha/gamma clamp is measured against.
         Returns 0.0 if no hits found.
         """
         seq_dna = sequence.upper().replace("U", "T")
@@ -253,6 +258,7 @@ class RIsearchService:
                 target_fasta=fasta_path,
                 seed_length=len(seq_dna) - 1,
                 energy_threshold=0.0,
+                matrix=matrix,
             )
             if df.is_empty():
                 logger.warning(
@@ -263,11 +269,14 @@ class RIsearchService:
             logger.debug(f"Self-hyb E_min {sirna_id}: {emin:.4f} kcal/mol")
             return emin
 
-    def self_hybridization_emin_batch(self, fasta_path: Path) -> Dict[str, float]:
+    def self_hybridization_emin_batch(
+        self, fasta_path: Path, matrix: Union[str, Path] = "t04"
+    ) -> Dict[str, float]:
         """Compute self-hybridisation E_min for all siRNAs in a FASTA file.
 
         Each siRNA is searched against itself (seed_length = len - 1, energy ≤ 0),
-        replicating the old pipeline's minimum-energy anchor for alpha/gamma clamping.
+        replicating the old pipeline's minimum-energy anchor for alpha/gamma
+        clamping, with energy parameter set ``matrix``.
         """
         if not fasta_path.exists():
             raise FileNotFoundError(f"siRNA FASTA not found: {fasta_path}")
@@ -276,7 +285,10 @@ class RIsearchService:
         logger.info(
             f"Computing self-hybridisation E_min for {len(records)} siRNA(s)..."
         )
-        result = {r.id: self.self_hybridization_emin(str(r.seq), r.id) for r in records}
+        result = {
+            r.id: self.self_hybridization_emin(str(r.seq), r.id, matrix=matrix)
+            for r in records
+        }
         logger.info(f"Self-hybridisation complete: {len(result)} siRNA(s) processed")
         return result
 

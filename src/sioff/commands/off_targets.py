@@ -182,6 +182,20 @@ def run(
             help="Folding temperature in °C (default 37.0). Affects both accessibility and partition function.",
         ),
     ] = 37.0,
+    matrix: Annotated[
+        str,
+        typer.Option(
+            "--matrix",
+            "-z",
+            help=(
+                "Energy parameter set for in-process searches and the "
+                "self-hybridisation E_min of --sirna-fasta: 't04', 'slh04', "
+                "'s95-rna-dna', 's95-dna-rna', or the path of a DSM TSV table. Use "
+                "the set the predictions were searched with: E_min is the reference "
+                "energy of the alpha/gamma clamp."
+            ),
+        ),
+    ] = "t04",
     on_target_file: Annotated[
         Optional[Path],
         typer.Option(
@@ -451,6 +465,7 @@ def run(
                 accessibility_dir=accessibility_dir,
                 accessibility_cache_dir=accessibility_cache_dir,
                 temperature=temperature,
+                matrix=matrix,
                 on_target_ids_file=on_target_ids_file,
                 on_target_expression=on_target_expression,
                 alpha=alpha,
@@ -633,6 +648,7 @@ def run(
                 max_span=max_span,
                 unpaired_prob=unpaired_prob,
                 temperature=temperature,
+                matrix=matrix,
                 on_target_file=on_target_file,
                 on_target_risearch_file=on_target_risearch_file,
                 query_file=query_file,

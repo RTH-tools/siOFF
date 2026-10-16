@@ -32,6 +32,9 @@ class OffTargetsConfig:
     on_target_expression: float = 1000.0
     on_target_accessibility: Optional[str] = None
     temperature: float = 37.0
+    matrix: str = (
+        "t04"  # bundled DSM id, or a DSM TSV path (resolved like the other paths)
+    )
     alpha: str = "1.0"
     gamma: str = "1.0"
     theta: str = ""
@@ -98,6 +101,13 @@ def _resolve_paths(cfg: DictConfig, base_dir: Path) -> DictConfig:
         "accessibility": ["fasta", "output"],
     }
 
+    # matrix is a bundled id or a TSV path; only a relative path that exists
+    # next to the config file is resolved.
+    ot = getattr(cfg, "off_targets", None)
+    if ot is not None and isinstance(getattr(ot, "matrix", None), str):
+        candidate = base_dir / ot.matrix
+        if not Path(ot.matrix).is_absolute() and candidate.is_file():
+            ot.matrix = str(candidate)
     for section, fields in path_fields.items():
         section_cfg = getattr(cfg, section, None)
         if section_cfg is None:

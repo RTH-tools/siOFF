@@ -422,6 +422,7 @@ Available on `sioff` itself, before any subcommand.
 | `-L / --span` | Max base-pair span L (default: 40) |
 | `-u / --unpaired` | Unpaired probability length u (default: 30) |
 | `-T / --temperature` | Folding temperature °C (default: 37.0) |
+| `-z / --matrix` | Energy parameter set (`t04`, `slh04`, `s95-rna-dna`, `s95-dna-rna` or a DSM TSV path) for in-process searches and the self-hybridisation E_min of `-s`; use the set the predictions were searched with (default: `t04`) |
 | `-j / --workers` | Parallel workers, one per chromosome (default: 1) |
 
 ### `index`
