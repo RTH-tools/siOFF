@@ -69,6 +69,9 @@ _WORKER_INTERSECTOR: Optional[object] = None
 _WORKER_PROB_SERVICE: Optional[object] = None
 _WORKER_ON_TARGET_MAP: dict = {}
 _WORKER_SELF_HYB_EMIN: dict = {}
+# --summary-only: score per siRNA with ProbabilityService(aggregate_only=True)
+# and return only the metadata, no per-site table.
+_WORKER_SUMMARY_ONLY: bool = False
 
 
 def _read_shared_ipc(path: Path) -> pl.DataFrame:
@@ -97,6 +100,7 @@ def _init_worker(
     self_hyb_emin: dict,
     temperature: float = 37.0,
     accessibility_cache_dir: str = "",
+    summary_only: bool = False,
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
 
@@ -114,7 +118,7 @@ def _init_worker(
     pa.set_cpu_count(max(1, polars_max_threads))
 
     global _WORKER_DF_TRANS, _WORKER_INTERSECTOR, _WORKER_PROB_SERVICE
-    global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN
+    global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN, _WORKER_SUMMARY_ONLY
 
     if ipc_path:
         # Memory-map the transcriptome the parent wrote (sorted, uncompressed,
@@ -141,6 +145,7 @@ def _init_worker(
     # Store per-run constants so they don't need to be pickled per task.
     _WORKER_ON_TARGET_MAP = on_target_map
     _WORKER_SELF_HYB_EMIN = self_hyb_emin
+    _WORKER_SUMMARY_ONLY = summary_only
 
 
 def _process_one_sirna(
@@ -211,6 +216,7 @@ def _process_one_sirna(
         theta_values=theta_vals,
         on_target_map=on_target_map,
         on_target_expression=on_target_expression,
+        aggregate_only=_m._WORKER_SUMMARY_ONLY,
     )
     _t_prob = time.perf_counter()
 
@@ -530,6 +536,7 @@ def _pass3_finish_sirna(
         on_target_map=on_target_map,
         on_target_expression=on_target_expression,
         precomputed_opening_energy=True,
+        aggregate_only=_m._WORKER_SUMMARY_ONLY,
     )
     _t_prob = time.perf_counter()
 
@@ -1399,6 +1406,7 @@ def compute_off_targets_directory(
     predictions_type: str = "gw",
     n_workers: int = 1,
     accessibility_strategy: str = "auto",
+    summary_only: bool = False,
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
     """Compute off-target probabilities for a directory of per-siRNA files.
 
@@ -1518,6 +1526,11 @@ def compute_off_targets_directory(
         How opening energies are looked up when ``accessibility_dir`` is given
         (CLI ``--accessibility-strategy``); see above. ``"auto"`` is
         ``"chrom-major"``. Ignored without ``accessibility_dir``.
+    summary_only : bool, default False
+        Only the per-siRNA sums are needed (CLI ``--summary-only``): workers
+        score with ``aggregate_only`` and ``df`` is empty, so no per-site table
+        is built or sent back to this process. ``meta`` is unchanged and
+        carries ``"n_rows"``, the number of scored site x transcript rows.
 
     Yields
     ------
@@ -1528,7 +1541,8 @@ def compute_off_targets_directory(
         ``gtf_file`` is given, ``opening_energy``, ``dG_total``,
         ``is_on_target`` and ``P_off_target``, plus ``dG_total``, ``energy`` and
         ``P_off_target`` repeated with a ``:alpha=A,gamma=G`` or ``:theta=T``
-        suffix for each extra parameter set. ``meta`` contains ``"n_sirnas"``,
+        suffix for each extra parameter set (empty with ``summary_only``).
+        ``meta`` contains ``"n_sirnas"``, ``"n_rows"``,
         ``"z_per_sirna"``, ``"on_target_weights"``, ``"on_target_count"`` and
         ``"_timings"`` (per-stage wall times for the worker: ``load_s``,
         ``intersect_s``, ``prob_s``, ``serialize_s``, ``total_s`` and the
@@ -1653,6 +1667,7 @@ def compute_off_targets_directory(
         self_hyb_emin,
         temperature,
         str(cache_dir) if cache_dir is not None else "",
+        summary_only,
     )
 
     _run_tmp: Optional[str] = None

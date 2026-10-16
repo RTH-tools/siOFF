@@ -356,3 +356,38 @@ def test_failed_worker_exits_nonzero_from_cli(hits, acc_dir, tmp_path, plain):
     # The five good siRNAs were still written before the non-zero exit.
     out = pl.read_csv(tmp_path / "out" / "output.tsv", separator="\t")
     assert out["sirna_id"].n_unique() == 5
+
+
+@pytest.mark.parametrize("strategy", ["eager", "memmap", "chrom-major"])
+def test_summary_only_returns_sums_without_rows(hits, acc_dir, tmp_path, strategy):
+    """--summary-only: no per-site rows leave the workers, the sums are unchanged."""
+    hits_dir, _ = hits
+    cache = tmp_path / "cache" if strategy == "memmap" else None
+
+    def run(summary_only):
+        metas, n_rows, n_frames = {}, 0, 0
+        for df, meta in compute_off_targets_directory(
+            input_dir=hits_dir,
+            accessibility_dir=acc_dir,
+            accessibility_cache_dir=cache,
+            alpha="0.8;1",
+            gamma="0.9;1",
+            theta="0.7",
+            n_workers=2,
+            accessibility_strategy=strategy,
+            summary_only=summary_only,
+        ):
+            n_frames += 1
+            n_rows += df.height
+            metas.update(meta["z_per_sirna"])
+        return metas, n_rows, n_frames
+
+    full, full_rows, full_frames = run(False)
+    agg, agg_rows, agg_frames = run(True)
+    assert full_rows > 0 and agg_rows == 0
+    assert agg_frames == full_frames
+    assert set(agg) == set(full)
+    for sid, row in full.items():
+        for k, v in row.items():
+            if k != "sirna_id":
+                assert agg[sid][k] == pytest.approx(v, rel=1e-6), (sid, k)

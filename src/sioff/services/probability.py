@@ -180,8 +180,16 @@ class ProbabilityService:
         on_target_expression: float = 1000.0,
         on_target_fasta_data: Optional[dict[str, dict]] = None,
         precomputed_opening_energy: bool = False,
+        aggregate_only: bool = False,
     ) -> Tuple[pl.DataFrame, Dict]:
         """Per-siRNA partition-function probabilities with optional alpha/gamma/theta sweeps.
+
+        With ``aggregate_only`` only the per-siRNA sums are computed (the
+        metadata ``z_per_sirna``, ``on_target_weights`` and ``n_rows``) and an
+        empty frame is returned: the per-row energy, dG, weight and probability
+        columns of every alpha/gamma/theta set are never materialised. That is
+        all ``--summary-only`` needs, and for a large grid it is most of the
+        memory (385 columns on millions of rows for the RIsearch3 benchmark).
 
         Mode A (in_predictions): on-target rows already in df, tagged by ID match.
         Mode B (fasta): on-target energy comes from on_target_fasta_data; rows excluded from df.
@@ -318,6 +326,11 @@ class ProbabilityService:
 
         calc_configs = [("", "dG_total", "energy")]
         all_dG_exprs = []
+        # suffix -> (dG, dG_noacc) expressions, so aggregate_only can sum the
+        # weights without first adding the dG columns to the frame.
+        dG_exprs: dict[str, tuple[pl.Expr, pl.Expr]] = {
+            "": (pl.col("dG_total"), pl.col("energy"))
+        }
 
         if alpha_gamma_pairs:
             for alpha, gamma in alpha_gamma_pairs:
@@ -329,19 +342,21 @@ class ProbabilityService:
                 col_name_noacc = f"energy{suffix}"
 
                 # Clamp: energy < α·E_min → use γ·E_min; otherwise keep energy
+                dG = (
+                    pl.when(pl.col("energy") < alpha * pl.col("E_min"))
+                    .then(gamma * pl.col("E_min") + pl.col("opening_energy"))
+                    .otherwise(pl.col("energy") + pl.col("opening_energy"))
+                )
+                dG_noacc = (
+                    pl.when(pl.col("energy") < alpha * pl.col("E_min"))
+                    .then(gamma * pl.col("E_min"))
+                    .otherwise(pl.col("energy"))
+                )
                 all_dG_exprs.extend(
-                    [
-                        pl.when(pl.col("energy") < alpha * pl.col("E_min"))
-                        .then(gamma * pl.col("E_min") + pl.col("opening_energy"))
-                        .otherwise(pl.col("energy") + pl.col("opening_energy"))
-                        .alias(col_name),
-                        pl.when(pl.col("energy") < alpha * pl.col("E_min"))
-                        .then(gamma * pl.col("E_min"))
-                        .otherwise(pl.col("energy"))
-                        .alias(col_name_noacc),
-                    ]
+                    [dG.alias(col_name), dG_noacc.alias(col_name_noacc)]
                 )
                 calc_configs.append((suffix, col_name, col_name_noacc))
+                dG_exprs[suffix] = (dG, dG_noacc)
 
         if theta_values:
             for theta in theta_values:
@@ -350,20 +365,15 @@ class ProbabilityService:
                 col_name_noacc = f"energy{suffix}"
 
                 # Theta scaling: ((θ·(E + 10)) - 10) + open_energy
+                dG_noacc = (theta * (pl.col("energy") + 10.0)) - 10.0
+                dG = dG_noacc + pl.col("opening_energy")
                 all_dG_exprs.extend(
-                    [
-                        (
-                            ((theta * (pl.col("energy") + 10.0)) - 10.0)
-                            + pl.col("opening_energy")
-                        ).alias(col_name),
-                        ((theta * (pl.col("energy") + 10.0)) - 10.0).alias(
-                            col_name_noacc
-                        ),
-                    ]
+                    [dG.alias(col_name), dG_noacc.alias(col_name_noacc)]
                 )
                 calc_configs.append((suffix, col_name, col_name_noacc))
+                dG_exprs[suffix] = (dG, dG_noacc)
 
-        if all_dG_exprs:
+        if all_dG_exprs and not aggregate_only:
             df = df.with_columns(all_dG_exprs)
 
         all_weight_exprs = []
@@ -384,31 +394,29 @@ class ProbabilityService:
                     ).alias(weight_noacc_col),
                 ]
             )
+            if aggregate_only:
+                dG, dG_noacc = dG_exprs[suffix]
+                w = pl.col("exp_value") * ((-dG / self._RT).exp())
+                w_noacc = pl.col("exp_value") * ((-dG_noacc / self._RT).exp())
+            else:
+                w, w_noacc = pl.col(weight_col), pl.col(weight_noacc_col)
             z_col = f"Z_sirna{suffix}"
             z_noacc_col = f"Z_sirna_noacc{suffix}"
-            z_aggs.extend(
-                [
-                    pl.col(weight_col).sum().alias(z_col),
-                    pl.col(weight_noacc_col).sum().alias(z_noacc_col),
-                ]
-            )
+            z_aggs.extend([w.sum().alias(z_col), w_noacc.sum().alias(z_noacc_col)])
             z_col_names.extend([z_col, z_noacc_col])
 
             if in_predictions_mode:
                 on_aggs.extend(
                     [
-                        pl.col(weight_col)
-                        .filter(pl.col("is_on_target"))
-                        .sum()
-                        .alias(f"W_on{suffix}"),
-                        pl.col(weight_noacc_col)
-                        .filter(pl.col("is_on_target"))
+                        w.filter(pl.col("is_on_target")).sum().alias(f"W_on{suffix}"),
+                        w_noacc.filter(pl.col("is_on_target"))
                         .sum()
                         .alias(f"W_on_noacc{suffix}"),
                     ]
                 )
 
-        df = df.with_columns(all_weight_exprs)
+        if not aggregate_only:
+            df = df.with_columns(all_weight_exprs)
 
         agg_df = df.group_by("sirna_id").agg(z_aggs + on_aggs)
         z_df = agg_df.select(["sirna_id"] + z_col_names)
@@ -498,6 +506,17 @@ class ProbabilityService:
                 f"FASTA mode: added on-target weights for {len(on_target_data_fasta)} siRNAs to partition functions"
             )
 
+        z_stats_dict = {row["sirna_id"]: row for row in z_df.to_dicts()}
+        metadata = {
+            "n_sirnas": len(unique_sirnas),
+            "n_rows": df.height,
+            "z_per_sirna": z_stats_dict,
+            "on_target_weights": on_target_weight_metadata,
+            "on_target_count": len(on_target_weight_metadata),
+        }
+        if aggregate_only:
+            return df.head(0), metadata
+
         df = df.join(z_df, on="sirna_id", how="left")
 
         probs_exprs = []
@@ -513,14 +532,6 @@ class ProbabilityService:
             )
 
         df = df.with_columns(probs_exprs)
-
-        z_stats_dict = {row["sirna_id"]: row for row in z_df.to_dicts()}
-        metadata = {
-            "n_sirnas": len(unique_sirnas),
-            "z_per_sirna": z_stats_dict,
-            "on_target_weights": on_target_weight_metadata,
-            "on_target_count": len(on_target_weight_metadata),
-        }
 
         return df, metadata
 
