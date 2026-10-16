@@ -475,6 +475,9 @@ def run(
                 predictions_type=predictions_type,
                 n_workers=n_workers,
                 accessibility_strategy=accessibility_strategy,
+                # --summary-only writes the .summary files from the per-siRNA
+                # metadata alone; workers then send back no per-site table.
+                summary_only=summary_only,
             )
 
             _drain_stage_totals: dict[str, float] = {}
@@ -503,7 +506,7 @@ def run(
                                 advance=1,
                                 description=f"Batch {completed}/{len(all_files)}",
                             )
-                            total_rows += df_chunk.height
+                            total_rows += batch_metadata.get("n_rows", df_chunk.height)
 
                             # Stream .summary files as each siRNA completes.
                             if summary_out_dir is not None:
