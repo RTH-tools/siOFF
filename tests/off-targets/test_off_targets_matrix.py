@@ -80,10 +80,13 @@ class TestPlumbing:
             )
         assert seen["matrix"] == "slh04"
 
-    def test_cli_lists_the_option(self):
+    def test_cli_lists_the_option(self, plain):
+        # Rich colours the help on CI (FORCE_COLOR), splitting "--matrix" with
+        # ANSI codes; compare the plain text.
         result = runner.invoke(app, ["off-targets", "--help"], terminal_width=200)
         assert result.exit_code == 0
-        assert "--matrix" in result.output and "-z" in result.output
+        out = plain(result.output)
+        assert "--matrix" in out and "-z" in out
 
     def test_cli_passes_the_option_to_the_directory_core(self, monkeypatch, tmp_path):
         seen = {}
