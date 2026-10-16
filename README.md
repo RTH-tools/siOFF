@@ -258,6 +258,9 @@ Standalone prediction (stage 1 by itself) is also available as
    transcript once, and every transcript containing the site contributes its
    own expression. BED is not accepted: with a single ID column it cannot say
    which rows belong to the same transcript.
+   Hits and features are 1-based closed intervals, so a site that shares a
+   single position with an exon overlaps it. Exons with expression ≤ 0 are
+   dropped after loading: they would add weight 0 to every partition function.
 4. Either **pre-computed [RIsearch](https://github.com/RTH-tools/risearch)
    predictions** (TSV / `.out.gz` / directory
    of per-siRNA Parquet files) **or** a siRNA FASTA plus target FASTA so siOFF

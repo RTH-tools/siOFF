@@ -261,7 +261,10 @@ class IntersectionService:
         return result
 
     def _build_transcript_index(self, trans_sorted: pl.DataFrame) -> dict:
-        starts = trans_sorted["start"].to_numpy().astype(np.int64, copy=False)
+        # RIsearch hits and GTF/GFF3 features are 1-based closed [start, end];
+        # NCLS is half-open, so both sides are queried as [start - 1, end).
+        # Intervals sharing a coordinate then overlap, adjacent ones do not.
+        starts = trans_sorted["start"].to_numpy().astype(np.int64) - 1
         ends = trans_sorted["end"].to_numpy().astype(np.int64, copy=False)
 
         interval_ids = np.arange(len(starts), dtype=np.int64)
@@ -286,7 +289,9 @@ class IntersectionService:
         trans_df = trans_index["trans_df"]
         ncls = trans_index["ncls"]
 
-        pred_starts = preds["start"].to_numpy().astype(np.int64, copy=False)
+        pred_starts = (
+            preds["start"].to_numpy().astype(np.int64) - 1
+        )  # closed -> half-open
         pred_ends = preds["end"].to_numpy().astype(np.int64, copy=False)
         pred_ids = np.arange(preds.height, dtype=np.int64)
 

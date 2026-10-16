@@ -74,6 +74,35 @@ _WORKER_SELF_HYB_EMIN: dict = {}
 _WORKER_SUMMARY_ONLY: bool = False
 
 
+def _drop_unexpressed(df_trans: pl.DataFrame) -> pl.DataFrame:
+    """Drop annotation rows whose expression is <= 0.
+
+    A site on such a transcript has Boltzmann weight 0 and changes no partition
+    function, but on a typical RNA-seq annotation (GENCODE v47 + H1299 TPM) more
+    than half the exon lines are unexpressed, so half of every siRNA's site x
+    transcript rows were intersected, looked up and scored for nothing. The
+    legacy pipeline's GTF path skips them as well.
+
+    Parameters
+    ----------
+    df_trans : polars.DataFrame
+        Annotation with an ``exp_value`` column.
+
+    Returns
+    -------
+    polars.DataFrame
+        The rows with ``exp_value > 0``.
+    """
+    kept = df_trans.filter(pl.col("exp_value") > 0)
+    dropped = df_trans.height - kept.height
+    if dropped:
+        logger.info(
+            f"Dropped {dropped:,} of {df_trans.height:,} annotation rows with "
+            "expression <= 0 (weight 0 in every partition function)"
+        )
+    return kept
+
+
 def _read_shared_ipc(path: Path) -> pl.DataFrame:
     """Polars view of an uncompressed Arrow IPC file, memory-mapped (no copy).
 
@@ -1258,6 +1287,7 @@ def compute_off_targets_single(
                 score_col=expression_metric,
                 format=transcriptome_format,
             )
+            df_trans = _drop_unexpressed(df_trans)
             _s.rows_out = df_trans.height
         logger.info(
             f"Transcriptome: {df_trans.height:,} rows, {df_trans['gene_id'].n_unique()} genes"
@@ -1599,6 +1629,7 @@ def compute_off_targets_directory(
             score_col=expression_metric,
             format=transcriptome_format,
         )
+        df_trans = _drop_unexpressed(df_trans)
         # Sorted by (chrom, strand, start) so each worker's partitions are
         # zero-copy slices of the memory-mapped file, and uncompressed so the
         # file can be memory-mapped at all; see preload_transcriptome.
