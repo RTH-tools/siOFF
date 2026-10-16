@@ -85,30 +85,48 @@ class TestAnyOverlap:
 
 class TestBoundaryTouching:
     """
-    BED intervals are half-open [start, end).
-    pred_end == trans_start means the intervals share one coordinate but do NOT overlap.
-    These must return zero hits.
+    RIsearch hits and GTF/GFF3 features are 1-based closed intervals [start, end]:
+    both end positions belong to the interval. Two intervals that share a
+    coordinate share that nucleotide and overlap; intervals one position apart
+    (end + 1 == start) are adjacent and do not. The index used to treat both as
+    half-open, which dropped every hit whose last base is an exon's first base
+    (and the reverse) -- 2,184 site x transcript rows for one Huesken siRNA on
+    GENCODE v47, which the legacy pipeline kept.
     """
 
-    def test_pred_end_equals_trans_start_no_hit(self):
-        # pred [10, 20], trans [20, 30]: pred_end = trans_start = 20 → no overlap
+    def test_pred_end_equals_trans_start_is_a_hit(self):
+        # pred [10, 20], trans [20, 30]: both contain position 20
         svc = IntersectionService()
-        assert hits(svc, pred(10, 20), trans(20, 30)) == 0
+        assert hits(svc, pred(10, 20), trans(20, 30)) == 1
 
-    def test_pred_start_equals_trans_end_no_hit(self):
-        # pred [20, 30], trans [10, 20]: pred_start = trans_end = 20 → no overlap
+    def test_pred_start_equals_trans_end_is_a_hit(self):
+        # pred [20, 30], trans [10, 20]: both contain position 20
         svc = IntersectionService()
-        assert hits(svc, pred(20, 30), trans(10, 20)) == 0
+        assert hits(svc, pred(20, 30), trans(10, 20)) == 1
 
     def test_adjacent_intervals_no_hit(self):
-        # pred [0, 5], trans [5, 10] → touching, no overlap
+        # pred [1, 5], trans [6, 10]: adjacent, no shared position
         svc = IntersectionService()
-        assert hits(svc, pred(0, 5), trans(5, 10)) == 0
+        assert hits(svc, pred(1, 5), trans(6, 10)) == 0
+        assert hits(svc, pred(6, 10), trans(1, 5)) == 0
+
+    def test_single_position_intervals(self):
+        svc = IntersectionService()
+        assert hits(svc, pred(7, 7), trans(7, 7)) == 1
+        assert hits(svc, pred(7, 7), trans(8, 8)) == 0
 
     def test_one_base_overlap_is_a_hit(self):
-        # pred [9, 11], trans [10, 20]: pred_start=9 < trans_end=20, pred_end=11 > trans_start=10 → overlap
+        # pred [9, 11], trans [10, 20]: positions 10 and 11 shared
         svc = IntersectionService()
         assert hits(svc, pred(9, 11), trans(10, 20)) == 1
+
+    def test_gencode_example(self):
+        # hit chr10:100219251-100219270 (-) and exon 100219270-100219359 of
+        # ENST00000370397.8 share position 100219270.
+        svc = IntersectionService()
+        p = pred(100219251, 100219270, chrom="chr10", strand="-")
+        t = trans(100219270, 100219359, chrom="chr10", strand="-")
+        assert hits(svc, p, t) == 1
 
 
 # ---------------------------------------------------------------------------
