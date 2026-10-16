@@ -33,7 +33,7 @@ import tempfile
 import time
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
-from typing import Generator, Mapping, Optional, cast
+from typing import Generator, Mapping, Optional, Union, cast
 
 import numpy as np
 import polars as pl
@@ -937,6 +937,7 @@ def compute_off_targets_single(
     max_span: int = 40,
     unpaired_prob: int = 30,
     temperature: float = 37.0,
+    matrix: Union[str, Path] = "t04",
     on_target_file: Optional[Path] = None,
     on_target_risearch_file: Optional[Path] = None,
     query_file: Optional[Path] = None,
@@ -1049,6 +1050,12 @@ def compute_off_targets_single(
     temperature : float, default 37.0
         Folding temperature in degrees Celsius (CLI ``-T/--temperature``).
         Affects both on-the-fly accessibility and the partition function.
+    matrix : str or pathlib.Path, default "t04"
+        Energy parameter set for every RIsearch call made here (in-process
+        search and the self-hybridisation E_min of ``sirna_fasta``): a bundled
+        id or the path of a DSM TSV table (CLI ``-z/--matrix``). Use the set the
+        predictions were searched with: E_min is the reference energy of the
+        alpha/gamma clamp.
     on_target_file : pathlib.Path, optional
         On-target sequence FASTA for the single-siRNA partition function (CLI
         ``-on/--on-target``). Requires ``query_file``; adds an ``onTarget`` row
@@ -1202,6 +1209,7 @@ def compute_off_targets_single(
             query_path=sirna_fasta,
             index_path=index_path,
             target_fasta=target_fasta,
+            matrix=matrix,
         )
     else:
         # Mode 2: pre-computed RIsearch file
@@ -1381,6 +1389,7 @@ def compute_off_targets_directory(
     accessibility_dir: Optional[Path] = None,
     accessibility_cache_dir: Optional[Path] = None,
     temperature: float = 37.0,
+    matrix: Union[str, Path] = "t04",
     on_target_ids_file: Optional[Path] = None,
     on_target_expression: float = 1000.0,
     alpha: str = "1.0",
@@ -1473,6 +1482,12 @@ def compute_off_targets_directory(
     temperature : float, default 37.0
         Temperature in degrees Celsius for the partition function (CLI
         ``-T/--temperature``).
+    matrix : str or pathlib.Path, default "t04"
+        Energy parameter set for every RIsearch call made here (in-process
+        search and the self-hybridisation E_min of ``sirna_fasta``): a bundled
+        id or the path of a DSM TSV table (CLI ``-z/--matrix``). Use the set the
+        predictions were searched with: E_min is the reference energy of the
+        alpha/gamma clamp.
     on_target_ids_file : pathlib.Path, optional
         Two-column TSV mapping ``sirna_id`` to on-target ``transcript_id``
         (CLI ``-oi/--on-target-ids``); lines starting with ``#`` are ignored.
@@ -1593,7 +1608,9 @@ def compute_off_targets_directory(
     # Self-hybridisation E_min per siRNA (matches the legacy E_min semantics).
     self_hyb_emin: dict[str, float] = {}
     if sirna_fasta is not None:
-        self_hyb_emin = RIsearchService().self_hybridization_emin_batch(sirna_fasta)
+        self_hyb_emin = RIsearchService().self_hybridization_emin_batch(
+            sirna_fasta, matrix=matrix
+        )
 
     # memmap: build the accessibility cache once, here, so workers only ever
     # map finished files (and never each decode a whole chromosome).
