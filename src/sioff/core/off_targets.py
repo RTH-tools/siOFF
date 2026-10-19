@@ -103,6 +103,39 @@ def _drop_unexpressed(df_trans: pl.DataFrame) -> pl.DataFrame:
     return kept
 
 
+def _apply_self_hyb_emin(df: pl.DataFrame, self_hyb_emin: dict) -> pl.DataFrame:
+    """Set ``raw_e_min`` to the legacy E_min: self-hybridisation or lower hit.
+
+    The legacy pipeline starts E_min at the siRNA's self-hybridisation energy
+    and lowers it to any expressed site that binds more strongly (G:U wobbles
+    can beat the perfect complement). Overriding ``raw_e_min`` with the
+    self-hybridisation energy alone moved the alpha/gamma clamp threshold for
+    those siRNAs: 11 of 2000 in the RIsearch3 off-target benchmark differed
+    from the legacy pipeline by up to 0.069 in P_off_target. Call after the
+    intersection, so the sites are the expressed ones the legacy pipeline reads.
+
+    Parameters
+    ----------
+    df : polars.DataFrame
+        One siRNA's predictions, with ``energy`` and ``raw_e_min`` columns.
+    self_hyb_emin : dict
+        ``sirna_id -> self-hybridisation E_min`` (empty without ``-s``).
+
+    Returns
+    -------
+    polars.DataFrame
+        ``df`` with ``raw_e_min`` replaced when the siRNA has a
+        self-hybridisation E_min; unchanged otherwise.
+    """
+    if not self_hyb_emin or "raw_e_min" not in df.columns or df.height == 0:
+        return df
+    sirna_id = str(df["sirna_id"][0])
+    if sirna_id not in self_hyb_emin:
+        return df
+    e_min = min(float(self_hyb_emin[sirna_id]), float(cast(float, df["energy"].min())))
+    return df.with_columns(pl.lit(e_min).cast(pl.Float32).alias("raw_e_min"))
+
+
 def _read_shared_ipc(path: Path) -> pl.DataFrame:
     """Polars view of an uncompressed Arrow IPC file, memory-mapped (no copy).
 
@@ -215,14 +248,6 @@ def _process_one_sirna(
     if df.height == 0:
         return None, {}
 
-    # Apply self-hybridisation E_min override (one value per siRNA file)
-    if self_hyb_emin and "raw_e_min" in df.columns:
-        sirna_id = str(df["sirna_id"][0])
-        if sirna_id in self_hyb_emin:
-            df = df.with_columns(
-                pl.lit(self_hyb_emin[sirna_id]).cast(pl.Float32).alias("raw_e_min")
-            )
-
     # Intersect with transcriptome (sequential — each worker owns its CPU).
     # intersect() already deduplicates per (chrom, strand) pair internally.
     _intersect_subtimings: dict = {}
@@ -236,6 +261,7 @@ def _process_one_sirna(
         )
         if df.height == 0:
             return None, {}
+    df = _apply_self_hyb_emin(df, self_hyb_emin)
     _t_intersect = time.perf_counter()
 
     # Probabilities
@@ -348,22 +374,11 @@ def _release_memory() -> None:
         pass
 
 
-def _load_filtered_predictions(
-    file_path_str: str, sense_only: bool, self_hyb_emin: dict
-) -> pl.DataFrame:
+def _load_filtered_predictions(file_path_str: str, sense_only: bool) -> pl.DataFrame:
     parser = RIsearchParser()
     df = parser.load_single_file(Path(file_path_str))
     if sense_only:
         df = df.filter(pl.col("strand") == "+")
-    if df.height == 0:
-        return df
-    # Apply self-hybridisation E_min override (one value per siRNA file)
-    if self_hyb_emin and "raw_e_min" in df.columns:
-        sirna_id = str(df["sirna_id"][0])
-        if sirna_id in self_hyb_emin:
-            df = df.with_columns(
-                pl.lit(self_hyb_emin[sirna_id]).cast(pl.Float32).alias("raw_e_min")
-            )
     return df
 
 
@@ -422,7 +437,7 @@ def _pass1_prepare_sirna(
     self_hyb_emin = _m._WORKER_SELF_HYB_EMIN
 
     _t_start = time.perf_counter()
-    df = _load_filtered_predictions(file_path_str, sense_only, self_hyb_emin)
+    df = _load_filtered_predictions(file_path_str, sense_only)
     _t_load = time.perf_counter()
     if df.height == 0:
         return idx, None, 0, {}
@@ -438,6 +453,7 @@ def _pass1_prepare_sirna(
         )
         if df.height == 0:
             return idx, None, 0, {}
+    df = _apply_self_hyb_emin(df, self_hyb_emin)
     _t_intersect = time.perf_counter()
 
     out = Path(pass1_dir)
@@ -1490,8 +1506,8 @@ def compute_off_targets_directory(
         ``-r/--risearch-file`` pointing at a directory).
     sirna_fasta : pathlib.Path, optional
         siRNA FASTA (CLI ``-s/--sirna-fasta``). When given, a self-hybridisation
-        ``E_min`` is computed for every siRNA and overrides the per-file
-        ``raw_e_min`` before clamping (matching the legacy ``E_min`` semantics).
+        ``E_min`` is computed for every siRNA; the clamp's ``E_min`` is the lower
+        of it and the strongest expressed site (the legacy ``E_min`` semantics).
     gtf_file : pathlib.Path, optional
         Transcriptome annotation, GTF or GFF3 (CLI ``-t/--transcriptome``).
         Loaded once, serialised to a temporary Arrow IPC file and memory-mapped
