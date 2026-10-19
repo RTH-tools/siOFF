@@ -54,10 +54,10 @@ off_targets:
   # Accessibility profiles — choose ONE source (or omit for energy-only P(OT))
   # ---------------------------------------------------------------------------
 
-  # Directory of per-chromosome accessibility Parquet files produced by the
-  # "sioff accessibility" command ({chrom}.accessibility.parquet). With
-  # accessibility_strategy: memmap it may instead hold only the memory-mapped
-  # {chrom}_{plus,minus}.access.npy cache built from them.
+  # Directory of per-chromosome accessibility profiles produced by the
+  # "sioff accessibility" command: by default the memory-mapped
+  # {chrom}_{plus,minus}.access.npy cache, or {chrom}.accessibility.parquet
+  # files with its output_format: parquet.
   accessibility_dir: ../examples/data/accessibility
 
   # How opening energies are read from accessibility_dir. Default: "auto".
@@ -69,8 +69,9 @@ off_targets:
   #                cache files.
   #   eager:       loads whole chromosomes into memory in every worker (small
   #                genomes only).
-  #   auto:        chrom-major for a directory of per-siRNA files, eager for a
-  #                single predictions file.
+  #   auto:        memmap when accessibility_dir holds only the .access.npy
+  #                cache; otherwise chrom-major for a directory of per-siRNA
+  #                files, eager for a single predictions file.
   # accessibility_strategy: auto
 
   # memmap only: where the cache is read from and, when missing, built
