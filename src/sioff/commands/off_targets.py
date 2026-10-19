@@ -128,7 +128,9 @@ def run(
                 "accessibility dir) that all workers memory-map, and is the only "
                 "strategy that writes cache files; 'eager' loads whole-chromosome "
                 "profiles in every worker (small genomes only). 'auto' (default) "
-                "is chrom-major in directory mode and eager for a single file."
+                "is memmap when the accessibility dir holds only the .access.npy "
+                "cache (what 'sioff accessibility' writes by default), otherwise "
+                "chrom-major in directory mode and eager for a single file."
             ),
         ),
     ] = "auto",

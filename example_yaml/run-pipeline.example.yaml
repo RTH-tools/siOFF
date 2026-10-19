@@ -57,6 +57,9 @@ accessibility:
   unpaired: 30
   temperature: 37.0
   workers: 1
+  # npy (default): the uint8 .access.npy cache off-targets memory-maps;
+  # parquet: one {chrom}.accessibility.parquet per chromosome.
+  output_format: npy
 
 # =============================================================================
 # Step: off-targets  (main off-target analysis)

@@ -198,7 +198,7 @@ This example rebuilds both from the raw example FASTA files — the same three
 stages you will run on your own data.
 
 ```bash
-# 1 · Fold: accessibility profiles, one Parquet file per chromosome
+# 1 · Fold: accessibility profiles, a memory-mappable .npy cache per chromosome
 # run with --verbose to see the steps involved
 sioff accessibility \
   -f examples/data/genome.fa \
@@ -301,9 +301,16 @@ in-process when given `-s/--sirna-fasta sirnas.fa --target-fasta genome.fa`
 sioff accessibility -f genome.fa -o accessibility/ -j 8
 ```
 
-Writes one `{chrom}.accessibility.parquet` per chromosome with RNAplfold
-unpaired probabilities (window `-W 80`, span `-L 40`, unpaired length
-`-u 30` by default — change them consistently if your protocol differs).
+Writes RNAplfold opening energies per chromosome (window `-W 80`, span
+`-L 40`, unpaired length `-u 30` by default — change them consistently if
+your protocol differs). The default `--output-format npy` writes the uint8
+cache that `off-targets` memory-maps: `{chrom}_{plus,minus}.access.npy`
+(value × 10 per position and `u`) plus an `.access.exceptions.npz` sidecar
+holding exactly the few values a byte cannot (above 25.5 kcal/mol), so
+`off-targets -a` reads it with no conversion step. `--output-format parquet`
+writes one `{chrom}.accessibility.parquet` per chromosome instead (columns
+`position`, `strand`, `u1..u{u}`), for other tools or the `chrom-major`
+strategy.
 Chromosomes fold in parallel (`-j`, one worker per chromosome). This is the
 most compute-intensive stage: budget hours and tens of GB of memory for a
 mammalian genome — run it on a cluster (see
@@ -336,17 +343,20 @@ documents every option; run it with `sioff -c my-config.yaml`.
 #### Accessibility lookup strategy (large genomes)
 
 `--accessibility-strategy` selects how the opening energies are read from
-`-a` in the directory (per-siRNA batch) mode. All three give identical results:
+`-a` in the directory (per-siRNA batch) mode. All three give identical results;
+an `-a` directory written with the default `--output-format npy` holds only the
+cache, so `auto` reads it with `memmap` and the two Parquet strategies refuse it:
 
 | Strategy | What it does | Memory | Writes |
 |----------|--------------|--------|--------|
-| `chrom-major` (`auto`) | Three passes: intersect every siRNA, stream each chromosome's Parquet **once** for the hits of all siRNAs, then score. | ~ one Parquet row group per worker | nothing (a temp dir under `TMPDIR`) |
-| `memmap` | Builds a uint8 `{chrom}_{plus,minus}.access.npy` cache (+ `.access.exceptions.npz` sidecar) per chromosome and strand, once, in `--accessibility-cache-dir` (default: the accessibility dir), then every worker memory-maps it: one shared page-cache copy. | the pages the hits touch; 7.5 GB per chr1 strand while building | the cache files (the only strategy that does) |
+| `chrom-major` (`auto` on a Parquet directory) | Three passes: intersect every siRNA, stream each chromosome's Parquet **once** for the hits of all siRNAs, then score. | ~ one Parquet row group per worker | nothing (a temp dir under `TMPDIR`) |
+| `memmap` (`auto` on an npy directory) | Every worker memory-maps a uint8 `{chrom}_{plus,minus}.access.npy` cache (+ `.access.exceptions.npz` sidecar) per chromosome and strand: one shared page-cache copy. The cache is what `accessibility` writes by default; from Parquet it is built once in `--accessibility-cache-dir` (default: the accessibility dir). | the pages the hits touch; 7.5 GB per chr1 strand while building | the cache files (the only strategy that does) |
 | `eager` | The original loader: each worker reads whole chromosomes into dense float32 arrays. | 30 GB per chr1 strand **per worker** — small genomes only | nothing |
 
-`auto` is `chrom-major` whenever `-a` is given (also with `-j 1`); a single
-predictions file (`-r file`) has no chromosome-major path and uses the eager
-loader unless `memmap` is requested. `memmap` suits repeated runs against the
+`auto` is `memmap` when `-a` holds only the npy cache; on a Parquet directory it
+is `chrom-major` (also with `-j 1`), except that a single predictions file
+(`-r file`) has no chromosome-major path and uses the eager loader unless
+`memmap` is requested. `memmap` suits repeated runs against the
 same genome: the cache is reused across runs, may live on node-local disk
 (`--accessibility-cache-dir /scratch/acc_cache`), and a cache directory that is
 complete needs no Parquet at all (`-a` may then point at an empty directory).
@@ -405,8 +415,8 @@ Available on `sioff` itself, before any subcommand.
 | `--target-fasta / --genome` | Target FASTA for in-process RIsearch |
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
-| `-a / --accessibility-dir` | Directory of per-chromosome accessibility Parquet files (from `accessibility` command); with `--accessibility-strategy memmap` it may hold only the `.access.npy` cache |
-| `--accessibility-strategy` | `auto` (default), `chrom-major`, `memmap` or `eager` — see [Accessibility lookup strategy](#accessibility-lookup-strategy-large-genomes) |
+| `-a / --accessibility-dir` | Directory of per-chromosome accessibility profiles from the `accessibility` command: the `.access.npy` cache (its default) or Parquet files |
+| `--accessibility-strategy` | `auto` (default; `memmap` on an npy directory), `chrom-major`, `memmap` or `eager` — see [Accessibility lookup strategy](#accessibility-lookup-strategy-large-genomes) |
 | `--accessibility-cache-dir` | `memmap` only: where the `.access.npy` cache is read from / built (default: the accessibility dir) |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
@@ -420,7 +430,8 @@ Available on `sioff` itself, before any subcommand.
 | Flag | Description |
 |------|-------------|
 | `-f / --fasta` | Genome or transcriptome FASTA |
-| `-o / --output` | Output directory (one `{chrom}.accessibility.parquet` per chromosome) |
+| `-o / --output` | Output directory (per chromosome: `{chrom}_{plus,minus}.access.npy` + `.access.exceptions.npz`, or one `{chrom}.accessibility.parquet`) |
+| `--output-format` | `npy` (default; the cache `off-targets` memory-maps) or `parquet` |
 | `-W / --window` | RNAplfold window size W (default: 80) |
 | `-L / --span` | Max base-pair span L (default: 40) |
 | `-u / --unpaired` | Unpaired probability length u (default: 30) |
@@ -498,7 +509,7 @@ df = sioff.off_targets(
 **Notes**
 
 - `sioff.off_targets` takes its predictions from one of `predictions=` (a `polars.DataFrame` in the `sioff.search` schema: `sirna_id, chrom, start, end, strand, energy`), `risearch_file=` (a RIsearch output file) or `sirna_fasta=` + `target_fasta=` (run RIsearch in-process), and returns a `polars.DataFrame`. With a **directory** of per-siRNA files in `risearch_file=` it returns a **generator** yielding one `polars.DataFrame` per siRNA; iterate it to consume the results. No form writes files — the API layer returns results in memory, and writing output is the CLI's job.
-- `sioff.accessibility` likewise writes nothing: it returns `dict[chrom -> polars.DataFrame]`, which `sioff.off_targets(accessibility=...)` takes directly (single-frame forms only; the directory form needs `accessibility_dir=`). Use the `accessibility` CLI command (or `sioff -c <config>`) if you want `{chrom}.accessibility.parquet` files on disk.
+- `sioff.accessibility` likewise writes nothing: it returns `dict[chrom -> polars.DataFrame]`, which `sioff.off_targets(accessibility=...)` takes directly (single-frame forms only; the directory form needs `accessibility_dir=`). Use the `accessibility` CLI command (or `sioff -c <config>`) if you want profiles on disk (the `.access.npy` cache, or `{chrom}.accessibility.parquet` with `--output-format parquet`).
 - On bad input the API functions raise ordinary Python exceptions — `FileNotFoundError` or `ValueError` — not `typer.Exit`. `typer.Exit` is raised only by the CLI layer for its own argument validation.
 - `sioff.index` / `sioff.search` call the `risearch` bindings in-process — the same dependency the CLI's `index`/`search` commands use.
 

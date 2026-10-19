@@ -163,6 +163,7 @@ def _build_accessibility(cfg: dict, base: Path) -> list[str]:
         ("unpaired", "--unpaired"),
         ("temperature", "--temperature"),
         ("workers", "--workers"),
+        ("output_format", "--output-format"),
     ]:
         if key in cfg and cfg[key] is not None:
             cmd += [flag, str(cfg[key])]

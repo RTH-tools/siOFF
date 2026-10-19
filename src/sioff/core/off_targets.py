@@ -43,9 +43,11 @@ from loguru import logger
 
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
 from sioff.services.accessibility import (
+    AccessibilityError,
     GenomeAccessibilityService,
     ensure_accessibility_cache,
     gather_opening_energies,
+    holds_only_cache,
 )
 from sioff.services.annotation_parser import AnnotationParser
 from sioff.services.intersection_service import (
@@ -851,6 +853,39 @@ def _check_strategy(accessibility_strategy: str) -> None:
         )
 
 
+def _resolve_dir_strategy(
+    accessibility_dir: Path, accessibility_strategy: str, auto: str
+) -> str:
+    """Resolve ``"auto"`` for a profile directory, to ``auto`` unless it holds only npy.
+
+    A directory of ``.access.npy`` caches (``sioff accessibility`` writes one
+    by default) has no Parquet, so ``"auto"`` is ``"memmap"`` there and the
+    Parquet readers are refused with a message saying so.
+
+    Returns
+    -------
+    str
+        The strategy to run: ``accessibility_strategy`` with ``"auto"``
+        replaced.
+
+    Raises
+    ------
+    AccessibilityError
+        When a Parquet strategy (``"eager"``, ``"chrom-major"``) is asked of
+        a directory that holds only the npy cache.
+    """
+    if not holds_only_cache(accessibility_dir):
+        return auto if accessibility_strategy == "auto" else accessibility_strategy
+    if accessibility_strategy in ("auto", "memmap"):
+        return "memmap"
+    raise AccessibilityError(
+        f"{accessibility_dir} holds the .access.npy accessibility cache and no "
+        f"Parquet profiles; accessibility_strategy={accessibility_strategy!r} reads "
+        "Parquet. Use 'memmap' (or 'auto'), or write the profiles with "
+        "'sioff accessibility --output-format parquet'."
+    )
+
+
 def _memmap_cache_dir(
     accessibility_dir: Path, accessibility_cache_dir: Optional[Path]
 ) -> Path:
@@ -1172,7 +1207,9 @@ def compute_off_targets_single(
         building it in ``accessibility_cache_dir`` when missing; every other
         value loads whole-chromosome Parquet files into dense float32 arrays
         and never writes cache files (the chromosome-major path exists only in
-        `compute_off_targets_directory`). Ignored without ``accessibility_dir``.
+        `compute_off_targets_directory`). ``"auto"`` is ``"memmap"`` when
+        ``accessibility_dir`` holds only the ``.access.npy`` cache. Ignored
+        without ``accessibility_dir``.
 
     Returns
     -------
@@ -1397,10 +1434,13 @@ def compute_off_targets_single(
         # "memmap" serves the shared uint8 cache (built on first use when it is
         # missing); every other strategy is the eager whole-chromosome loader
         # and never writes cache files.
-        _warn_unused_cache_dir(accessibility_cache_dir, accessibility_strategy)
+        strategy = _resolve_dir_strategy(
+            Path(accessibility_dir), accessibility_strategy, auto="eager"
+        )
+        _warn_unused_cache_dir(accessibility_cache_dir, strategy)
         cache_dir = (
             _memmap_cache_dir(Path(accessibility_dir), accessibility_cache_dir)
-            if accessibility_strategy == "memmap"
+            if strategy == "memmap"
             else None
         )
         acc_service = GenomeAccessibilityService(
@@ -1471,7 +1511,7 @@ def compute_off_targets_directory(
     Three strategies serve ``accessibility_dir`` (results are identical):
 
     - ``"chrom-major"`` (what ``"auto"`` picks whenever ``accessibility_dir``
-      is given, at any worker count): pass 1 loads and intersects every siRNA
+      holds Parquet profiles, at any worker count): pass 1 loads and intersects every siRNA
       into a run temp directory (under ``TMPDIR``), pass 2 streams each
       accessibility Parquet once, row group by row group, for the hits of all
       siRNAs, and pass 3 scores each siRNA with the precomputed column. Peak
@@ -1485,7 +1525,9 @@ def compute_off_targets_directory(
       then memory-maps those files, so the OS page cache holds one shared copy
       and a worker's resident set is the pages its hits touch. The only
       strategy that writes cache files; an ``accessibility_dir`` (or cache
-      dir) holding only the cache files, without Parquet, works too.
+      dir) holding only the cache files, without Parquet, works too, and is
+      what ``sioff accessibility`` writes by default (``"auto"`` then picks
+      ``"memmap"``).
     - ``"eager"``: the per-worker whole-chromosome loader (a dense float32
       profile per chromosome and strand in every worker; fine for small
       genomes, hopeless on hg38).
@@ -1619,11 +1661,16 @@ def compute_off_targets_directory(
     all_files = risearch_parser.list_directory_files(input_dir)
     if not all_files:
         raise FileNotFoundError(f"No RIsearch files found in {input_dir}")
-    # Resolve "auto": chromosome-major whenever profiles come from a directory
-    # (also with one worker; the eager loader cannot hold a human chromosome).
-    strategy = "none" if accessibility_dir is None else accessibility_strategy
-    if strategy == "auto":
-        strategy = "chrom-major"
+    # Resolve "auto": chromosome-major whenever profiles come from a Parquet
+    # directory (also with one worker; the eager loader cannot hold a human
+    # chromosome), memmap when the directory holds only the npy cache.
+    strategy = (
+        "none"
+        if accessibility_dir is None
+        else _resolve_dir_strategy(
+            Path(accessibility_dir), accessibility_strategy, auto="chrom-major"
+        )
+    )
     _warn_unused_cache_dir(accessibility_cache_dir, strategy)
     chrom_major = strategy == "chrom-major"
     # Only "memmap" ever builds cache files; the workers' service is the eager

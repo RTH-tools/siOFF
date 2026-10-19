@@ -195,8 +195,9 @@ def off_targets(
         source the directory form accepts. CLI: ``-a/--accessibility-dir``.
     accessibility_cache_dir : str or pathlib.Path, optional
         ``accessibility_strategy="memmap"`` only: directory of the
-        memory-mapped ``<chrom>_<plus|minus>.access.npy`` accessibility cache,
-        built there from the Parquet when missing and created if absent; the
+        memory-mapped ``<chrom>_<plus|minus>.access.npy`` accessibility cache
+        (as ``sioff accessibility`` writes it), built there from the Parquet
+        when missing and created if absent; the
         directory form builds every missing contig before its workers start.
         Default: ``accessibility_dir`` itself. Ignored (with a warning) by the
         other strategies. CLI: ``--accessibility-cache-dir``.
@@ -286,9 +287,12 @@ def off_targets(
         ``accessibility_cache_dir``) that every worker memory-maps, and is the
         only strategy that writes cache files; ``"eager"`` loads
         whole-chromosome profiles into memory (30 GB per chr1 strand on hg38).
-        ``"auto"`` is chromosome-major for the directory form and eager for the
-        single-frame forms, which have no chromosome-major path. Results are
-        identical. CLI: ``--accessibility-strategy``.
+        ``"auto"`` is ``"memmap"`` when ``accessibility_dir`` holds only the
+        ``.access.npy`` cache (the default output of ``sioff accessibility``),
+        which the two Parquet strategies refuse; otherwise it is
+        chromosome-major for the directory form and eager for the single-frame
+        forms, which have no chromosome-major path. Results are identical.
+        CLI: ``--accessibility-strategy``.
 
     Returns
     -------

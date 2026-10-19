@@ -157,6 +157,84 @@ def fold_sequence(
     return profile
 
 
+OUTPUT_FORMATS = ("npy", "parquet")
+
+
+def _fold_strand_chunks(
+    seq: str,
+    window_size: int,
+    max_span: int,
+    unpaired_prob: int,
+    chunk_size: int,
+    temperature: float,
+):
+    """Fold one strand in chunks; yield ``(pos0, u_matrix)`` per chunk.
+
+    ``pos0`` is the chunk's first 0-based position and ``u_matrix`` its
+    float32 ``[n_pos, unpaired_prob]`` opening energies, rounded to 0.1.
+    """
+    RT = _GAS_CONSTANT * (temperature + 273.15)
+    seq_len = len(seq)
+    rna_seq = seq.upper().replace("T", "U")
+    pos = 0
+
+    while pos < seq_len:
+        ext_start = max(0, pos - window_size)
+        ext_end = min(seq_len, pos + chunk_size + window_size)
+        chunk_seq = rna_seq[ext_start:ext_end]
+        chunk_len = len(chunk_seq)
+
+        data_start_in_chunk = pos - ext_start
+        data_end_in_chunk = min(seq_len, pos + chunk_size) - ext_start
+
+        w = min(window_size, chunk_len)
+        l_adj = min(max_span, chunk_len)
+
+        try:
+            md = RNA.md()
+            md.temperature = temperature
+            md.window_size = w
+            md.max_bp_span = l_adj
+            fc = RNA.fold_compound(chunk_seq, md, RNA.OPTION_WINDOW)
+            probs_matrix: list[list[float] | None] | None = [None] * (chunk_len + 2)
+
+            # `probs_matrix` is non-None here (just assigned); cast the
+            # default so the callback param is a list, not `list | None`.
+            def _cb(v, v_size, i, maxsize, what, data, _pm=cast(list, probs_matrix)):
+                if (what & RNA.PROBS_WINDOW_UP) and v is not None:
+                    _pm[i] = list(v)
+
+            fc.probs_window(unpaired_prob, RNA.PROBS_WINDOW_UP, _cb)
+            probs_ok = True
+        except Exception:
+            probs_ok = False
+            probs_matrix = None
+
+        n_pos = data_end_in_chunk - data_start_in_chunk
+        u_matrix = np.full((n_pos, unpaired_prob), 25.5, dtype=np.float32)
+
+        if probs_ok and probs_matrix is not None:
+            for i in range(n_pos):
+                chunk_pos_1based = data_start_in_chunk + i + 1
+                if chunk_pos_1based >= len(probs_matrix):
+                    continue
+                row_probs = probs_matrix[chunk_pos_1based]
+                if row_probs is None:
+                    continue
+                for u in range(1, unpaired_prob + 1):
+                    if u >= len(row_probs):
+                        break
+                    p = row_probs[u]
+                    if p is not None and p > 0:
+                        ev = -RT * math.log(p)
+                        u_matrix[i, u - 1] = round(ev * 10.0) / 10.0
+        else:
+            u_matrix[:] = 10.0  # folding error
+
+        yield pos, u_matrix
+        pos += chunk_size
+
+
 def _fold_full_chromosome(
     sequence: str,
     chrom: str,
@@ -166,91 +244,52 @@ def _fold_full_chromosome(
     output_path: str,
     chunk_size: int = 1_000_000,
     temperature: float = 37.0,
+    output_format: str = "parquet",
 ) -> str:
-    """Fold both strands of a chromosome in chunks and stream to Parquet.
+    """Fold both strands of a chromosome in chunks and stream them to disk.
+
+    ``output_format="parquet"`` writes ``output_path`` (the
+    ``{chrom}.accessibility.parquet`` schema); ``"npy"`` writes the uint8
+    cache files of `build_accessibility_cache` for both strands into the
+    directory ``output_path``, byte for byte what that function builds from
+    the Parquet, and returns the plus-strand ``.npy`` path.
 
     Top-level (not a method) so ProcessPoolExecutor can pickle it; only the
     output path string is pickled back, avoiding O(N×u) OOM on large chromosomes.
     """
-    RT = _GAS_CONSTANT * (temperature + 273.15)
-    seq_len = len(sequence)
+    if output_format not in OUTPUT_FORMATS:
+        raise AccessibilityError(
+            f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}"
+        )
+    strands = (("+", sequence), ("-", _reverse_complement(sequence)))
+
+    def chunks(seq: str):
+        return _fold_strand_chunks(
+            seq, window_size, max_span, unpaired_prob, chunk_size, temperature
+        )
+
+    if output_format == "npy":
+        out_dir = Path(output_path)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for strand, seq in strands:
+            _write_strand_cache(
+                out_dir, chrom, strand, len(seq), unpaired_prob, chunks(seq)
+            )
+        return str(cache_paths(out_dir, chrom, "+")[0])
 
     schema = pa.schema(
         [("position", pa.int32()), ("strand", pa.utf8())]
         + [(f"u{i}", pa.float32()) for i in range(1, unpaired_prob + 1)]
     )
-
-    def _fold_strand(writer: pq.ParquetWriter, seq: str, strand_char: str) -> None:
-        rna_seq = seq.upper().replace("T", "U")
-        pos = 0
-
-        while pos < seq_len:
-            ext_start = max(0, pos - window_size)
-            ext_end = min(seq_len, pos + chunk_size + window_size)
-            chunk_seq = rna_seq[ext_start:ext_end]
-            chunk_len = len(chunk_seq)
-
-            data_start_in_chunk = pos - ext_start
-            data_end_in_chunk = min(seq_len, pos + chunk_size) - ext_start
-
-            w = min(window_size, chunk_len)
-            l_adj = min(max_span, chunk_len)
-
-            try:
-                md = RNA.md()
-                md.temperature = temperature
-                md.window_size = w
-                md.max_bp_span = l_adj
-                fc = RNA.fold_compound(chunk_seq, md, RNA.OPTION_WINDOW)
-                probs_matrix: list[list[float] | None] | None = [None] * (chunk_len + 2)
-
-                # `probs_matrix` is non-None here (just assigned); cast the
-                # default so the callback param is a list, not `list | None`.
-                def _cb(
-                    v, v_size, i, maxsize, what, data, _pm=cast(list, probs_matrix)
-                ):
-                    if (what & RNA.PROBS_WINDOW_UP) and v is not None:
-                        _pm[i] = list(v)
-
-                fc.probs_window(unpaired_prob, RNA.PROBS_WINDOW_UP, _cb)
-                probs_ok = True
-            except Exception:
-                probs_ok = False
-                probs_matrix = None
-
-            n_pos = data_end_in_chunk - data_start_in_chunk
-            positions = np.arange(pos + 1, pos + n_pos + 1, dtype=np.int32)
-            u_matrix = np.full((n_pos, unpaired_prob), 25.5, dtype=np.float32)
-
-            if probs_ok and probs_matrix is not None:
-                for i in range(n_pos):
-                    chunk_pos_1based = data_start_in_chunk + i + 1
-                    if chunk_pos_1based >= len(probs_matrix):
-                        continue
-                    row_probs = probs_matrix[chunk_pos_1based]
-                    if row_probs is None:
-                        continue
-                    for u in range(1, unpaired_prob + 1):
-                        if u >= len(row_probs):
-                            break
-                        p = row_probs[u]
-                        if p is not None and p > 0:
-                            ev = -RT * math.log(p)
-                            u_matrix[i, u - 1] = round(ev * 10.0) / 10.0
-            else:
-                u_matrix[:] = 10.0  # folding error
-
-            arrays = [
-                pa.array(positions),
-                pa.array([strand_char] * n_pos, type=pa.utf8()),
-            ] + [pa.array(u_matrix[:, u - 1]) for u in range(1, unpaired_prob + 1)]
-            writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
-
-            pos += chunk_size
-
     with pq.ParquetWriter(output_path, schema) as writer:
-        _fold_strand(writer, sequence, "+")
-        _fold_strand(writer, _reverse_complement(sequence), "-")
+        for strand, seq in strands:
+            for pos0, u_matrix in chunks(seq):
+                n_pos = len(u_matrix)
+                arrays = [
+                    pa.array(np.arange(pos0 + 1, pos0 + n_pos + 1, dtype=np.int32)),
+                    pa.array([strand] * n_pos, type=pa.utf8()),
+                ] + [pa.array(u_matrix[:, u]) for u in range(unpaired_prob)]
+                writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
 
     return output_path
 
@@ -258,7 +297,8 @@ def _fold_full_chromosome(
 # ---------------------------------------------------------------------------
 # Memory-mapped per-(contig, strand) cache
 #
-# `_fold_full_chromosome` writes one Parquet file per contig. Reading a whole
+# `_fold_full_chromosome` writes one Parquet file per contig, or (npy, the
+# CLI default) this cache directly through `_write_strand_cache`. Reading a whole
 # chromosome back into a dense float32 array costs 30 GB per strand on chr1,
 # and off-target batch runs do that once per worker process. The cache below
 # re-encodes each strand as a position-major uint8 matrix that every worker
@@ -297,6 +337,16 @@ def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
         Path(cache_dir) / f"{stem}{CACHE_SUFFIX}",
         Path(cache_dir) / f"{stem}{EXCEPTIONS_SUFFIX}",
     )
+
+
+def holds_only_cache(accessibility_dir: Union[str, Path]) -> bool:
+    """True when the directory has ``.access.npy`` caches and no Parquet profile.
+
+    That is what ``sioff accessibility --output-format npy`` writes; only the
+    ``memmap`` lookup strategy can serve it.
+    """
+    d = Path(accessibility_dir)
+    return any(d.glob(f"*{CACHE_SUFFIX}")) and not any(d.glob(f"*{PARQUET_SUFFIX}"))
 
 
 def _chrom_of(parquet_path: Path) -> str:
@@ -433,25 +483,82 @@ def _build_strand(
                 exc_index.append(pos0[r] * n_u + c)
                 exc_value.append(values[r, c])
 
-    index = np.concatenate(exc_index) if exc_index else np.empty(0, dtype=np.int64)
-    value = np.concatenate(exc_value) if exc_value else np.empty(0, dtype=np.float32)
-    order = np.argsort(index, kind="stable")
-    index, value = index[order], value[order]
-    n_exc = len(index)
-    if n_rows and n_exc > 0.01 * n_rows * n_u:
-        logger.warning(
-            f"{chrom} {strand}: {n_exc:,} of {n_rows * n_u:,} values are not "
-            "multiples of 0.1 kcal/mol (or exceed 25.5); the exceptions sidecar "
-            "will be large. Write accessibility with 'sioff accessibility' for a "
-            "compact cache."
-        )
-
+    index, value = _sorted_exceptions(chrom, strand, exc_index, exc_value, n_rows * n_u)
     npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
     _write_atomically(npz_path, lambda tmp: np.savez(tmp, index=index, value=value))
     _write_atomically(npy_path, lambda tmp: np.save(tmp, codes))
     logger.info(
         f"Built accessibility cache {npy_path.name}: {max_pos:,} positions × {n_u}, "
-        f"{n_exc:,} exact-value exceptions"
+        f"{len(index):,} exact-value exceptions"
+    )
+    return npy_path
+
+
+def _sorted_exceptions(
+    chrom: str,
+    strand: str,
+    exc_index: list[np.ndarray],
+    exc_value: list[np.ndarray],
+    n_values: int,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Concatenate one strand's exception chunks, sorted by flat index."""
+    index = np.concatenate(exc_index) if exc_index else np.empty(0, dtype=np.int64)
+    value = np.concatenate(exc_value) if exc_value else np.empty(0, dtype=np.float32)
+    order = np.argsort(index, kind="stable")
+    index, value = index[order], value[order]
+    if n_values and len(index) > 0.01 * n_values:
+        logger.warning(
+            f"{chrom} {strand}: {len(index):,} of {n_values:,} values are not "
+            "multiples of 0.1 kcal/mol (or exceed 25.5); the exceptions sidecar "
+            "will be large. Write accessibility with 'sioff accessibility' for a "
+            "compact cache."
+        )
+    return index, value
+
+
+def _write_strand_cache(
+    cache_dir: Path,
+    chrom: str,
+    strand: str,
+    n_pos: int,
+    n_u: int,
+    chunks: Iterable[tuple[int, np.ndarray]],
+) -> Path:
+    """Encode folded ``(pos0, float32 block)`` chunks straight into one strand's cache.
+
+    The ``.npy`` is filled through a memory map, so peak memory is one chunk,
+    and the files equal what `build_accessibility_cache` makes from the
+    Parquet of the same chunks. As there, the sidecar lands before the codes
+    and each file is renamed into place complete.
+    """
+    npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
+    tmp = npy_path.with_name(f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}")
+    exc_index: list[np.ndarray] = []
+    exc_value: list[np.ndarray] = []
+    try:
+        codes = np.lib.format.open_memmap(
+            tmp, mode="w+", dtype=np.uint8, shape=(n_pos, n_u)
+        )
+        for pos0, values in chunks:
+            block, exact = _encode(values)
+            codes[pos0 : pos0 + len(values)] = block
+            if not exact.all():
+                r, c = np.nonzero(~exact)
+                exc_index.append((pos0 + r).astype(np.int64) * n_u + c)
+                exc_value.append(values[r, c])
+        codes.flush()
+        del codes
+        index, value = _sorted_exceptions(
+            chrom, strand, exc_index, exc_value, n_pos * n_u
+        )
+        _write_atomically(npz_path, lambda t: np.savez(t, index=index, value=value))
+        os.replace(tmp, npy_path)
+    finally:
+        if tmp.exists():
+            tmp.unlink()
+    logger.info(
+        f"Wrote accessibility cache {npy_path.name}: {n_pos:,} positions × {n_u}, "
+        f"{len(index):,} exact-value exceptions"
     )
     return npy_path
 
@@ -762,13 +869,18 @@ class GenomeAccessibilityService:
         progress=None,
         progress_callback=None,
         temperature: float = 37.0,
+        output_format: str = "parquet",
     ) -> Dict[str, Path]:
         """
         Compute accessibility for all sequences in the genome FASTA.
 
         Dispatches one task per chromosome to a ProcessPoolExecutor for
-        parallel folding. Saves one Parquet file per chromosome containing
-        columns [position, strand, u1, u2, ..., u{unpaired_prob}].
+        parallel folding. With ``output_format="parquet"`` saves one Parquet
+        file per chromosome containing columns [position, strand, u1, u2, ...,
+        u{unpaired_prob}]; with ``"npy"`` writes the uint8 memory-map cache
+        (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
+        sidecars, see `build_accessibility_cache`) instead, which the
+        ``memmap`` lookup strategy reads with no conversion step.
 
         Args:
             genome_path: Path to genome FASTA file.
@@ -778,10 +890,17 @@ class GenomeAccessibilityService:
             workers: Number of parallel folding workers.
             progress: Rich Progress instance (optional).
             progress_callback: Simple callback(advance, description) (optional).
+            temperature: Folding temperature in °C (default 37.0).
+            output_format: "parquet" (default) or "npy".
 
         Returns:
-            Dictionary mapping 'chrom' to the output Parquet path.
+            Dictionary mapping 'chrom' to the output Parquet path, or to the
+            plus-strand ``.access.npy`` path for "npy".
         """
+        if output_format not in OUTPUT_FORMATS:
+            raise AccessibilityError(
+                f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}"
+            )
         from concurrent.futures import ProcessPoolExecutor, as_completed
         from sioff.services.helpers import read_fasta
 
@@ -807,7 +926,11 @@ class GenomeAccessibilityService:
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             for chrom, sequence in chromosomes:
-                out_path = str(self._require_dir() / f"{chrom}.accessibility.parquet")
+                out_path = str(
+                    self._require_dir()
+                    if output_format == "npy"
+                    else self._require_dir() / f"{chrom}{PARQUET_SUFFIX}"
+                )
                 fut = pool.submit(
                     _fold_full_chromosome,
                     sequence,
@@ -818,6 +941,7 @@ class GenomeAccessibilityService:
                     out_path,
                     1_000_000,
                     temperature,
+                    output_format=output_format,
                 )
                 futures[fut] = chrom
 

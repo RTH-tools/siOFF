@@ -55,6 +55,7 @@ class AccessibilityConfig:
     span: int = 40
     unpaired: int = 30
     temperature: float = 37.0
+    output_format: str = "npy"
     verbose: bool = False
 
 
