@@ -230,3 +230,5 @@ example_yaml/sioff_example_out/
 
 # Output directory used by the README quick-start / full-example commands
 example_run/
+/risearch/
+docs/superpowers/
