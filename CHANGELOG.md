@@ -9,6 +9,43 @@ section as the GitHub release notes. The project uses
 
 <!-- git-cliff: end of header -->
 
+## [0.2.0] - 2026-10-26
+
+### 🚀 Features
+
+- Support Python 3.15 (polars 2.0); README install/Step 1/API updates ([#29](https://github.com/RTH-tools/siOFF/pull/29)) ([34d648d](https://github.com/RTH-tools/siOFF/commit/34d648d914c676ad08e4020a16bb9b13b76cb35b))
+- [**breaking**] Drop BED annotations; a binding site counts once per transcript ([#32](https://github.com/RTH-tools/siOFF/pull/32)) ([0fab595](https://github.com/RTH-tools/siOFF/commit/0fab595a72bc49fb98fe9c63a5ed17082a81f5ef))
+- *(accessibility)* Write the memmap .npy cache directly (--output-format npy, default) ([#38](https://github.com/RTH-tools/siOFF/pull/38)) ([19a039f](https://github.com/RTH-tools/siOFF/commit/19a039f0f7e607975f519b56f07516d85accc132))
+
+### 🐛 Bug Fixes
+
+- *(intersection)* Sum a BED ID's overlapping rows instead of keeping one at random ([#28](https://github.com/RTH-tools/siOFF/pull/28)) ([f5bda7e](https://github.com/RTH-tools/siOFF/commit/f5bda7e534975b0aa828daf3f22ff49f5f1cec17))
+- *(intersection)* Sum a BED ID's overlapping rows instead of keeping one at random ([#30](https://github.com/RTH-tools/siOFF/pull/30)) ([60fece9](https://github.com/RTH-tools/siOFF/commit/60fece913a2b4ca3bbc4c5900a136c45a3208340))
+- *(off-targets)* E_min with -s is the lower of self-hybridisation and the strongest expressed site ([#37](https://github.com/RTH-tools/siOFF/pull/37)) ([47bc88f](https://github.com/RTH-tools/siOFF/commit/47bc88fdc7f378146b2eeb3d7fb0b2b311c7afe4))
+
+### 📚 Documentation
+
+- *(readme)* Add CI, release, PyPI, licence and Python badges ([#23](https://github.com/RTH-tools/siOFF/pull/23)) ([5ee53df](https://github.com/RTH-tools/siOFF/commit/5ee53dffdbf616cdd929d2c79da597460cc698ae))
+- *(readme)* Refer to RIsearch v3 with PyPI/crates.io/GitHub links ([34ca5bf](https://github.com/RTH-tools/siOFF/commit/34ca5bf4c8fabd86cb26abd70e79f2838f51cf06))
+- *(readme)* Link PyPI project page in install section ([a970184](https://github.com/RTH-tools/siOFF/commit/a970184112c66056e986e3c5fdd2e505d39d4d60))
+- Describe siOFF as analyzing RIsearch3 predictions; drop Perl mention ([#26](https://github.com/RTH-tools/siOFF/pull/26)) ([893bf97](https://github.com/RTH-tools/siOFF/commit/893bf970eabee3a73b216ca6c842a0ee1cb641dc))
+- Point links at RTH-tools org (siOFF + risearch) ([#27](https://github.com/RTH-tools/siOFF/pull/27)) ([2672731](https://github.com/RTH-tools/siOFF/commit/2672731badb59aad949fddb87271bec1af1980c7))
+
+### ⚡ Performance
+
+- *(cli)* Import heavy deps lazily so --help is fast ([#20](https://github.com/RTH-tools/siOFF/pull/20)) ([b7d00d6](https://github.com/RTH-tools/siOFF/commit/b7d00d65ca9cd34564b386ae4ef0a62503bedf6f))
+- *(off-targets)* Share the transcriptome between workers instead of copying it ([#33](https://github.com/RTH-tools/siOFF/pull/33)) ([ccc8262](https://github.com/RTH-tools/siOFF/commit/ccc82629c5b56b904cf8373356b4efb8bebf6402))
+- *(off-targets)* --summary-only scores per siRNA without per-row columns ([#35](https://github.com/RTH-tools/siOFF/pull/35)) ([06494b4](https://github.com/RTH-tools/siOFF/commit/06494b49e506e8346a5e761de4741923a6d47fb8))
+
+### 📦 Build
+
+- Make polars[rtcompat] opt-in via a lts-cpu extra ([#21](https://github.com/RTH-tools/siOFF/pull/21)) ([8c53075](https://github.com/RTH-tools/siOFF/commit/8c530758e9a7177edb39af9de75654a7ed34eff2))
+
+### ⚙️ Miscellaneous Tasks
+
+- Generate CHANGELOG.md and release notes with git-cliff ([#22](https://github.com/RTH-tools/siOFF/pull/22)) ([7353602](https://github.com/RTH-tools/siOFF/commit/7353602603d516475b5b4a82fc350a089348526c))
+
+
 ## [0.1.0] - 2026-09-29
 
 First public version, published on PyPI under the name `sioff`. The entries
