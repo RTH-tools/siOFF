@@ -39,11 +39,10 @@ dependencies = [
   "pyarrow",
   "pyyaml",
   "rich>=14.3.0",
-  # Exact pin: risearch is an alpha series whose Python API and search results
-  # can change between alphas. Bump deliberately, after re-running the test
-  # suite and comparing search output on the fixtures (see README, "The
-  # risearch dependency").
-  "risearch==3.0.0a4",
+  # Unpinned so the latest release is picked up automatically. While only
+  # alphas exist on PyPI, resolvers fall back to pre-releases ("if-necessary"
+  # strategy); once a stable release is out, the latest stable wins.
+  "risearch",
   "typer",
   "viennaRNA==2.7.2",
 ]

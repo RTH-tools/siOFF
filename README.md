@@ -611,9 +611,9 @@ Rust with PyO3 bindings, called in-process with no subprocess or intermediate
 files. `off-targets` and `accessibility` on pre-computed predictions never
 import it.
 
-`risearch` is pinned exactly (`risearch==3.0.0a4`) because it is an alpha
-series whose API and results change between alphas; the pin is bumped
-deliberately, with the test suite and a fixture comparison, not automatically.
+`risearch` is unpinned, so the latest release is installed automatically.
+While only alpha builds exist on PyPI, resolvers fall back to pre-releases;
+once a stable release is published, the latest stable is preferred.
 
 The previous generation of this pipeline, built on RIsearch2, is at
 [rth.dk/resources/risearch](https://rth.dk/resources/risearch); siOFF reads its
