@@ -15,7 +15,11 @@ from pathlib import Path
 import numpy as np
 import polars as pl
 
-from sioff.services.accessibility import _reverse_complement, fold_sequence
+from sioff.services.accessibility import (
+    _check_fold_strand,
+    _strands_to_fold,
+    fold_sequence,
+)
 from sioff.services.helpers import read_fasta
 
 
@@ -50,15 +54,17 @@ def compute_accessibility(
     max_span: int = 40,
     unpaired_prob: int = 30,
     temperature: float = 37.0,
+    strand: str = "both",
 ) -> dict[str, pl.DataFrame]:
     """Compute per-chromosome accessibility profiles in memory.
 
     Every sequence in ``genome`` is folded twice with ViennaRNA's RNAplfold
     model, once as given (``+`` strand) and once as its reverse complement
-    (``-`` strand). The resulting opening energies are returned as one Polars
-    DataFrame per chromosome with columns ``[position, strand,
-    u1..u{unpaired_prob}]``, both strands stacked (``+`` then ``-``), matching
-    the on-disk Parquet schema written by ``sioff accessibility``. ``position``
+    (``-`` strand); ``strand="+"`` skips the reverse complement. The resulting
+    opening energies are returned as one Polars DataFrame per chromosome with
+    columns ``[position, strand, u1..u{unpaired_prob}]``, the strands stacked
+    (``+`` then ``-``), matching the on-disk Parquet schema written by
+    ``sioff accessibility``. ``position``
     is 1-based along the folded sequence and ``u{k}`` is the opening energy
     (kcal/mol) of the ``k``-nt stretch ending at that position. Writes no
     files and keeps every profile resident at once, so prefer the CLI's
@@ -78,6 +84,10 @@ def compute_accessibility(
         output holds columns ``u1..u{unpaired_prob}``.
     temperature : float, default 37.0
         Folding temperature in degrees Celsius (CLI ``-T/--temperature``).
+    strand : {"both", "+"}, default "both"
+        ``"+"`` folds each sequence as given only, for a transcriptome FASTA
+        whose records are already sense; the frames then hold no ``-`` rows
+        (CLI ``--strand``).
 
     Returns
     -------
@@ -90,6 +100,9 @@ def compute_accessibility(
     ------
     FileNotFoundError
         When ``genome`` does not exist.
+    AccessibilityError
+        `sioff.services.accessibility.AccessibilityError`, when ``strand`` is
+        not ``"both"`` or ``"+"``.
 
     See Also
     --------
@@ -97,30 +110,27 @@ def compute_accessibility(
     sioff.off_targets : Consumes the returned mapping via its ``accessibility``
         argument.
     """
+    _check_fold_strand(strand)
     genome = Path(genome)
     if not genome.exists():
         raise FileNotFoundError(f"Genome FASTA not found: {genome}")
 
     profiles: dict[str, pl.DataFrame] = {}
     for chrom, sequence in read_fasta(genome):
-        plus = fold_sequence(
-            sequence,
-            window_size=window_size,
-            max_span=max_span,
-            unpaired_prob=unpaired_prob,
-            temperature=temperature,
-        )
-        minus = fold_sequence(
-            _reverse_complement(sequence),
-            window_size=window_size,
-            max_span=max_span,
-            unpaired_prob=unpaired_prob,
-            temperature=temperature,
-        )
         profiles[chrom] = pl.concat(
             [
-                _profile_to_df(plus, "+", unpaired_prob),
-                _profile_to_df(minus, "-", unpaired_prob),
+                _profile_to_df(
+                    fold_sequence(
+                        seq,
+                        window_size=window_size,
+                        max_span=max_span,
+                        unpaired_prob=unpaired_prob,
+                        temperature=temperature,
+                    ),
+                    s,
+                    unpaired_prob,
+                )
+                for s, seq in _strands_to_fold(sequence, strand)
             ]
         )
     return profiles

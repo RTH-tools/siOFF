@@ -311,6 +311,11 @@ holding exactly the few values a byte cannot (above 25.5 kcal/mol), so
 writes one `{chrom}.accessibility.parquet` per chromosome instead (columns
 `position`, `strand`, `u1..u{u}`), for other tools or the `chrom-major`
 strategy.
+Each sequence is folded as given (`+`) and as its reverse complement (`-`).
+For a transcriptome FASTA, whose records are already in sense orientation,
+`--strand +` skips the reverse complement and halves the work; run
+`off-targets` with `--sense-only` on such profiles, or every antisense hit
+keeps the default opening energy (10 kcal/mol, with a warning).
 Chromosomes fold in parallel (`-j`, one worker per chromosome). This is the
 most compute-intensive stage: budget hours and tens of GB of memory for a
 mammalian genome — run it on a cluster (see
@@ -420,6 +425,7 @@ Available on `sioff` itself, before any subcommand.
 | `--accessibility-cache-dir` | `memmap` only: where the `.access.npy` cache is read from / built (default: the accessibility dir) |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
+| `--sense-only` | Keep only `+`-strand predictions (use it with profiles from `accessibility --strand +`) |
 | `--alpha / --gamma / --theta` | Parameter sweep values (semicolon-separated, e.g. `0.8;1.0`) |
 | `--on-target-ids / -oi` | TSV mapping `sirna_id → transcript_id` for on-target normalization |
 | `-j / --workers` | Parallel worker processes (default: CPU count) |
@@ -432,6 +438,7 @@ Available on `sioff` itself, before any subcommand.
 | `-f / --fasta` | Genome or transcriptome FASTA |
 | `-o / --output` | Output directory (per chromosome: `{chrom}_{plus,minus}.access.npy` + `.access.exceptions.npz`, or one `{chrom}.accessibility.parquet`) |
 | `--output-format` | `npy` (default; the cache `off-targets` memory-maps) or `parquet` |
+| `--strand` | `both` (default) or `+`: fold the sequences as given only (transcriptome FASTA; pair with `off-targets --sense-only`) |
 | `-W / --window` | RNAplfold window size W (default: 80) |
 | `-L / --span` | Max base-pair span L (default: 40) |
 | `-u / --unpaired` | Unpaired probability length u (default: 30) |
