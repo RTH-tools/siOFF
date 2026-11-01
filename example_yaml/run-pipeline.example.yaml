@@ -60,6 +60,9 @@ accessibility:
   # npy (default): the uint8 .access.npy cache off-targets memory-maps;
   # parquet: one {chrom}.accessibility.parquet per chromosome.
   output_format: npy
+  # both (default), or + to fold each sequence as given only: for a
+  # transcriptome FASTA, with sense_only: true on the off-targets step.
+  strand: both
 
 # =============================================================================
 # Step: off-targets  (main off-target analysis)

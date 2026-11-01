@@ -72,6 +72,13 @@ def run(
             help="Profile format: 'npy' (the uint8 cache off-targets memory-maps) or 'parquet'.",
         ),
     ] = "npy",
+    strand: Annotated[
+        str,
+        typer.Option(
+            "--strand",
+            help="Strands to fold: 'both' or '+' (the sequences as given only, for a transcriptome FASTA; pair with off-targets --sense-only).",
+        ),
+    ] = "both",
     verbose: Annotated[
         bool,
         typer.Option("--verbose", "-v", help="Show detailed progress information."),
@@ -88,6 +95,11 @@ def run(
     --output-format parquet writes one {chrom}.accessibility.parquet per
     chromosome instead, with columns [position (int32), strand (utf8),
     u1..u{u} (float32)].
+
+    Each sequence is folded as given (+) and as its reverse complement (-).
+    --strand + skips the reverse complement, halving the work for a
+    transcriptome FASTA, whose records are already in sense orientation; the
+    profiles then hold no '-' rows (an empty minus cache in npy form).
 
     Profiles can later be consumed by the off-targets command via
     --accessibility-dir.
@@ -112,6 +124,9 @@ def run(
             f"[red]Error: --output-format must be npy or parquet, got {output_format!r}[/red]"
         )
         raise typer.Exit(code=1)
+    if strand not in ("both", "+"):
+        console.print(f"[red]Error: --strand must be both or +, got {strand!r}[/red]")
+        raise typer.Exit(code=1)
 
     output.mkdir(parents=True, exist_ok=True)
     service = GenomeAccessibilityService(output)
@@ -119,6 +134,7 @@ def run(
     console.print("\n[bold]Full-genome accessibility computation[/bold]")
     console.print(f"  Genome:       {genome}")
     console.print(f"  Output dir:   {output} ({output_format})")
+    console.print(f"  Strands:      {'+ only' if strand == '+' else 'both'}")
     console.print(
         f"  Parameters:   W={window_size}, L={max_span}, u={unpaired_prob}, T={temperature}°C"
     )
@@ -135,6 +151,7 @@ def run(
                 progress=prog,
                 temperature=temperature,
                 output_format=output_format,
+                strand=strand,
             )
 
         console.print(

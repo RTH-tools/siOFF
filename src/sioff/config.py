@@ -56,6 +56,7 @@ class AccessibilityConfig:
     unpaired: int = 30
     temperature: float = 37.0
     output_format: str = "npy"
+    strand: str = "both"
     verbose: bool = False
 
 

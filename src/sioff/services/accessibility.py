@@ -21,6 +21,10 @@ class AccessibilityError(Exception):
     pass
 
 
+class MissingStrandError(AccessibilityError):
+    """The contig's profile has no rows for the strand looked up."""
+
+
 _COMPLEMENT_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
 _GAS_CONSTANT = 0.001987  # kcal / (mol·K)
 
@@ -85,11 +89,13 @@ def check_strand_lengths(
     end (truncated or hand-edited Parquet, a future writer change) would shift
     every minus-strand lookup on the contig without any other symptom. Both
     strands of one contig must have the same length, so a mismatch is the
-    cheapest observable sign of that. Unknown lengths (``None``) are skipped.
+    cheapest observable sign of that. Unknown lengths (``None``) and empty
+    strands (``0``, a single-strand profile; see `_warn_missing_strand`) are
+    skipped.
 
     Returns ``True`` when the lengths agree or cannot be compared.
     """
-    if plus_len is None or minus_len is None or plus_len == minus_len:
+    if not plus_len or not minus_len or plus_len == minus_len:
         return True
     logger.warning(
         f"Accessibility profile for {chrom} ({source}): '+' covers {plus_len} "
@@ -98,6 +104,30 @@ def check_strand_lengths(
         "contig; regenerate the profile with `sioff accessibility`."
     )
     return False
+
+
+# Strands `_warn_missing_strand` has reported in this process.
+_WARNED_MISSING_STRANDS: set[str] = set()
+
+
+def _warn_missing_strand(chrom: str, strand: str) -> None:
+    """Warn that hits on a strand the profile lacks keep the default energy.
+
+    A profile folded with ``--strand +`` has no ``-`` rows, so without
+    ``--sense-only`` every minus-strand hit would get the default opening
+    energy silently. Reported once per process and strand: a worker meets it
+    on every contig of such a profile.
+    """
+    if strand in _WARNED_MISSING_STRANDS:
+        return
+    _WARNED_MISSING_STRANDS.add(strand)
+    logger.warning(
+        f"The accessibility profile for {chrom} has no {strand!r} strand (folded "
+        "with `sioff accessibility --strand +`?): hits on that strand keep the "
+        f"default opening energy of {_OUT_OF_BOUNDS_ENERGY} kcal/mol, here and on "
+        "any other contig without it. Pass --sense-only (sense_only=True) to drop "
+        "them, or recompute the profiles with --strand both."
+    )
 
 
 def fold_sequence(
@@ -158,6 +188,23 @@ def fold_sequence(
 
 
 OUTPUT_FORMATS = ("npy", "parquet")
+# "+" folds the sequence as given only: a transcriptome FASTA already holds each
+# target in its sense orientation, so its reverse complement is never hit.
+FOLD_STRANDS = ("both", "+")
+
+
+def _check_fold_strand(strand: str) -> None:
+    if strand not in FOLD_STRANDS:
+        raise AccessibilityError(
+            f"strand must be one of {FOLD_STRANDS}, got {strand!r}"
+        )
+
+
+def _strands_to_fold(sequence: str, strand: str) -> tuple[tuple[str, str], ...]:
+    """``(strand, sequence)`` pairs to fold: ``+``, then ``-`` unless ``strand="+"``."""
+    _check_fold_strand(strand)
+    plus = (("+", sequence),)
+    return plus if strand == "+" else plus + (("-", _reverse_complement(sequence)),)
 
 
 def _fold_strand_chunks(
@@ -245,6 +292,7 @@ def _fold_full_chromosome(
     chunk_size: int = 1_000_000,
     temperature: float = 37.0,
     output_format: str = "parquet",
+    strand: str = "both",
 ) -> str:
     """Fold both strands of a chromosome in chunks and stream them to disk.
 
@@ -254,6 +302,10 @@ def _fold_full_chromosome(
     directory ``output_path``, byte for byte what that function builds from
     the Parquet, and returns the plus-strand ``.npy`` path.
 
+    ``strand="+"`` folds the forward strand only: the Parquet holds no ``-``
+    rows, and the npy output an empty ``(0, u)`` ``-`` cache, as
+    `build_accessibility_cache` makes from that Parquet.
+
     Top-level (not a method) so ProcessPoolExecutor can pickle it; only the
     output path string is pickled back, avoiding O(N×u) OOM on large chromosomes.
     """
@@ -261,7 +313,7 @@ def _fold_full_chromosome(
         raise AccessibilityError(
             f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}"
         )
-    strands = (("+", sequence), ("-", _reverse_complement(sequence)))
+    strands = _strands_to_fold(sequence, strand)
 
     def chunks(seq: str):
         return _fold_strand_chunks(
@@ -271,10 +323,10 @@ def _fold_full_chromosome(
     if output_format == "npy":
         out_dir = Path(output_path)
         out_dir.mkdir(parents=True, exist_ok=True)
-        for strand, seq in strands:
-            _write_strand_cache(
-                out_dir, chrom, strand, len(seq), unpaired_prob, chunks(seq)
-            )
+        for s, seq in strands:
+            _write_strand_cache(out_dir, chrom, s, len(seq), unpaired_prob, chunks(seq))
+        if strand == "+":
+            _write_strand_cache(out_dir, chrom, "-", 0, unpaired_prob, ())
         return str(cache_paths(out_dir, chrom, "+")[0])
 
     schema = pa.schema(
@@ -282,12 +334,12 @@ def _fold_full_chromosome(
         + [(f"u{i}", pa.float32()) for i in range(1, unpaired_prob + 1)]
     )
     with pq.ParquetWriter(output_path, schema) as writer:
-        for strand, seq in strands:
+        for s, seq in strands:
             for pos0, u_matrix in chunks(seq):
                 n_pos = len(u_matrix)
                 arrays = [
                     pa.array(np.arange(pos0 + 1, pos0 + n_pos + 1, dtype=np.int32)),
-                    pa.array([strand] * n_pos, type=pa.utf8()),
+                    pa.array([s] * n_pos, type=pa.utf8()),
                 ] + [pa.array(u_matrix[:, u]) for u in range(unpaired_prob)]
                 writer.write_batch(pa.RecordBatch.from_arrays(arrays, schema=schema))
 
@@ -870,6 +922,7 @@ class GenomeAccessibilityService:
         progress_callback=None,
         temperature: float = 37.0,
         output_format: str = "parquet",
+        strand: str = "both",
     ) -> Dict[str, Path]:
         """
         Compute accessibility for all sequences in the genome FASTA.
@@ -881,6 +934,8 @@ class GenomeAccessibilityService:
         (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
         sidecars, see `build_accessibility_cache`) instead, which the
         ``memmap`` lookup strategy reads with no conversion step.
+        ``strand="+"`` folds each sequence as given only (see
+        `_fold_full_chromosome`).
 
         Args:
             genome_path: Path to genome FASTA file.
@@ -892,6 +947,7 @@ class GenomeAccessibilityService:
             progress_callback: Simple callback(advance, description) (optional).
             temperature: Folding temperature in °C (default 37.0).
             output_format: "parquet" (default) or "npy".
+            strand: "both" (default) or "+" to skip the reverse complement.
 
         Returns:
             Dictionary mapping 'chrom' to the output Parquet path, or to the
@@ -901,6 +957,7 @@ class GenomeAccessibilityService:
             raise AccessibilityError(
                 f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}"
             )
+        _check_fold_strand(strand)
         from concurrent.futures import ProcessPoolExecutor, as_completed
         from sioff.services.helpers import read_fasta
 
@@ -942,6 +999,7 @@ class GenomeAccessibilityService:
                     1_000_000,
                     temperature,
                     output_format=output_format,
+                    strand=strand,
                 )
                 futures[fut] = chrom
 
@@ -1013,7 +1071,7 @@ class GenomeAccessibilityService:
         """
         df = full.filter(pl.col("strand") == strand).sort("position")
         if df.height == 0:
-            raise AccessibilityError(f"No data for strand {strand!r} in {source}")
+            raise MissingStrandError(f"No data for strand {strand!r} in {source}")
         u_cols = _u_columns(df.columns)
         max_pos = int(cast(int, df["position"].max()))
         arr = np.full((max_pos, len(u_cols)), 25.5, dtype=np.float32)
@@ -1090,7 +1148,7 @@ class GenomeAccessibilityService:
                     f"building from {parquet}"
                 )
         if profile.n_pos == 0:
-            raise AccessibilityError(f"No data for strand {strand!r} in {chrom}")
+            raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
         return profile
 
     def _ensure_profile(self, chrom: str, strand: str) -> str:
@@ -1249,6 +1307,9 @@ class GenomeAccessibilityService:
         for (chrom, strand), row_indices in groups.items():
             try:
                 profile_key = self._ensure_profile(chrom, strand)
+            except MissingStrandError:
+                _warn_missing_strand(chrom, strand)
+                continue
             except Exception:
                 continue
 
@@ -1389,6 +1450,7 @@ def gather_opening_energies(
         rgs = [e for e in layout if e[1] == strand]
         if not rgs:
             # The eager path raises "No data for strand" and skips the group.
+            _warn_missing_strand(_chrom_of(parquet_path), strand)
             continue
         seq_len = max(e[3] for e in rgs)
 

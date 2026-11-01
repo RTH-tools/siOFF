@@ -438,11 +438,12 @@ def accessibility(
     max_span: int = 40,
     unpaired_prob: int = 30,
     temperature: float = 37.0,
+    strand: str = "both",
 ) -> dict[str, pl.DataFrame]:
     """Compute per-chromosome accessibility profiles in memory.
 
     Folds every sequence in *genome* with ViennaRNA (local folding, both
-    strands) and returns the opening-energy profiles in the same schema the
+    strands unless ``strand="+"``) and returns the opening-energy profiles in the same schema the
     ``sioff accessibility`` command streams to ``{chrom}.accessibility.parquet``.
     Writes no files. The result is the ``accessibility`` argument of
     [`off_targets`][sioff.off_targets]. Every profile stays resident at once, so for
@@ -463,6 +464,11 @@ def accessibility(
         computed; sets the number of ``u`` columns. CLI: ``-u/--unpaired``.
     temperature : float, default 37.0
         Folding temperature in degrees Celsius. CLI: ``-T/--temperature``.
+    strand : {"both", "+"}, default "both"
+        ``"+"`` folds each sequence as given only, skipping its reverse
+        complement: for a transcriptome FASTA, whose records are already
+        sense. Hits on ``-`` then have no profile, so pair it with
+        ``off_targets(sense_only=True)``. CLI: ``--strand``.
 
     Returns
     -------
@@ -470,7 +476,7 @@ def accessibility(
         Chromosome (FASTA record ID) to profile, in file order. Each frame has
         the columns ``position`` (1-based), ``strand`` (``"+"`` or ``"-"``) and
         ``u1..u{unpaired_prob}`` (opening energies in kcal/mol), with all
-        ``+`` rows followed by all ``-`` rows.
+        ``+`` rows followed by all ``-`` rows (none with ``strand="+"``).
 
     Raises
     ------
@@ -478,7 +484,8 @@ def accessibility(
         When *genome* does not exist.
     AccessibilityError
         `sioff.services.accessibility.AccessibilityError`, when
-        ViennaRNA fails to fold a sequence.
+        ViennaRNA fails to fold a sequence or ``strand`` is not ``"both"``
+        or ``"+"``.
 
     See Also
     --------
@@ -498,6 +505,7 @@ def accessibility(
         max_span=max_span,
         unpaired_prob=unpaired_prob,
         temperature=temperature,
+        strand=strand,
     )
 
 

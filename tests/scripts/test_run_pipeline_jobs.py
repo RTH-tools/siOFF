@@ -94,11 +94,18 @@ class TestBuildAccessibility:
         assert "--window" not in bare
 
         full = rp._build_accessibility(
-            {"fasta": "g.fa", "output": "acc/", "window": 80, "temperature": 37.0},
+            {
+                "fasta": "g.fa",
+                "output": "acc/",
+                "window": 80,
+                "temperature": 37.0,
+                "strand": "+",
+            },
             tmp_path,
         )
         assert _flag(full, "--window") == "80"
         assert _flag(full, "--temperature") == "37.0"
+        assert _flag(full, "--strand") == "+"
 
 
 class TestBuildOffTargets:
