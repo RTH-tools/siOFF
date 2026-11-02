@@ -15,9 +15,11 @@ import polars as pl
 import pytest
 from polars.testing import assert_frame_equal
 from loguru import logger
+from typer.testing import CliRunner
 
 import sioff
 import sioff.services.accessibility as acc
+from sioff.cli import app
 from sioff.services.accessibility import (
     AccessibilityError,
     _batch_records,
@@ -649,3 +651,286 @@ def test_off_targets_packed_equals_per_record(pq_copy, tmp_path, form):
     assert (packed["opening_energy"] != 10.0).any()
     assert (reference["opening_energy"] != 10.0).any()
     assert_frame_equal(packed, reference, check_exact=True)
+
+
+# --------------------------------------------------------------------------
+# `sioff accessibility` folds a FASTA straight into the packed pair.
+# --------------------------------------------------------------------------
+
+FOLD_80 = ["-W", "80", "-L", "40", "-u", "30"]
+
+
+def _write_fasta(path: Path, records) -> Path:
+    path.write_text("".join(f">{name}\n{seq}\n" for name, seq in records))
+    return path
+
+
+def _fold_cli(fa: Path, out: Path, *extra: str):
+    result = CliRunner().invoke(
+        app, ["accessibility", "-f", str(fa), "-o", str(out), *FOLD_80, *extra]
+    )
+    assert result.exit_code == 0, result.output
+    return result
+
+
+def _record_slices(directory: Path, strand: str) -> dict:
+    """``{name: (codes, exception index local to the record, values)}`` of a pack."""
+    npy, npz = packed_paths(directory, strand)
+    codes = np.load(npy, mmap_mode="r")
+    n_u = codes.shape[1]
+    slices = {}
+    with np.load(npz) as side:
+        index, value = side["index"], side["value"]
+        for name, off, n in zip(
+            side["names"].tolist(), side["offsets"].tolist(), side["lengths"].tolist()
+        ):
+            lo, hi = np.searchsorted(index, [off * n_u, (off + n) * n_u])
+            slices[name] = (
+                np.asarray(codes[off : off + n]),
+                index[lo:hi] - off * n_u,
+                value[lo:hi],
+            )
+    return slices
+
+
+def _per_record_slice(rec_dir: Path, name: str, strand: str):
+    npy, npz = cache_paths(rec_dir, name, strand)
+    with np.load(npz) as side:
+        return np.load(npy), side["index"], side["value"]
+
+
+def _assert_same_record(got, want, label) -> None:
+    (codes_g, index_g, value_g), (codes_w, index_w, value_w) = got, want
+    assert codes_g.dtype == codes_w.dtype == np.uint8, label
+    assert codes_g.shape == codes_w.shape, label
+    assert codes_g.tobytes() == codes_w.tobytes(), label
+    assert index_g.dtype == index_w.dtype == np.int64, label
+    assert value_g.dtype == value_w.dtype == np.float32, label
+    np.testing.assert_array_equal(index_g, index_w, err_msg=str(label))
+    np.testing.assert_array_equal(value_g, value_w, err_msg=str(label))
+
+
+def _assert_index(directory: Path, strand: str, names, lengths) -> None:
+    with np.load(packed_paths(directory, strand)[1]) as side:
+        assert side["names"].tolist() == list(names)
+        for key in ("offsets", "lengths", "index"):
+            assert side[key].dtype == np.int64, key
+        assert side["value"].dtype == np.float32
+        assert side["lengths"].tolist() == list(lengths)
+        assert (
+            side["offsets"].tolist()
+            == np.concatenate([[0], np.cumsum(lengths)[:-1]]).tolist()
+        )
+        assert (np.diff(side["index"]) > 0).all()
+
+
+def test_cli_writes_four_files_and_two_with_strand_plus(
+    parquet_records, tmp_path, plain
+):
+    _, seqs = parquet_records
+    fa = _write_fasta(tmp_path / "multi.fa", seqs.items())
+    for extra, strands in (((), "+-"), (("--strand", "+"), "+")):
+        out = tmp_path / f"out_{len(strands)}"
+        text = plain(_fold_cli(fa, out, *extra).output)
+        assert _listing(out) == sorted(
+            p.name for s in strands for p in packed_paths(out, s)
+        )
+        assert "Processed 3 record(s)" in text
+        assert "accessibility.plus.packed.npy" in text
+        assert "recA" not in text
+
+
+@pytest.mark.parametrize("workers", [1, 2])
+def test_fold_pack_equals_parquet_pack(parquet_records, tmp_path, workers, monkeypatch):
+    pdir, seqs = parquet_records
+    order = ["recB", "recA", "recC"]
+    fa = _write_fasta(tmp_path / "multi.fa", [(n, seqs[n]) for n in order])
+    calls: list[int] = []
+    if workers > 1:
+        # One batch per record, so the process pool really runs and its
+        # workers write their r+ slices of the same files concurrently.
+        def one_each(sizes, target=0):
+            calls.append(len(sizes))
+            return [[i] for i in range(len(sizes))]
+
+        monkeypatch.setattr(acc, "_batch_records", one_each)
+    out = tmp_path / "fold"
+    got = acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+        fa, 80, 40, 30, workers=workers, output_format="npy", chunk_size=700
+    )
+    assert calls == ([3] if workers > 1 else [])
+    assert list(got) == order
+    assert set(got.values()) == {packed_paths(out, "+")[0]}
+    assert _listing(out) == PACKED_NAMES
+
+    ref = tmp_path / "ref"
+    pack_parquet_profiles(pdir, ref)
+    for strand in "+-":
+        _assert_index(out, strand, order, [len(seqs[n]) for n in order])
+        folded, packed = _record_slices(out, strand), _record_slices(ref, strand)
+        assert folded.keys() == packed.keys()
+        for name in order:
+            _assert_same_record(folded[name], packed[name], (name, strand))
+        assert folded["recB"][1].size > 0, strand  # the hairpins' exceptions
+
+
+def test_zero_length_record_is_indexed_and_not_folded(parquet_records, tmp_path):
+    pdir, seqs = parquet_records
+    # recB's exceptions sit at a nonzero offset, after recC and the empty record.
+    order = ["recC", "empty", "recB"]
+    fa = tmp_path / "gap.fa"
+    fa.write_text(f">recC\n{seqs['recC']}\n>empty\n>recB\n{seqs['recB']}\n")
+    out = tmp_path / "fold"
+    got = acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+        fa, 80, 40, 30, output_format="npy", chunk_size=700
+    )
+    assert list(got) == order
+    ref = tmp_path / "ref"
+    pack_parquet_profiles(pdir, ref)
+    for strand in "+-":
+        _assert_index(out, strand, order, [25, 0, len(seqs["recB"])])
+        folded, packed = _record_slices(out, strand), _record_slices(ref, strand)
+        assert folded["empty"][0].shape == (0, 30)
+        for name in ("recC", "recB"):
+            _assert_same_record(folded[name], packed[name], (name, strand))
+        assert folded["recB"][1].size > 0, strand
+
+
+def test_empty_fasta_writes_no_pack(tmp_path):
+    fa = tmp_path / "empty.fa"
+    fa.write_text("")
+    out = tmp_path / "out"
+    with pytest.raises(AccessibilityError, match="No records in"):
+        acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+            fa, 40, 20, 10, output_format="npy"
+        )
+    assert not any(out.iterdir())
+
+
+@pytest.mark.parametrize("output_format", ["npy", "parquet"])
+def test_duplicate_record_ids_are_refused(tmp_path, output_format, plain):
+    seq = _random_seq(60, np.random.default_rng(6))
+    fa = _write_fasta(
+        tmp_path / "dup.fa", [("dupX", seq), ("ok", seq), ("dupX second copy", seq)]
+    )
+    out = tmp_path / "out"
+    with pytest.raises(AccessibilityError, match=r"Duplicate record IDs in .*: dupX$"):
+        acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+            fa, 40, 20, 10, output_format=output_format
+        )
+    assert not any(out.iterdir())
+
+    many = _write_fasta(
+        tmp_path / "many.fa", [(f"d{i:02d}", seq) for i in range(12)] * 2
+    )
+    with pytest.raises(AccessibilityError) as err:
+        acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+            many, 40, 20, 10, output_format=output_format
+        )
+    assert str(err.value).endswith(
+        ": " + ", ".join(f"d{i:02d}" for i in range(10)) + "…"
+    )
+    assert not any(out.iterdir())
+
+    cli_out = tmp_path / "cli"
+    result = CliRunner().invoke(
+        app,
+        ["accessibility", "-f", str(fa), "-o", str(cli_out), "-W", "40", "-L", "20"]
+        + ["-u", "10", "--output-format", output_format],
+    )
+    assert result.exit_code == 1
+    assert "dupX" in plain(result.output)
+    assert not cli_out.exists() or not any(cli_out.iterdir())
+
+
+def test_strand_plus_rerun_removes_a_stale_minus_pair(
+    parquet_records, tmp_path, monkeypatch
+):
+    _, seqs = parquet_records
+    fa = _write_fasta(tmp_path / "multi.fa", seqs.items())
+    out = tmp_path / "out"
+    _fold_cli(fa, out)
+    assert _listing(out) == PACKED_NAMES
+    _fold_cli(fa, out, "--strand", "+")
+    assert _listing(out) == sorted(p.name for p in packed_paths(out, "+"))
+
+    # A CLI run resets loguru's handlers, so start capturing after it.
+    monkeypatch.setattr(acc, "_WARNED_MISSING_STRANDS", set())
+    seen: list[str] = []
+    handler = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    try:
+        got = _annotate(
+            acc.GenomeAccessibilityService(out), "recA", [("+", 50, 60), ("-", 50, 60)]
+        )
+    finally:
+        logger.remove(handler)
+    assert got[0] != 10.0 and got[1] == 10.0
+    assert [m for m in seen if "no '-' strand" in m], seen
+
+
+def test_record_ids_with_pipes_and_slashes(tmp_path):
+    seq = _random_seq(300, np.random.default_rng(11))
+    names = ["ENST0001.1|ENSG0001.1|tx", "a/b", "plain"]
+    fa = tmp_path / "ids.fa"
+    fa.write_text(
+        f">{names[0]} gene=x\n{seq}\n>{names[1]}\n{seq}\n>{names[2]}\n{seq}\n"
+    )
+    out = tmp_path / "out"
+    got = acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+        fa, 40, 20, 10, output_format="npy"
+    )
+    assert list(got) == names
+    assert _listing(out) == PACKED_NAMES
+    reader = acc.GenomeAccessibilityService(out)
+    for strand in "+-":
+        for start, end in ((100, 115), (10, 18), (280, 300)):
+            want = reader.query_single("plain", start, end, strand)
+            assert want != 10.0
+            for name in names[:2]:
+                assert reader.query_single(name, start, end, strand) == want
+
+
+def test_many_short_records(tmp_path):
+    rng = np.random.default_rng(21)
+    records = [
+        (f"t{i:03d}", _random_seq(int(rng.integers(30, 121)), rng)) for i in range(300)
+    ]
+    names = [n for n, _ in records]
+    lengths = [len(s) for _, s in records]
+    fa = _write_fasta(tmp_path / "many.fa", records)
+    advances: list[int] = []
+    descriptions: list[str] = []
+
+    def callback(advance, description):
+        advances.append(advance)
+        descriptions.append(description)
+
+    out = tmp_path / "out"
+    got = acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+        fa,
+        40,
+        20,
+        10,
+        workers=2,
+        output_format="npy",
+        progress_callback=callback,
+    )
+    assert list(got) == names
+    assert _listing(out) == PACKED_NAMES
+    assert sum(advances) == 300
+    assert len(advances) == len(_batch_records(lengths)) <= 2
+    assert descriptions[-1] == "Folded 300/300 records"
+
+    slices = {s: _record_slices(out, s) for s in "+-"}
+    for strand in "+-":
+        _assert_index(out, strand, names, lengths)
+    for i in rng.choice(300, 20, replace=False):
+        name, seq = records[int(i)]
+        rec = tmp_path / "rec"
+        _fold_full_chromosome(seq, name, 40, 20, 10, str(rec), output_format="npy")
+        for strand in "+-":
+            _assert_same_record(
+                slices[strand][name],
+                _per_record_slice(rec, name, strand),
+                (name, strand),
+            )

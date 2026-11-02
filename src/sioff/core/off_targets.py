@@ -748,8 +748,8 @@ def compute_off_targets_single(
         time and memory per stage (CLI ``--profile``). A disabled profiler is
         used when omitted.
     accessibility_progress_callback : callable, optional
-        Called as ``callback(advance=1, description=str)`` after each
-        chromosome is folded on the fly; only used with ``genome_file``.
+        Called as ``callback(advance=n, description=str)`` after each batch
+        of ``n`` records is folded on the fly; only used with ``genome_file``.
 
     Returns
     -------

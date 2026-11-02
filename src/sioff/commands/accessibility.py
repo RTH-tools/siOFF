@@ -3,6 +3,7 @@ from typing import Annotated, Optional
 
 import typer
 from rich.console import Console
+from rich.markup import escape
 from rich.progress import (
     Progress,
     SpinnerColumn,
@@ -39,7 +40,7 @@ def run(
         typer.Option(
             "--output",
             "-o",
-            help="Output directory — per chromosome, the {chrom}_{plus,minus}.access.npy memory-map cache (default) or one {chrom}.accessibility.parquet (--output-format parquet) is written here",
+            help="Output directory — the packed memory-map cache, accessibility.{plus,minus}.packed.{npy,npz} for all records (default; the plus pair only with --strand +), or one {record}.accessibility.parquet per record (--output-format parquet) is written here; a re-run replaces the packed files",
         ),
     ] = ...,  # ty: ignore[invalid-parameter-default]  # pyrefly: ignore[bad-function-definition]  # Typer required-option idiom (Ellipsis); kept required, must follow defaulted `genome`
     window_size: Annotated[
@@ -62,7 +63,7 @@ def run(
         typer.Option(
             "--workers",
             "-j",
-            help="Number of parallel workers (one per chromosome).",
+            help="Number of parallel folding processes.",
         ),
     ] = 1,
     output_format: Annotated[
@@ -85,21 +86,25 @@ def run(
     ] = False,
 ):
     """
-    Pre-compute per-chromosome accessibility profiles.
+    Pre-compute accessibility profiles for every record of a FASTA.
 
-    Folds every chromosome in the FASTA with ViennaRNA RNAplfold and writes
-    its opening energies to the output directory. The default npy format is
-    the uint8 cache that off-targets memory-maps: per chromosome and
-    strand a {chrom}_{plus,minus}.access.npy code matrix [position, u] plus an
-    .access.exceptions.npz sidecar of the values a code cannot hold exactly.
-    --output-format parquet writes one {chrom}.accessibility.parquet per
-    chromosome instead, with columns [position (int32), strand (utf8),
+    Folds every record in the FASTA (chromosomes or transcripts; IDs, the
+    first word of each header, must be unique) with ViennaRNA RNAplfold and
+    writes its opening energies to the output directory. The default npy
+    format is the packed uint8 cache that off-targets memory-maps, one pair
+    of files per strand whatever the number of records:
+    accessibility.{plus,minus}.packed.npy, a code matrix [position, u] with
+    every record's rows back to back in FASTA order, and a .packed.npz index
+    of record names, offsets and lengths plus the values a code cannot hold
+    exactly. A re-run into the same directory replaces the pair.
+    --output-format parquet writes one {record}.accessibility.parquet per
+    record instead, with columns [position (int32), strand (utf8),
     u1..u{u} (float32)].
 
     Each sequence is folded as given (+) and as its reverse complement (-).
     --strand + skips the reverse complement, halving the work for a
     transcriptome FASTA, whose records are already in sense orientation; the
-    profiles then hold no '-' rows (an empty minus cache in npy form).
+    profiles then hold no '-' rows (no minus pair in npy form).
 
     Profiles can later be consumed by the off-targets command via
     --accessibility-dir.
@@ -108,7 +113,7 @@ def run(
     # load polars/numpy/Biopython through the service (see TestCLIStartup).
     from loguru import logger
 
-    from sioff.services.accessibility import GenomeAccessibilityService
+    from sioff.services.accessibility import GenomeAccessibilityService, packed_paths
 
     console = Console(stderr=True)
 
@@ -155,10 +160,19 @@ def run(
             )
 
         console.print(
-            f"\n[green bold]✓[/green bold] Processed {len(results)} chromosome(s)"
+            f"\n[green bold]✓[/green bold] Processed {len(results)} record(s)"
         )
-        for chrom, path in results.items():
-            console.print(f"  {chrom}: [cyan]{path}[/cyan]")
+        if output_format == "npy":
+            # One packed pair per strand holds every record.
+            packed = sorted(
+                (p for s in ("+", "-") for p in packed_paths(output, s) if p.is_file()),
+                key=lambda p: p.name,
+            )
+            for path in packed:
+                console.print(f"  [cyan]{escape(str(path))}[/cyan]", soft_wrap=True)
+        else:
+            for chrom, path in results.items():
+                console.print(f"  {chrom}: [cyan]{path}[/cyan]")
 
         return results
 

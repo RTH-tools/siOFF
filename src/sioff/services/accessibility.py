@@ -2,9 +2,9 @@ import itertools
 import math
 import multiprocessing
 import os
-from collections import OrderedDict, defaultdict
-from collections.abc import Iterable, Sequence
-from concurrent.futures import ProcessPoolExecutor
+from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Callable, Iterable, Sequence
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Union, cast
 
@@ -356,8 +356,9 @@ def _fold_full_chromosome(
 # ---------------------------------------------------------------------------
 # Memory-mapped per-(contig, strand) cache
 #
-# `_fold_full_chromosome` writes one Parquet file per contig, or (npy, the
-# CLI default) this cache directly through `_write_strand_cache`. Reading a whole
+# `_fold_full_chromosome` writes one Parquet file per contig, or (npy) this
+# cache directly through `_write_strand_cache`; the CLI default, npy, folds a
+# FASTA into the packed layout below (`_pack_fasta_records`). Reading a whole
 # chromosome back into a dense float32 array costs 30 GB per strand on chr1,
 # and off-target batch runs do that once per worker process. The cache below
 # re-encodes each strand as a position-major uint8 matrix that every worker
@@ -629,6 +630,29 @@ def _sorted_exceptions(
     return index, value
 
 
+def _encode_chunks(
+    codes: np.ndarray, chunks: Iterable[tuple[int, np.ndarray]], row0: int = 0
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Encode folded ``(pos0, float32 block)`` chunks into ``codes`` from row ``row0``.
+
+    Chunk ``pos0`` lands at row ``row0 + pos0``. Returns the entries a code
+    cannot hold exactly, one array per chunk that has any: their flat indices
+    in ``codes`` (``row * n_u + col``, int64) and their float32 values.
+    """
+    n_u = codes.shape[1]
+    exc_index: list[np.ndarray] = []
+    exc_value: list[np.ndarray] = []
+    for pos0, values in chunks:
+        start = row0 + pos0
+        block, exact = _encode(values)
+        codes[start : start + len(values)] = block
+        if not exact.all():
+            r, c = np.nonzero(~exact)
+            exc_index.append((start + r).astype(np.int64) * n_u + c)
+            exc_value.append(values[r, c])
+    return exc_index, exc_value
+
+
 def _write_strand_cache(
     cache_dir: Path,
     chrom: str,
@@ -646,19 +670,11 @@ def _write_strand_cache(
     """
     npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
     tmp = npy_path.with_name(f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}")
-    exc_index: list[np.ndarray] = []
-    exc_value: list[np.ndarray] = []
     try:
         codes = np.lib.format.open_memmap(
             tmp, mode="w+", dtype=np.uint8, shape=(n_pos, n_u)
         )
-        for pos0, values in chunks:
-            block, exact = _encode(values)
-            codes[pos0 : pos0 + len(values)] = block
-            if not exact.all():
-                r, c = np.nonzero(~exact)
-                exc_index.append((pos0 + r).astype(np.int64) * n_u + c)
-                exc_value.append(values[r, c])
+        exc_index, exc_value = _encode_chunks(codes, chunks)
         codes.flush()
         del codes
         index, value = _sorted_exceptions(
@@ -786,6 +802,13 @@ def _pack_parquet_batch(
                 found[strand][1].extend(val)
     for mm in maps.values():
         mm.flush()
+    return _concat_exceptions(found)
+
+
+def _concat_exceptions(
+    found: Mapping[str, tuple[list[np.ndarray], list[np.ndarray]]],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Per strand, a worker's exception chunks as one (int64, float32) pair."""
     return {
         s: (
             np.concatenate(i).astype(np.int64) if i else np.empty(0, np.int64),
@@ -944,6 +967,163 @@ def pack_parquet_profiles(
         for tmp in tmp_paths.values():
             tmp.unlink(missing_ok=True)
     return names
+
+
+def _fold_records_into_pack(
+    tmp_npy: dict[str, str],
+    records: list[tuple[str, str, int]],
+    window_size: int,
+    max_span: int,
+    unpaired_prob: int,
+    chunk_size: int,
+    temperature: float,
+    strand: str,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Fold one batch of FASTA records into the packed temp ``.npy`` files.
+
+    Each record is ``(name, sequence, row offset)``. Its strands are folded in
+    chunks as `_fold_full_chromosome` folds them, and each chunk's codes land
+    at row ``offset + pos0`` of that strand's map, ``tmp_npy[strand]``, opened
+    ``r+``. A zero-length record has no rows and is skipped. Returns, per
+    strand, only the exceptions as ``(global flat index int64, value
+    float32)``. Top-level so worker processes can pickle it.
+    """
+    maps = {s: np.load(p, mmap_mode="r+") for s, p in tmp_npy.items()}
+    found: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {
+        s: ([], []) for s in maps
+    }
+    for _, sequence, offset in records:
+        if not sequence:
+            continue
+        for s, seq in _strands_to_fold(sequence, strand):
+            chunks = _fold_strand_chunks(
+                seq, window_size, max_span, unpaired_prob, chunk_size, temperature
+            )
+            index, value = _encode_chunks(maps[s], chunks, offset)
+            found[s][0].extend(index)
+            found[s][1].extend(value)
+    for mm in maps.values():
+        mm.flush()
+    return _concat_exceptions(found)
+
+
+def _pack_fasta_records(
+    records: Sequence[tuple[str, str]],
+    cache_dir: Path,
+    window_size: int,
+    max_span: int,
+    unpaired_prob: int,
+    chunk_size: int,
+    temperature: float,
+    strand: str,
+    workers: int,
+    on_batch: Callable[[int], None],
+) -> Path:
+    """Fold FASTA ``(name, sequence)`` records into one packed pair per strand.
+
+    Records keep their FASTA order, and both strands share ``offsets`` and
+    ``lengths`` (a reverse complement is as long as its record). Each written
+    strand's ``.npy`` is preallocated under a temporary name and filled
+    through memory maps by `_fold_records_into_pack`, on `_batch_records`
+    batches: inline for ``workers <= 1``, else in a pool of ``workers``
+    processes. Only exceptions come back to this process, and ``on_batch``
+    gets the record count of every finished batch. The ``.npz`` is renamed
+    into place before the ``.npy``; with ``strand="+"`` a minus pair left by
+    an earlier run is deleted afterwards. Temporary files never outlive the
+    call.
+
+    Returns the plus strand's ``.npy`` path.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    names = [name for name, _ in records]
+    lengths = np.array([len(seq) for _, seq in records], dtype=np.int64)
+    offsets = (np.cumsum(lengths) - lengths).astype(np.int64)
+    total = int(lengths.sum())
+    strands = ["+"] if strand == "+" else ["+", "-"]
+
+    tmp_paths: dict[str, Path] = {}
+    try:
+        for s in strands:
+            npy_path = packed_paths(cache_dir, s)[0]
+            tmp = npy_path.with_name(
+                f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}"
+            )
+            tmp_paths[s] = tmp
+            mm = np.lib.format.open_memmap(
+                tmp, mode="w+", dtype=np.uint8, shape=(total, unpaired_prob)
+            )
+            mm.flush()
+            del mm
+
+        tmp_npy = {s: str(p) for s, p in tmp_paths.items()}
+        tasks = [
+            (
+                tmp_npy,
+                [(names[i], records[i][1], int(offsets[i])) for i in batch],
+                window_size,
+                max_span,
+                unpaired_prob,
+                chunk_size,
+                temperature,
+                strand,
+            )
+            for batch in _batch_records(lengths.tolist())
+        ]
+        results: list[dict[str, tuple[np.ndarray, np.ndarray]]] = []
+        if workers <= 1:
+            for task in tasks:
+                results.append(_fold_records_into_pack(*task))
+                on_batch(len(task[1]))
+        else:
+            with ProcessPoolExecutor(max_workers=workers) as pool:
+                futures = {
+                    pool.submit(_fold_records_into_pack, *task): len(task[1])
+                    for task in tasks
+                }
+                try:
+                    for fut in as_completed(futures):
+                        results.append(fut.result())
+                        on_batch(futures[fut])
+                except BaseException:
+                    # A failed run must not go on folding the rest of the FASTA.
+                    pool.shutdown(cancel_futures=True)
+                    raise
+
+        for s in strands:
+            index, value = _sorted_exceptions(
+                "accessibility (packed)",
+                s,
+                [r[s][0] for r in results],
+                [r[s][1] for r in results],
+                total * unpaired_prob,
+            )
+            npy_path, npz_path = packed_paths(cache_dir, s)
+            _write_atomically(
+                npz_path,
+                lambda t, i=index, v=value: np.savez(
+                    t,
+                    names=np.array(names, dtype=str),
+                    offsets=offsets,
+                    lengths=lengths,
+                    index=i,
+                    value=v,
+                ),
+            )
+            os.replace(tmp_paths[s], npy_path)
+            logger.info(
+                f"Folded {len(names):,} records into {npy_path.name}: "
+                f"{total:,} positions × {unpaired_prob}, {len(index):,} "
+                "exact-value exceptions"
+            )
+        if strand == "+":
+            # A minus pair from an earlier --strand both run would otherwise
+            # keep answering for records this run did not fold.
+            for path in packed_paths(cache_dir, "-"):
+                path.unlink(missing_ok=True)
+    finally:
+        for tmp in tmp_paths.values():
+            tmp.unlink(missing_ok=True)
+    return packed_paths(cache_dir, "+")[0]
 
 
 def _date_no_earlier_than(npy_path: Path, mtime_ns: int) -> None:
@@ -1439,55 +1619,105 @@ class GenomeAccessibilityService:
         temperature: float = 37.0,
         output_format: str = "parquet",
         strand: str = "both",
+        chunk_size: int = 1_000_000,
     ) -> Dict[str, Path]:
         """
         Compute accessibility for all sequences in the genome FASTA.
 
-        Dispatches one task per chromosome to a ProcessPoolExecutor for
-        parallel folding. With ``output_format="parquet"`` saves one Parquet
-        file per chromosome containing columns [position, strand, u1, u2, ...,
-        u{unpaired_prob}]; with ``"npy"`` writes the uint8 memory-map cache
-        (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
-        sidecars, see `build_accessibility_cache`) instead, which
-        ``off-targets`` reads with no conversion step.
-        ``strand="+"`` folds each sequence as given only (see
-        `_fold_full_chromosome`).
+        Record IDs (the first word of each header) must be unique; duplicates
+        raise before anything is written. With ``output_format="parquet"``
+        one task per record goes to a ProcessPoolExecutor, and each saves a
+        ``{record}.accessibility.parquet`` with columns [position, strand, u1,
+        u2, ..., u{unpaired_prob}]. With ``"npy"`` the records are folded, in
+        batches, straight into the packed uint8 memory-map cache in the data
+        directory, ``accessibility.{plus,minus}.packed.npy`` plus a
+        ``.packed.npz`` index each, records in FASTA order (see
+        `_pack_fasta_records`), which ``off-targets`` reads with no
+        conversion step; a re-run replaces the pair, and a FASTA without
+        records is refused. ``strand="+"`` folds each sequence as given only
+        (see `_fold_full_chromosome`); the npy output then has no minus pair,
+        and one from an earlier run is deleted.
 
         Args:
             genome_path: Path to genome FASTA file.
             window_size: -W parameter (default 80).
             max_span: -L parameter (default 40).
             unpaired_prob: -u parameter (default 30).
-            workers: Number of parallel folding workers.
+            workers: Number of parallel folding processes.
             progress: Rich Progress instance (optional).
             progress_callback: Simple callback(advance, description) (optional).
+                For "npy" it is called once per finished batch, with
+                ``advance`` the batch's record count.
             temperature: Folding temperature in °C (default 37.0).
             output_format: "parquet" (default) or "npy".
             strand: "both" (default) or "+" to skip the reverse complement.
+            chunk_size: Positions folded per RNAplfold call on long records
+                (default 1,000,000).
 
         Returns:
-            Dictionary mapping 'chrom' to the output Parquet path, or to the
-            plus-strand ``.access.npy`` path for "npy".
+            Dictionary mapping each record to its Parquet path, or, for
+            "npy", every record to the plus strand's ``.packed.npy`` path.
         """
         if output_format not in OUTPUT_FORMATS:
             raise AccessibilityError(
                 f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}"
             )
         _check_fold_strand(strand)
-        from concurrent.futures import ProcessPoolExecutor, as_completed
         from sioff.services.helpers import read_fasta
 
-        # Read all chromosomes; longest-job-first to minimise tail latency.
-        chromosomes = sorted(
-            list(read_fasta(genome_path)),
-            key=lambda cs: len(cs[1]),
-            reverse=True,
-        )
+        records = list(read_fasta(genome_path))
+        dups = [n for n, k in Counter(n for n, _ in records).items() if k > 1]
+        if dups:
+            more = "…" if len(dups) > 10 else ""
+            raise AccessibilityError(
+                f"Duplicate record IDs in {genome_path}: {', '.join(dups[:10])}{more}"
+            )
+        out_dir = self._require_dir()
 
         logger.info(
-            f"Computing full-genome accessibility for {len(chromosomes)} "
-            f"chromosome(s) using {workers} worker(s)"
+            f"Computing full-genome accessibility for {len(records)} "
+            f"record(s) using {workers} worker(s)"
         )
+
+        if output_format == "npy":
+            n = len(records)
+            if not n:
+                # A pack of no records is of no use, and `_annotate_packed`
+                # cannot index an empty one.
+                raise AccessibilityError(f"No records in {genome_path}")
+            prog_task = None
+            if progress is not None:
+                prog_task = progress.add_task("Folding records...", total=n)
+            done = 0
+
+            def on_batch(advance: int) -> None:
+                nonlocal done
+                done += advance
+                description = f"Folded {done}/{n} records"
+                if progress is not None and prog_task is not None:
+                    progress.update(prog_task, advance=advance, description=description)
+                elif progress_callback:
+                    progress_callback(advance=advance, description=description)
+
+            plus = _pack_fasta_records(
+                records,
+                out_dir,
+                window_size,
+                max_span,
+                unpaired_prob,
+                chunk_size,
+                temperature,
+                strand,
+                workers,
+                on_batch,
+            )
+            # Mappings of a pair this service had loaded are now stale.
+            self._reset_packed()
+            self._profiles.clear()
+            return {name: plus for name, _ in records}
+
+        # Longest-job-first to minimise tail latency.
+        chromosomes = sorted(records, key=lambda cs: len(cs[1]), reverse=True)
 
         total_tasks = len(chromosomes)
         prog_task = None
@@ -1499,11 +1729,6 @@ class GenomeAccessibilityService:
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             for chrom, sequence in chromosomes:
-                out_path = str(
-                    self._require_dir()
-                    if output_format == "npy"
-                    else self._require_dir() / f"{chrom}{PARQUET_SUFFIX}"
-                )
                 fut = pool.submit(
                     _fold_full_chromosome,
                     sequence,
@@ -1511,8 +1736,8 @@ class GenomeAccessibilityService:
                     window_size,
                     max_span,
                     unpaired_prob,
-                    out_path,
-                    1_000_000,
+                    str(out_dir / f"{chrom}{PARQUET_SUFFIX}"),
+                    chunk_size,
                     temperature,
                     output_format=output_format,
                     strand=strand,
