@@ -213,7 +213,7 @@ def _via_service(service, hits) -> np.ndarray:
     return out["opening_energy"].to_numpy()
 
 
-def _eager(d: Path, hits, tmp: Path) -> np.ndarray:
+def _default_cache_dir(d: Path, hits, tmp: Path) -> np.ndarray:
     return _via_service(GenomeAccessibilityService(d), hits)
 
 
@@ -227,7 +227,7 @@ def _memmap(d: Path, hits, tmp: Path) -> np.ndarray:
 
 
 PATHS = {
-    "eager": _eager,
+    "default_cache_dir": _default_cache_dir,
     "from_frames": _frames,
     "memmap": _memmap,
 }

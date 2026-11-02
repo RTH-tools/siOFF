@@ -1,19 +1,17 @@
-"""The memory-mapped accessibility cache answers exactly like the eager path.
+"""The memory-mapped accessibility cache answers exactly like the dense profile.
 
-`GenomeAccessibilityService` reads, by default (``cache_dir=None``), a whole
-chromosome's Parquet and keeps a dense float32 copy per strand (chr1: 30 GB,
-one private copy per worker process). With ``cache_dir`` it instead serves a
-compact uint8 cache (``<chrom>_<plus|minus>.access.npy``, value
-``round(E * 10)``) that every worker memory-maps, so the OS page cache holds
-one shared copy. Entries that the code cannot represent exactly (opening
-energies above 25.5, negative or unrounded values) live in a small sorted
-sidecar, which keeps the cache lossless for any input. Only the memory-mapped
-mode (``cache_dir`` set, as ``off-targets`` always does) writes cache files.
+A directory-backed `GenomeAccessibilityService` always serves a compact uint8
+cache (``<chrom>_<plus|minus>.access.npy``, value ``round(E * 10)``) that every
+worker memory-maps, so the OS page cache holds one shared copy. Without a
+``cache_dir`` the cache lives next to the Parquet and is built on first use.
+Entries that the code cannot represent exactly (opening energies above 25.5,
+negative or unrounded values) live in a small sorted sidecar, which keeps the
+cache lossless for any input.
 
-The reference for every test here is the frame-backed service: it runs the
-very code the Parquet path ran before the cache existed (filter one strand,
-materialise a dense float32 array), so equality against it is equality against
-the old eager path.
+The reference for every test here is the frame-backed service
+(`GenomeAccessibilityService.from_frames`): it filters one strand and
+materialises a dense float32 array, the very code the Parquet path ran before
+the cache became the only on-disk path.
 """
 
 import os
@@ -217,14 +215,26 @@ def test_memmap_service_matches_eager(parquet_dir: Path, eager) -> None:
     _assert_same_answers(eager, cached)
 
 
-def test_eager_parquet_service_matches_and_writes_nothing(
-    parquet_dir: Path, eager
-) -> None:
-    """Without ``cache_dir`` the service is the original Parquet loader."""
+def test_default_cache_dir_is_the_profile_dir(parquet_dir: Path, eager) -> None:
+    """With no cache_dir the service builds and reads the cache next to the Parquet."""
     _assert_same_answers(eager, GenomeAccessibilityService(parquet_dir))
-    assert not [f for f in parquet_dir.iterdir() if ".access." in f.name], (
-        "the eager loader must never write cache files"
+    assert cache_paths(parquet_dir, "chrA", "-")[0].exists()
+
+
+def test_cache_in_profile_dir_is_found_with_another_cache_dir(
+    tmp_path: Path, parquet_dir: Path, eager
+) -> None:
+    """An npy-only -a plus an unrelated --accessibility-cache-dir: read from -a."""
+    ensure_accessibility_cache(parquet_dir, parquet_dir)
+    npy_only = tmp_path / "npy_only"
+    shutil.copytree(
+        parquet_dir, npy_only, ignore=shutil.ignore_patterns("*.accessibility.parquet")
     )
+    elsewhere = tmp_path / "scratch"
+    _assert_same_answers(
+        eager, GenomeAccessibilityService(npy_only, cache_dir=elsewhere)
+    )
+    assert not elsewhere.exists() or not any(elsewhere.iterdir())
 
 
 def test_service_builds_a_missing_cache_lazily(
@@ -263,11 +273,10 @@ def test_npy_only_directory_works(tmp_path: Path, parquet_dir: Path, eager) -> N
 # --- (iv) neither cache nor Parquet -> AccessibilityError ----------------------
 
 
-@pytest.mark.parametrize("memmap", [False, True])
-def test_missing_cache_and_parquet_raise(tmp_path: Path, memmap: bool) -> None:
+def test_missing_cache_and_parquet_raise(tmp_path: Path) -> None:
     empty = tmp_path / "empty"
     empty.mkdir()
-    service = GenomeAccessibilityService(empty, cache_dir=empty if memmap else None)
+    service = GenomeAccessibilityService(empty)
     with pytest.raises(AccessibilityError, match="chrQ"):
         service.query("chrQ", 0, 10, "+")
 

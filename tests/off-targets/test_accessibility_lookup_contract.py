@@ -68,10 +68,6 @@ def _annotate(service, hits):
     return out["opening_energy"].to_numpy()
 
 
-def _path_eager(pdir, ppath, cdir, hits):
-    return _annotate(GenomeAccessibilityService(pdir), hits)
-
-
 def _path_frames(pdir, ppath, cdir, hits):
     frames = {CHROM: pl.read_parquet(ppath)}
     return _annotate(GenomeAccessibilityService.from_frames(frames), hits)
@@ -82,7 +78,7 @@ def _path_memmap(pdir, ppath, cdir, hits):
 
 
 def _path_query_single(pdir, ppath, cdir, hits):
-    service = GenomeAccessibilityService(pdir)
+    service = GenomeAccessibilityService(pdir, cache_dir=cdir)
     return np.array(
         [service.query_single(CHROM, s, e, strand) for strand, s, e in hits],
         dtype=np.float32,
@@ -90,7 +86,6 @@ def _path_query_single(pdir, ppath, cdir, hits):
 
 
 PATHS = {
-    "eager": _path_eager,
     "from_frames": _path_frames,
     "memmap": _path_memmap,
     "query_single": _path_query_single,

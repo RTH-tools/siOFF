@@ -651,16 +651,6 @@ def build_accessibility_cache(
     return built
 
 
-def _layout_strand_lengths(
-    layout: list[tuple[int, str, int, int, bool]],
-) -> tuple[Optional[int], Optional[int]]:
-    """``(plus, minus)`` maximum positions from a `_row_group_layout`."""
-    lens: dict[str, int] = {}
-    for _, strand, _, pos_max, _ in layout:
-        lens[strand] = max(lens.get(strand, 0), int(pos_max))
-    return lens.get("+"), lens.get("-")
-
-
 def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
     """Both files present and the ``.npy`` header is a 2-D uint8 array.
 
@@ -840,24 +830,17 @@ class GenomeAccessibilityService:
     Service to pre-compute and query genomic accessibility profiles.
 
     Profiles are stored as per-chromosome Parquet files produced by
-    compute_genome_accessibility() in ``data_dir`` and served one of two ways:
-
-    - eager (``cache_dir=None``, the default): a chromosome's Parquet is read
-      whole, one strand is filtered out and materialised as a dense float32
-      ``[max_pos, n_u]`` array (chr1: 30 GB per strand). Nothing is written.
-    - memory-mapped (``cache_dir`` given): the uint8 cache described at
-      `build_accessibility_cache` (one ``<chrom>_<plus|minus>.access.npy``
-      per strand, plus an exceptions sidecar) in ``cache_dir`` is
-      ``np.load(mmap_mode="r")``-ed, so every process shares one page-cache
-      copy and resident memory is only the pages it touches. A contig whose
-      cache is missing is built from its Parquet on first use (batch runs
-      build it up front with `ensure_accessibility_cache` so worker processes
-      only map finished files); a ``cache_dir`` holding the complete cache
-      needs no Parquet at all. Pass ``cache_dir=data_dir`` to keep the cache
-      next to the Parquet.
-
-    Both answer bit-for-bit alike. The LRU of ``max_cached`` slots bounds the
-    number of loaded profiles (arrays or mappings) per process.
+    compute_genome_accessibility() in ``data_dir`` and served from the uint8
+    cache described at `build_accessibility_cache`: one
+    ``<chrom>_<plus|minus>.access.npy`` per strand plus an exceptions sidecar,
+    ``np.load(mmap_mode="r")``-ed so every process shares one page-cache copy
+    and resident memory is only the pages it touches. The cache is looked up in
+    ``cache_dir`` (default: ``data_dir``), then in ``data_dir``. A contig whose
+    cache is missing is built from its Parquet into ``cache_dir`` on first use
+    (batch runs build it up front with `ensure_accessibility_cache` so worker
+    processes only map finished files); a directory holding the complete cache
+    needs no Parquet at all. The LRU of ``max_cached`` slots bounds the number
+    of mappings loaded per process.
 
     `from_frames()` builds a service over in-memory per-chromosome
     DataFrames instead (the ``dict[chrom -> DataFrame]`` that
@@ -875,9 +858,12 @@ class GenomeAccessibilityService:
         self.data_dir = data_dir
         if self.data_dir is not None:
             self.data_dir.mkdir(parents=True, exist_ok=True)
-        # None: eager Parquet loader; a path: the memory-mapped uint8 cache there.
+        # Where the uint8 cache is built and first looked for; None only for a
+        # frame-backed service, which has no on-disk profiles.
         self.cache_dir: Optional[Path] = (
-            Path(cache_dir) if cache_dir is not None else None
+            Path(cache_dir)
+            if cache_dir is not None
+            else (Path(data_dir) if data_dir is not None else None)
         )
         self._frames: Mapping[str, pl.DataFrame] = frames if frames is not None else {}
         self._max_cached = max_cached
@@ -1073,24 +1059,31 @@ class GenomeAccessibilityService:
             arr[pos_0, col_idx] = df[col_name].to_numpy()
         return _DenseProfile(arr)
 
-    def _dense_from_parquet(self, chrom: str, strand: str) -> tuple[_DenseProfile, str]:
-        """Eager loader: read the chromosome's Parquet whole and densify one strand."""
-        path = self._find_profile(chrom)
-        if not path:
-            raise AccessibilityError(
-                f"Profile for {chrom} not found in {self.data_dir}. "
-                f"Expected {self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'}."
-            )
-        source = str(path)
-        return self._dense_profile(pl.read_parquet(path), strand, source), source
+    def _cache_dirs(self) -> list[Path]:
+        """Directories searched for a cache, in order: ``cache_dir``, ``data_dir``."""
+        return list(
+            dict.fromkeys(d for d in (self.cache_dir, self.data_dir) if d is not None)
+        )
+
+    def _npy_path(self, chrom: str, strand: str) -> Path:
+        """The ``.npy`` the lookup uses: the first searched directory that has it.
+
+        Falls back to the ``cache_dir`` path, where a lazy build would write.
+        """
+        dirs = self._cache_dirs()
+        for directory in dirs:
+            npy = cache_paths(directory, chrom, strand)[0]
+            if npy.is_file():
+                return npy
+        return cache_paths(dirs[0], chrom, strand)[0]
 
     def _open_cache(self, chrom: str, strand: str) -> _CachedProfile | None:
         """Memory-map the (chrom, strand) cache if both its files exist."""
-        cache_dir = self.cache_dir
-        if cache_dir is None:
-            return None
-        npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
-        if not (npy_path.is_file() and npz_path.is_file()):
+        for directory in self._cache_dirs():
+            npy_path, npz_path = cache_paths(directory, chrom, strand)
+            if npy_path.is_file() and npz_path.is_file():
+                break
+        else:
             return None
         try:
             codes = np.load(npy_path, mmap_mode="r")
@@ -1116,10 +1109,12 @@ class GenomeAccessibilityService:
         if profile is None:
             parquet = self._find_profile(chrom)
             if parquet is None:
-                expected_npy = cache_paths(cast(Path, self.cache_dir), chrom, strand)[0]
+                searched = " or ".join(
+                    str(cache_paths(d, chrom, strand)[0]) for d in self._cache_dirs()
+                )
                 raise AccessibilityError(
                     f"Profile for {chrom} not found: neither the cache "
-                    f"{expected_npy} nor the Parquet "
+                    f"{searched} nor the Parquet "
                     f"{self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'} exists."
                 )
             logger.info(
@@ -1150,11 +1145,10 @@ class GenomeAccessibilityService:
 
         Returns the profile_key string.
 
-        In-memory frames and, without ``cache_dir``, on-disk Parquet are
-        materialised as a dense float32 array (the eager path); with
-        ``cache_dir`` on-disk profiles are memory-mapped from the uint8 cache,
-        built from the Parquet first if needed. Positions absent from the
-        source keep the default sentinel value of 25.5 kcal/mol in all cases.
+        In-memory frames are materialised as a dense float32 array; on-disk
+        profiles are memory-mapped from the uint8 cache, built from the Parquet
+        first if needed. Positions absent from the source keep the default
+        sentinel value of 25.5 kcal/mol in both cases.
 
         Complexity: O(1) amortized. Eviction drops the oldest cached profile
         (an array, or a mapping) when the cache exceeds max_cached slots.
@@ -1174,11 +1168,8 @@ class GenomeAccessibilityService:
                     f"Profile for {chrom} not found among the in-memory "
                     f"accessibility frames ({', '.join(sorted(self._frames)) or 'none'})."
                 )
-            if self.cache_dir is None:
-                profile, source = self._dense_from_parquet(chrom, strand)
-            else:
-                profile = self._cached_from_disk(chrom, strand)
-                source = str(cache_paths(self.cache_dir, chrom, strand)[0])
+            profile = self._cached_from_disk(chrom, strand)
+            source = str(self._npy_path(chrom, strand))
 
         self._profiles[profile_key] = profile
         logger.info(f"Loaded accessibility profile for {chrom} {strand} from {source}")
@@ -1195,8 +1186,8 @@ class GenomeAccessibilityService:
     def _strand_lengths(self, chrom: str) -> tuple[Optional[int], Optional[int]]:
         """``(plus, minus)`` profile lengths from the cheapest available source.
 
-        In-memory frames: a group-by on ``position``. Parquet: row-group
-        statistics (no data read). Cache: the ``.npy`` headers. Any failure
+        In-memory frames: a group-by on ``position``. Cache: the ``.npy``
+        headers, read from ``cache_dir`` first, then ``data_dir``. Any failure
         yields ``None`` for that strand: this feeds a warning only and must
         never break a lookup.
         """
@@ -1207,20 +1198,13 @@ class GenomeAccessibilityService:
                 )
                 lens = dict(zip(agg["strand"].to_list(), agg["position"].to_list()))
                 return lens.get("+"), lens.get("-")
-            if self.cache_dir is not None:
-                out: list[Optional[int]] = []
-                for strand in ("+", "-"):
-                    npy = cache_paths(self.cache_dir, chrom, strand)[0]
-                    out.append(
-                        int(np.load(npy, mmap_mode="r").shape[0])
-                        if npy.is_file()
-                        else None
-                    )
-                return out[0], out[1]
-            path = self._find_profile(chrom)
-            if path is None:
-                return None, None
-            return _layout_strand_lengths(_row_group_layout(pq.ParquetFile(path)))
+            out: list[Optional[int]] = []
+            for strand in ("+", "-"):
+                npy = self._npy_path(chrom, strand)
+                out.append(
+                    int(np.load(npy, mmap_mode="r").shape[0]) if npy.is_file() else None
+                )
+            return out[0], out[1]
         except Exception as exc:  # noqa: BLE001 - diagnostics only
             logger.debug(f"could not determine strand lengths for {chrom}: {exc}")
             return None, None
@@ -1322,49 +1306,3 @@ class GenomeAccessibilityService:
         return df.with_columns(
             pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
         )
-
-
-# ---------------------------------------------------------------------------
-# Parquet row-group layout: strand and position range of each row group.
-# ---------------------------------------------------------------------------
-
-
-def _row_group_layout(pf: pq.ParquetFile) -> list[tuple[int, str, int, int, bool]]:
-    """Describe each row group as ``(index, strand, pos_min, pos_max, mixed)``.
-
-    Taken from the Parquet column statistics when they are present and the
-    row group holds a single strand (what ``_fold_full_chromosome`` writes);
-    otherwise the two key columns of that row group are read (cheap: ~5 B/row)
-    and a mixed-strand row group yields one entry per strand with
-    ``mixed=True`` so the reader masks rows by strand.
-    """
-    md = pf.metadata
-    names = pf.schema_arrow.names
-    i_pos = names.index("position")
-    i_strand = names.index("strand")
-    layout: list[tuple[int, str, int, int, bool]] = []
-    for rg in range(md.num_row_groups):
-        rgm = md.row_group(rg)
-        if rgm.num_rows == 0:
-            continue
-        ps = rgm.column(i_pos).statistics
-        ss = rgm.column(i_strand).statistics
-        if (
-            ps is not None
-            and ps.has_min_max
-            and ss is not None
-            and ss.has_min_max
-            and ss.min == ss.max
-        ):
-            strand = ss.min.decode() if isinstance(ss.min, bytes) else str(ss.min)
-            layout.append((rg, strand, int(ps.min), int(ps.max), False))
-            continue
-        tbl = pf.read_row_group(rg, columns=["position", "strand"])
-        pos = tbl.column("position").to_numpy()
-        strands = tbl.column("strand").to_numpy(zero_copy_only=False)
-        uniq = np.unique(strands)
-        for strand in uniq:
-            m = strands == strand if len(uniq) > 1 else slice(None)
-            p = pos[m]
-            layout.append((rg, str(strand), int(p.min()), int(p.max()), len(uniq) > 1))
-    return layout
