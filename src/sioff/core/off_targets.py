@@ -35,7 +35,6 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Generator, Mapping, Optional, Union, cast
 
-import numpy as np
 import polars as pl
 import pyarrow as pa
 import pyarrow.ipc
@@ -46,8 +45,7 @@ from sioff.services.accessibility import (
     AccessibilityError,
     GenomeAccessibilityService,
     ensure_accessibility_cache,
-    gather_opening_energies,
-    holds_only_cache,
+    has_profiles,
 )
 from sioff.services.annotation_parser import AnnotationParser
 from sioff.services.intersection_service import (
@@ -74,6 +72,75 @@ _WORKER_SELF_HYB_EMIN: dict = {}
 # --summary-only: score per siRNA with ProbabilityService(aggregate_only=True)
 # and return only the metadata, no per-site table.
 _WORKER_SUMMARY_ONLY: bool = False
+
+
+def _prepare_accessibility_cache(
+    accessibility_dir: Path, accessibility_cache_dir: Optional[Path], workers: int
+) -> Path:
+    """Check the profile source and build the uint8 cache before any scoring.
+
+    Parameters
+    ----------
+    accessibility_dir : pathlib.Path
+        Directory with the npy cache or per-chromosome Parquet profiles.
+    accessibility_cache_dir : pathlib.Path, optional
+        Where the cache lives; defaults to ``accessibility_dir``.
+    workers : int
+        Processes used to build missing contigs.
+
+    Returns
+    -------
+    pathlib.Path
+        The cache directory the service should read.
+
+    Raises
+    ------
+    AccessibilityError
+        When neither directory holds any profile, when a profile cannot be
+        read, or when the cache directory is not writable.
+    """
+    cache_dir = (
+        Path(accessibility_cache_dir)
+        if accessibility_cache_dir is not None
+        else Path(accessibility_dir)
+    )
+    if not has_profiles(accessibility_dir) and not has_profiles(cache_dir):
+        where = (
+            str(accessibility_dir)
+            if cache_dir == Path(accessibility_dir)
+            else f"{accessibility_dir} or {cache_dir}"
+        )
+        raise AccessibilityError(
+            f"No accessibility profiles in {where}. Pass the directory written by "
+            "'sioff accessibility' (-a/--accessibility-dir)."
+        )
+    t0 = time.perf_counter()
+    built: list[str] = []
+    write_error: Optional[OSError] = None
+    try:
+        built = ensure_accessibility_cache(
+            Path(accessibility_dir), cache_dir, workers=workers
+        )
+    except AccessibilityError as e:
+        # The build pool wraps a worker's OSError; any other failure stands.
+        if not isinstance(e.__cause__, OSError):
+            raise
+        write_error = e.__cause__
+    except OSError as e:
+        write_error = e
+    if write_error is not None:
+        raise AccessibilityError(
+            f"Cannot write the accessibility cache to {cache_dir}: {write_error}. "
+            "Pass a writable cache directory (--accessibility-cache-dir)."
+        ) from write_error
+    if built:
+        logger.info(
+            f"[accessibility] built accessibility cache for {len(built)} contig(s) "
+            f"in {cache_dir} in {time.perf_counter() - t0:.1f}s"
+        )
+    else:
+        logger.info(f"[accessibility] cache in {cache_dir} is complete")
+    return cache_dir
 
 
 def _drop_unexpressed(df_trans: pl.DataFrame) -> pl.DataFrame:
@@ -170,15 +237,13 @@ def _init_worker(
 
     The transcriptome is loaded from a pre-written Arrow IPC file (memory-mapped)
     rather than being re-parsed from the original GTF/GFF3, so all workers share
-    the same physical memory pages via the OS page cache. ``accessibility_dir``
-    is empty for chromosome-major runs (workers never load profiles). With
-    ``accessibility_cache_dir`` the service memory-maps the uint8 cache the
-    parent built there before starting the pool (strategy ``memmap``); without
-    it, it is the eager whole-chromosome loader (strategy ``eager``).
+    the same physical memory pages via the OS page cache. With
+    ``accessibility_dir`` the service memory-maps the uint8 cache the parent
+    built in ``accessibility_cache_dir`` before starting the pool.
     """
     os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
-    # pyarrow decodes Parquet row groups in the chromosome-major pass; keep its
-    # pool inside the same per-worker budget.
+    # pyarrow reads the shared transcriptome IPC and the cache-building Parquet,
+    # so keep its pool inside the per-worker budget.
     pa.set_cpu_count(max(1, polars_max_threads))
 
     global _WORKER_DF_TRANS, _WORKER_INTERSECTOR, _WORKER_PROB_SERVICE
@@ -199,9 +264,7 @@ def _init_worker(
         acc_service = GenomeAccessibilityService(
             Path(accessibility_dir),
             max_cached=4,
-            cache_dir=Path(accessibility_cache_dir)
-            if accessibility_cache_dir
-            else None,
+            cache_dir=Path(accessibility_cache_dir),
         )
 
     _WORKER_PROB_SERVICE = ProbabilityService(acc_service, temperature=temperature)
@@ -341,450 +404,7 @@ class WorkerFailureError(RuntimeError):
         return [name for name, _ in self.failures]
 
 
-# ---------------------------------------------------------------------------
-# Chromosome-major accessibility: three passes over a run temp dir.
-#
-#   pass 1 (siRNA-parallel)  load + filter + intersect -> <tmp>/pass1/<i>.arrow
-#                            and a per-chromosome key file <tmp>/pass1/<i>.keys.arrow
-#   pass 2 (contig-parallel) stream each accessibility Parquet ONCE, gather the
-#                            opening energies of every siRNA's hits on it ->
-#                            <tmp>/pass2/<chrom>.arrow (one batch per siRNA)
-#   pass 3 (siRNA-parallel)  join energies on row_id, partition function, yield
-#
-# The eager per-worker loader materialises a dense [max_pos, 30] float32 profile
-# per chromosome and strand (chr1: 30 GB) in every worker; this path never
-# holds more than one Parquet row group per worker.
-# ---------------------------------------------------------------------------
-_KEYS_SCHEMA = pa.schema(
-    [
-        ("row_id", pa.int64()),
-        ("minus", pa.int8()),
-        ("start", pa.int64()),
-        ("end", pa.int64()),
-    ]
-)
-_ENERGY_SCHEMA = pa.schema([("row_id", pa.int64()), ("opening_energy", pa.float32())])
-_DEFAULT_OPENING_ENERGY = 10.0  # annotate_opening_energy_vectorized's np.full default
-
-
-def _release_memory() -> None:
-    """Return freed pages to the OS so worker RSS stays flat across tasks."""
-    gc.collect()
-    try:
-        ctypes.CDLL("libc.so.6").malloc_trim(0)
-    except Exception:
-        pass
-
-
-def _load_filtered_predictions(file_path_str: str, sense_only: bool) -> pl.DataFrame:
-    parser = RIsearchParser()
-    df = parser.load_single_file(Path(file_path_str))
-    if sense_only:
-        df = df.filter(pl.col("strand") == "+")
-    return df
-
-
-def _write_keys(df: pl.DataFrame, path: Path) -> dict[str, int]:
-    """Write (row_id, minus, start, end) as one IPC record batch per chromosome.
-
-    ``onTarget`` rows are left out (the eager path skips them, leaving the
-    10.0 default).
-
-    Returns
-    -------
-    dict[str, int]
-        ``chrom -> batch index``, so pass 2 can memory-map the file and read
-        only its contig's batch.
-    """
-    keys = (
-        df.select(
-            pl.int_range(pl.len(), dtype=pl.Int64).alias("row_id"),
-            pl.col("chrom").cast(pl.Utf8).alias("chrom"),
-            (pl.col("strand").cast(pl.Utf8) == "-").cast(pl.Int8).alias("minus"),
-            pl.col("start").cast(pl.Int64),
-            pl.col("end").cast(pl.Int64),
-        )
-        .filter(pl.col("chrom") != "onTarget")
-        .sort("chrom", maintain_order=True)
-    )
-    batches: dict[str, int] = {}
-    with pa.OSFile(str(path), "wb") as sink:
-        with pa.ipc.new_file(sink, _KEYS_SCHEMA) as writer:
-            for (chrom,), part in keys.group_by("chrom", maintain_order=True):
-                tbl = part.drop("chrom").to_arrow().cast(_KEYS_SCHEMA).combine_chunks()
-                for batch in tbl.to_batches():
-                    writer.write_batch(batch)
-                    batches[str(chrom)] = len(batches)
-    return batches
-
-
-def _pass1_prepare_sirna(
-    file_path_str: str,
-    idx: int,
-    sense_only: bool,
-    predictions_type: str,
-    pass1_dir: str,
-) -> tuple[int, Optional[dict[str, int]], int, dict]:
-    """Load, filter and intersect one siRNA file; persist it for passes 2 and 3.
-
-    Returns
-    -------
-    tuple
-        ``(idx, chrom_batches, n_rows, timings)``; ``chrom_batches`` is
-        ``None`` when no predictions remain (nothing is written).
-    """
-    _m = sys.modules[__name__]
-    df_trans = _m._WORKER_DF_TRANS
-    intersector = _m._WORKER_INTERSECTOR
-    self_hyb_emin = _m._WORKER_SELF_HYB_EMIN
-
-    _t_start = time.perf_counter()
-    df = _load_filtered_predictions(file_path_str, sense_only)
-    _t_load = time.perf_counter()
-    if df.height == 0:
-        return idx, None, 0, {}
-
-    _intersect_subtimings: dict = {}
-    if df_trans is not None and intersector is not None:
-        df = intersector.intersect(
-            df,
-            df_trans,
-            mode=predictions_type,
-            workers=1,
-            _timings=_intersect_subtimings,
-        )
-        if df.height == 0:
-            return idx, None, 0, {}
-    df = _apply_self_hyb_emin(df, self_hyb_emin)
-    _t_intersect = time.perf_counter()
-
-    out = Path(pass1_dir)
-    df.write_ipc(out / f"{idx}.arrow", compression="lz4")
-    chrom_batches = _write_keys(df, out / f"{idx}.keys.arrow")
-    _t_end = time.perf_counter()
-    n_rows = df.height
-    del df
-    _release_memory()
-    timings = {
-        "load_s": _t_load - _t_start,
-        "intersect_s": _t_intersect - _t_load,
-        "pass1_write_s": _t_end - _t_intersect,
-        **_intersect_subtimings,
-    }
-    return idx, chrom_batches, n_rows, timings
-
-
-def _pass2_gather_contig(
-    chrom: str,
-    accessibility_path: str,
-    sources: list[tuple[int, str, int]],
-    out_path: str,
-) -> tuple[str, dict[int, int], dict]:
-    """Stream one contig's accessibility Parquet and gather every siRNA's hits.
-
-    ``sources`` lists ``(sirna_idx, keys_path, batch_index)``. Writes
-    ``out_path`` with one ``(row_id, opening_energy)`` batch per siRNA.
-
-    Returns
-    -------
-    tuple
-        ``(chrom, sirna_idx -> batch index, stats)``; ``stats`` carries the
-        `gather_opening_energies` counters plus hit counts and timings.
-    """
-    _t0 = time.perf_counter()
-    owner, row_id, minus, start, end = [], [], [], [], []
-    for sirna_idx, keys_path, batch_index in sources:
-        with pa.memory_map(keys_path, "r") as source:
-            batch = pa.ipc.open_file(source).get_batch(batch_index)
-            row_id.append(batch.column("row_id").to_numpy())
-            minus.append(batch.column("minus").to_numpy())
-            start.append(batch.column("start").to_numpy())
-            end.append(batch.column("end").to_numpy())
-        owner.append(np.full(batch.num_rows, sirna_idx, dtype=np.int64))
-    owner_a = np.concatenate(owner)
-    row_id_a = np.concatenate(row_id)
-    strands = np.where(np.concatenate(minus) == 1, "-", "+")
-    _t_keys = time.perf_counter()
-
-    energies, stats = gather_opening_energies(
-        Path(accessibility_path), strands, np.concatenate(start), np.concatenate(end)
-    )
-    _t_gather = time.perf_counter()
-
-    order = np.lexsort((row_id_a, owner_a))
-    owner_a, row_id_a, energies = owner_a[order], row_id_a[order], energies[order]
-    bounds = np.flatnonzero(np.diff(owner_a)) + 1
-    batches: dict[int, int] = {}
-    with pa.OSFile(out_path, "wb") as sink:
-        with pa.ipc.new_file(sink, _ENERGY_SCHEMA) as writer:
-            for lo, hi in zip(
-                np.concatenate(([0], bounds)), np.concatenate((bounds, [len(owner_a)]))
-            ):
-                writer.write_batch(
-                    pa.RecordBatch.from_arrays(
-                        [pa.array(row_id_a[lo:hi]), pa.array(energies[lo:hi])],
-                        schema=_ENERGY_SCHEMA,
-                    )
-                )
-                batches[int(owner_a[lo])] = len(batches)
-    _t_end = time.perf_counter()
-    stats.update(
-        {
-            "n_hits": int(len(owner_a)),
-            "n_sirnas": len(batches),
-            "keys_s": _t_keys - _t0,
-            "gather_s": _t_gather - _t_keys,
-            "write_s": _t_end - _t_gather,
-            "total_s": _t_end - _t0,
-        }
-    )
-    _release_memory()
-    return chrom, batches, stats
-
-
-def _pass3_finish_sirna(
-    idx: int,
-    pass1_path: str,
-    energy_sources: list[tuple[str, int]],
-    alpha_gamma_pairs: list,
-    theta_vals: list,
-    on_target_expression: float,
-) -> tuple:
-    """Join the gathered energies onto the pass-1 frame and score the siRNA.
-
-    Rows no pass-2 file covers (contig without an accessibility file,
-    ``onTarget``) keep the eager path's 10.0 default.
-
-    Returns
-    -------
-    tuple
-        ``(pyarrow.Table, meta)`` as `_process_one_sirna` returns them.
-    """
-    _m = sys.modules[__name__]
-    prob_service = _m._WORKER_PROB_SERVICE
-    on_target_map = _m._WORKER_ON_TARGET_MAP
-
-    _t_start = time.perf_counter()
-    df = pl.read_ipc(pass1_path)
-    energies = np.full(df.height, _DEFAULT_OPENING_ENERGY, dtype=np.float32)
-    for energy_path, batch_index in energy_sources:
-        with pa.memory_map(energy_path, "r") as source:
-            batch = pa.ipc.open_file(source).get_batch(batch_index)
-            energies[batch.column("row_id").to_numpy()] = batch.column(
-                "opening_energy"
-            ).to_numpy()
-    df = df.with_columns(pl.Series("opening_energy", energies, dtype=pl.Float32))
-    _t_join = time.perf_counter()
-
-    df, meta = prob_service.calculate_probabilities_per_sirna(
-        df,
-        alpha_gamma_pairs=alpha_gamma_pairs,
-        theta_values=theta_vals,
-        on_target_map=on_target_map,
-        on_target_expression=on_target_expression,
-        precomputed_opening_energy=True,
-        aggregate_only=_m._WORKER_SUMMARY_ONLY,
-    )
-    _t_prob = time.perf_counter()
-
-    drop_cols = [
-        c
-        for c in df.columns
-        if c.startswith("boltzmann_weight") or c.startswith("Z_sirna") or c == "E_min"
-    ]
-    if drop_cols:
-        df = df.drop(drop_cols)
-    arrow = df.to_arrow()
-    _t_end = time.perf_counter()
-    del df
-    _release_memory()
-
-    meta["_timings"] = {
-        "pass3_join_s": _t_join - _t_start,
-        "prob_s": _t_prob - _t_join,
-        "serialize_s": _t_end - _t_prob,
-    }
-    return arrow, meta
-
-
-def _dir_size(path: Path) -> int:
-    return sum(p.stat().st_size for p in path.rglob("*") if p.is_file())
-
-
-def _stream_chrom_major(
-    pool: ProcessPoolExecutor,
-    all_files: list[Path],
-    accessibility_dir: Path,
-    run_tmp: Path,
-    alpha_gamma_pairs: list,
-    theta_vals: list,
-    on_target_expression: float,
-    sense_only: bool,
-    predictions_type: str,
-) -> Generator[tuple[pl.DataFrame, dict], None, None]:
-    pass1_dir = run_tmp / "pass1"
-    pass2_dir = run_tmp / "pass2"
-    pass1_dir.mkdir()
-    pass2_dir.mkdir()
-    n_files = len(all_files)
-    names = {i: f.name for i, f in enumerate(all_files)}
-
-    # ---- pass 1: siRNA-parallel load + intersect -> temp files ----
-    t1 = time.perf_counter()
-    failures: list[tuple[str, str]] = []
-    pass1_timings: dict[int, dict] = {}
-    contig_sources: dict[str, list[tuple[int, str, int]]] = {}
-    contig_rows: dict[str, int] = {}
-    ready: list[int] = []
-    futures = {
-        pool.submit(
-            _pass1_prepare_sirna,
-            str(f),
-            i,
-            sense_only,
-            predictions_type,
-            str(pass1_dir),
-        ): i
-        for i, f in enumerate(all_files)
-    }
-    for future in as_completed(futures):
-        i = futures.pop(future)
-        try:
-            idx, chrom_batches, n_rows, timings = future.result()
-        except Exception as exc:
-            logger.error(f"Pass 1 failed for {names[i]}: {exc}")
-            failures.append((names[i], str(exc)))
-            continue
-        if chrom_batches is None:
-            continue
-        ready.append(idx)
-        pass1_timings[idx] = timings
-        keys_path = str(pass1_dir / f"{idx}.keys.arrow")
-        for chrom, batch_index in chrom_batches.items():
-            contig_sources.setdefault(chrom, []).append((idx, keys_path, batch_index))
-        for chrom in chrom_batches:
-            contig_rows[chrom] = contig_rows.get(chrom, 0) + n_rows
-    t1_end = time.perf_counter()
-    logger.info(
-        f"[chrom-major] pass 1: {len(ready)}/{n_files} siRNAs intersected in "
-        f"{t1_end - t1:.1f}s, {len(contig_sources)} contigs with hits, "
-        f"temp {_dir_size(pass1_dir) / 1e9:.2f} GB"
-    )
-
-    # ---- pass 2: contig-parallel streaming gather ----
-    # Contigs are scheduled largest-first (hit rows is a proxy for row groups
-    # touched) so the biggest chromosomes do not land at the tail.
-    present = {
-        c: accessibility_dir / f"{c}.accessibility.parquet" for c in contig_sources
-    }
-    missing = sorted(c for c, p in present.items() if not p.exists())
-    if missing:
-        logger.warning(
-            f"[chrom-major] {len(missing)} contig(s) have hits but no accessibility "
-            f"file; their rows keep opening energy {_DEFAULT_OPENING_ENERGY} "
-            f"(first: {', '.join(missing[:5])})"
-        )
-    order = sorted(
-        (c for c in contig_sources if present[c].exists()),
-        key=lambda c: contig_rows[c],
-        reverse=True,
-    )
-    energy_sources: dict[int, list[tuple[str, int]]] = {i: [] for i in ready}
-    bytes_read = bytes_total = rg_read = rg_total = 0
-    futures2 = {
-        pool.submit(
-            _pass2_gather_contig,
-            c,
-            str(present[c]),
-            contig_sources[c],
-            str(pass2_dir / f"{c}.arrow"),
-        ): c
-        for c in order
-    }
-    for future in as_completed(futures2):
-        c = futures2.pop(future)
-        try:
-            chrom, batches, stats = future.result()
-        except Exception as exc:
-            for pending in futures2:
-                pending.cancel()
-            logger.error(f"Pass 2 failed for {c}: {exc}")
-            raise WorkerFailureError(
-                "pass 2 (accessibility gather)", [(c, str(exc))], len(order)
-            ) from exc
-        out_path = str(pass2_dir / f"{chrom}.arrow")
-        for idx, batch_index in batches.items():
-            energy_sources[idx].append((out_path, batch_index))
-        bytes_read += stats["bytes_read"]
-        bytes_total += stats["bytes_file"]
-        rg_read += stats["row_groups_read"]
-        rg_total += stats["row_groups_total"]
-        logger.debug(
-            f"[chrom-major] {chrom}: {stats['n_hits']:,} hits, "
-            f"{stats['row_groups_read']}/{stats['row_groups_total']} row groups, "
-            f"{stats['bytes_read'] / 1e6:.1f}/{stats['bytes_file'] / 1e6:.1f} MB, "
-            f"{stats['total_s']:.1f}s (gather {stats['gather_s']:.1f}s)"
-        )
-    t2_end = time.perf_counter()
-    logger.info(
-        f"[chrom-major] pass 2: {len(order)} contigs in {t2_end - t1_end:.1f}s, "
-        f"{rg_read}/{rg_total} row groups read, {bytes_read / 1e9:.2f} GB of "
-        f"{bytes_total / 1e9:.2f} GB (touched files), temp "
-        f"{_dir_size(pass2_dir) / 1e9:.2f} GB"
-    )
-
-    # ---- pass 3: siRNA-parallel scoring ----
-    futures3 = {
-        pool.submit(
-            _pass3_finish_sirna,
-            i,
-            str(pass1_dir / f"{i}.arrow"),
-            energy_sources[i],
-            alpha_gamma_pairs,
-            theta_vals,
-            on_target_expression,
-        ): i
-        for i in ready
-    }
-    n_yielded = 0
-    for future in as_completed(futures3):
-        i = futures3.pop(future)
-        try:
-            arrow_table, meta = future.result()
-        except Exception as exc:
-            logger.error(f"Pass 3 failed for {names[i]}: {exc}")
-            failures.append((names[i], str(exc)))
-            continue
-        timings = {**pass1_timings.get(i, {}), **meta.get("_timings", {})}
-        timings["total_s"] = sum(
-            v
-            for k, v in timings.items()
-            if k.endswith("_s")
-            and k
-            in {
-                "load_s",
-                "intersect_s",
-                "pass1_write_s",
-                "pass3_join_s",
-                "prob_s",
-                "serialize_s",
-            }
-        )
-        meta["_timings"] = timings
-        df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
-        del arrow_table
-        n_yielded += 1
-        yield df_chunk, meta
-    t3_end = time.perf_counter()
-    logger.info(
-        f"[chrom-major] pass 3: {n_yielded} siRNAs scored in {t3_end - t2_end:.1f}s; "
-        f"total {t3_end - t1:.1f}s"
-    )
-    if failures:
-        raise WorkerFailureError("pass 1/3 (per-siRNA)", failures, n_files)
-
-
-def _stream_eager(
+def _stream_sirnas(
     pool: ProcessPoolExecutor,
     all_files: list[Path],
     alpha_gamma_pairs: list,
@@ -793,7 +413,7 @@ def _stream_eager(
     sense_only: bool,
     predictions_type: str,
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
-    """One task per siRNA; each worker looks accessibility up with its own loader.
+    """One task per siRNA; each worker looks accessibility up in the shared cache.
 
     Yields
     ------
@@ -840,72 +460,6 @@ def _stream_eager(
         yield df_chunk, batch_metadata
     if failures:
         raise WorkerFailureError("per-siRNA workers", failures, len(all_files))
-
-
-ACCESSIBILITY_STRATEGIES = ("auto", "eager", "memmap", "chrom-major")
-
-
-def _check_strategy(accessibility_strategy: str) -> None:
-    if accessibility_strategy not in ACCESSIBILITY_STRATEGIES:
-        raise ValueError(
-            f"accessibility_strategy must be one of {ACCESSIBILITY_STRATEGIES}, "
-            f"got {accessibility_strategy!r}"
-        )
-
-
-def _resolve_dir_strategy(
-    accessibility_dir: Path, accessibility_strategy: str, auto: str
-) -> str:
-    """Resolve ``"auto"`` for a profile directory, to ``auto`` unless it holds only npy.
-
-    A directory of ``.access.npy`` caches (``sioff accessibility`` writes one
-    by default) has no Parquet, so ``"auto"`` is ``"memmap"`` there and the
-    Parquet readers are refused with a message saying so.
-
-    Returns
-    -------
-    str
-        The strategy to run: ``accessibility_strategy`` with ``"auto"``
-        replaced.
-
-    Raises
-    ------
-    AccessibilityError
-        When a Parquet strategy (``"eager"``, ``"chrom-major"``) is asked of
-        a directory that holds only the npy cache.
-    """
-    if not holds_only_cache(accessibility_dir):
-        return auto if accessibility_strategy == "auto" else accessibility_strategy
-    if accessibility_strategy in ("auto", "memmap"):
-        return "memmap"
-    raise AccessibilityError(
-        f"{accessibility_dir} holds the .access.npy accessibility cache and no "
-        f"Parquet profiles; accessibility_strategy={accessibility_strategy!r} reads "
-        "Parquet. Use 'memmap' (or 'auto'), or write the profiles with "
-        "'sioff accessibility --output-format parquet'."
-    )
-
-
-def _memmap_cache_dir(
-    accessibility_dir: Path, accessibility_cache_dir: Optional[Path]
-) -> Path:
-    # Where the "memmap" strategy keeps its cache: the given dir or the Parquet dir.
-    return (
-        Path(accessibility_cache_dir)
-        if accessibility_cache_dir is not None
-        else Path(accessibility_dir)
-    )
-
-
-def _warn_unused_cache_dir(
-    accessibility_cache_dir: Optional[Path], accessibility_strategy: str
-) -> None:
-    if accessibility_cache_dir is not None and accessibility_strategy != "memmap":
-        logger.warning(
-            f"accessibility_cache_dir={accessibility_cache_dir} is only used by "
-            f"accessibility_strategy='memmap' (got {accessibility_strategy!r}); "
-            "ignored"
-        )
 
 
 def _build_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]]:
@@ -1041,7 +595,6 @@ def compute_off_targets_single(
     n_workers: int = 1,
     profiler: Optional[PipelineProfiler] = None,
     accessibility_progress_callback=None,
-    accessibility_strategy: str = "auto",
 ) -> tuple[pl.DataFrame, dict]:
     """Compute off-target probabilities for one set of RIsearch predictions.
 
@@ -1112,17 +665,14 @@ def compute_off_targets_single(
         returned by [`sioff.accessibility`][sioff.accessibility]. Mutually exclusive with
         ``accessibility_dir``.
     accessibility_dir : pathlib.Path, optional
-        Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``).
-        With ``accessibility_strategy="memmap"`` it may instead hold only the
-        ``.access.npy`` cache files built from them. Mutually exclusive with
-        ``accessibility``.
+        The npy cache from ``sioff accessibility`` or per-chromosome Parquet
+        files (CLI ``-a/--accessibility-dir``); for Parquet the cache of every
+        contig is built (or rebuilt, when older than its Parquet) in
+        ``accessibility_cache_dir`` before the predictions are read. Mutually
+        exclusive with ``accessibility``.
     accessibility_cache_dir : pathlib.Path, optional
-        ``memmap`` only: where the memory-mapped ``<chrom>_<plus|minus>.access.npy``
-        cache is read from and, when missing, built (CLI
-        ``--accessibility-cache-dir``). Created if absent. Default:
-        ``accessibility_dir`` itself. Ignored (with a warning) by the other
-        strategies.
+        Where the cache is read from and built; default ``accessibility_dir``
+        (CLI ``--accessibility-cache-dir``). Created if absent.
     genome_file : pathlib.Path, optional
         Genome FASTA to fold on the fly when no pre-computed profiles are
         supplied (CLI ``-f/--fasta``). Profiles are written to a temporary
@@ -1200,16 +750,6 @@ def compute_off_targets_single(
     accessibility_progress_callback : callable, optional
         Called as ``callback(advance=1, description=str)`` after each
         chromosome is folded on the fly; only used with ``genome_file``.
-    accessibility_strategy : {"auto", "eager", "memmap", "chrom-major"}, default "auto"
-        How profiles in ``accessibility_dir`` are served (CLI
-        ``--accessibility-strategy``). ``"memmap"`` memory-maps the uint8
-        cache (see `sioff.services.accessibility.build_accessibility_cache`),
-        building it in ``accessibility_cache_dir`` when missing; every other
-        value loads whole-chromosome Parquet files into dense float32 arrays
-        and never writes cache files (the chromosome-major path exists only in
-        `compute_off_targets_directory`). ``"auto"`` is ``"memmap"`` when
-        ``accessibility_dir`` holds only the ``.access.npy`` cache. Ignored
-        without ``accessibility_dir``.
 
     Returns
     -------
@@ -1234,12 +774,14 @@ def compute_off_targets_single(
 
     Raises
     ------
+    AccessibilityError
+        When ``accessibility_dir`` (and ``accessibility_cache_dir``) holds no
+        profile, or the cache cannot be written.
     ValueError
         When both ``predictions`` and ``risearch_file`` are given; when both
         ``accessibility`` and ``accessibility_dir`` are given; when none of
         ``predictions``, ``risearch_file`` or ``sirna_fasta`` is given; when
         ``sirna_fasta`` is given without ``target_fasta``; when
-        ``accessibility_strategy`` is not one of the four values; when
         ``on_target_ids_file`` cannot be parsed. Also propagated when
         ``predictions`` lacks a required column or ``sirna_fasta`` contains
         duplicate IDs.
@@ -1254,7 +796,6 @@ def compute_off_targets_single(
     """
     profiler = profiler if profiler is not None else PipelineProfiler(enabled=False)
     risearch_parser = RIsearchParser()
-    _check_strategy(accessibility_strategy)
 
     if predictions is not None and risearch_file is not None:
         raise ValueError(
@@ -1277,6 +818,14 @@ def compute_off_targets_single(
     if is_running_risearch and target_fasta is None:
         raise ValueError(
             "sirna_fasta requires target_fasta when running RIsearch dynamically"
+        )
+
+    # Check the profiles and build the uint8 cache before the predictions are
+    # loaded, searched or intersected, so a bad -a fails at once.
+    cache_dir: Optional[Path] = None
+    if accessibility_dir:
+        cache_dir = _prepare_accessibility_cache(
+            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
 
     # --- Acquire predictions ---
@@ -1431,18 +980,6 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
-        # "memmap" serves the shared uint8 cache (built on first use when it is
-        # missing); every other strategy is the eager whole-chromosome loader
-        # and never writes cache files.
-        strategy = _resolve_dir_strategy(
-            Path(accessibility_dir), accessibility_strategy, auto="eager"
-        )
-        _warn_unused_cache_dir(accessibility_cache_dir, strategy)
-        cache_dir = (
-            _memmap_cache_dir(Path(accessibility_dir), accessibility_cache_dir)
-            if strategy == "memmap"
-            else None
-        )
         acc_service = GenomeAccessibilityService(
             Path(accessibility_dir), max_cached=4, cache_dir=cache_dir
         )
@@ -1461,6 +998,7 @@ def compute_off_targets_single(
                 unpaired_prob=unpaired_prob,
                 progress_callback=accessibility_progress_callback,
                 temperature=temperature,
+                output_format="npy",
             )
             prob_service = ProbabilityService(acc_service, temperature=temperature)
             return _finish(prob_service, df)
@@ -1491,7 +1029,6 @@ def compute_off_targets_directory(
     sense_only: bool = False,
     predictions_type: str = "gw",
     n_workers: int = 1,
-    accessibility_strategy: str = "auto",
     summary_only: bool = False,
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
     """Compute off-target probabilities for a directory of per-siRNA files.
@@ -1508,30 +1045,6 @@ def compute_off_targets_directory(
     Heavy intermediate columns (``boltzmann_weight*``, ``Z_sirna*``, ``E_min``)
     are dropped from the yielded frames.
 
-    Three strategies serve ``accessibility_dir`` (results are identical):
-
-    - ``"chrom-major"`` (what ``"auto"`` picks whenever ``accessibility_dir``
-      holds Parquet profiles, at any worker count): pass 1 loads and intersects every siRNA
-      into a run temp directory (under ``TMPDIR``), pass 2 streams each
-      accessibility Parquet once, row group by row group, for the hits of all
-      siRNAs, and pass 3 scores each siRNA with the precomputed column. Peak
-      memory per worker is about one Parquet row group instead of a dense
-      per-chromosome profile (30 GB for chr1), the genome is read once per run
-      rather than once per worker, and nothing is written next to the Parquet.
-    - ``"memmap"``: the parent first builds, for every Parquet contig that
-      lacks one, the uint8 ``<chrom>_<plus|minus>.access.npy`` cache (plus its
-      exceptions sidecar) in ``accessibility_cache_dir`` with
-      `sioff.services.accessibility.ensure_accessibility_cache`; each worker
-      then memory-maps those files, so the OS page cache holds one shared copy
-      and a worker's resident set is the pages its hits touch. The only
-      strategy that writes cache files; an ``accessibility_dir`` (or cache
-      dir) holding only the cache files, without Parquet, works too, and is
-      what ``sioff accessibility`` writes by default (``"auto"`` then picks
-      ``"memmap"``).
-    - ``"eager"``: the per-worker whole-chromosome loader (a dense float32
-      profile per chromosome and strand in every worker; fine for small
-      genomes, hopeless on hg38).
-
     The process pool and the temporary Arrow-IPC copy of the transcriptome
     (memory-mapped by every worker) are held open across yields and cleaned up
     in a ``finally``. Consume the generator fully, call ``.close()`` on it, or
@@ -1539,7 +1052,8 @@ def compute_off_targets_directory(
 
     Accessibility profiles are read from ``accessibility_dir`` only; in-memory
     profiles and on-the-fly folding are not supported in this mode. Writes no
-    files (other than the temporary IPC copy) and prints nothing.
+    files other than the temporary IPC copy and the accessibility cache, and
+    prints nothing.
 
     Parameters
     ----------
@@ -1563,18 +1077,17 @@ def compute_off_targets_directory(
         Annotation format: ``"auto"``, ``"gtf"`` or ``"gff3"``; BED is rejected
         (CLI ``--transcriptome-format``).
     accessibility_dir : pathlib.Path, optional
-        Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility`` (CLI ``-a/--accessibility-dir``);
-        with ``"memmap"`` it may instead hold only the ``.access.npy`` cache
-        files built from them. Without it, opening energies are treated as
-        zero.
+        The npy cache from ``sioff accessibility`` or per-chromosome Parquet
+        files (CLI ``-a/--accessibility-dir``); for Parquet the cache is built
+        (or rebuilt, when older than its Parquet) in ``accessibility_cache_dir``
+        first, before the transcriptome is parsed or the pool starts. Without
+        it, opening energies are treated as zero.
     accessibility_cache_dir : pathlib.Path, optional
-        ``memmap`` only: where the memory-mapped ``<chrom>_<plus|minus>.access.npy``
-        cache lives (CLI ``--accessibility-cache-dir``); created if absent.
-        Every contig that has a Parquet but no cache is built here, in the
-        parent, before the worker pool starts (``min(n_workers, 4)`` build
-        processes, one strand's cache in memory each). Default:
-        ``accessibility_dir``. Ignored (with a warning) by the other strategies.
+        Where the cache is read from and built; default ``accessibility_dir``
+        (CLI ``--accessibility-cache-dir``); created if absent. Every contig
+        that has a Parquet but no current cache is built here, in the parent
+        (``min(n_workers, 4)`` build processes, one strand's cache in memory
+        each), and each worker then memory-maps the finished files.
     temperature : float, default 37.0
         Temperature in degrees Celsius for the partition function (CLI
         ``-T/--temperature``).
@@ -1610,10 +1123,6 @@ def compute_off_targets_directory(
         Number of worker processes (CLI ``-j/--workers``), capped at the number
         of input files. Polars threads per worker are set to
         ``n_workers // n_processes`` so the total stays within the budget.
-    accessibility_strategy : {"auto", "eager", "memmap", "chrom-major"}, default "auto"
-        How opening energies are looked up when ``accessibility_dir`` is given
-        (CLI ``--accessibility-strategy``); see above. ``"auto"`` is
-        ``"chrom-major"``. Ignored without ``accessibility_dir``.
     summary_only : bool, default False
         Only the per-siRNA sums are needed (CLI ``--summary-only``): workers
         score with ``aggregate_only`` and ``df`` is empty, so no per-site table
@@ -1640,14 +1149,11 @@ def compute_off_targets_directory(
     ------
     FileNotFoundError
         When ``input_dir`` contains no RIsearch prediction files.
-    ValueError
-        When ``accessibility_strategy`` is not one of the four values.
     WorkerFailureError
-        After the last successful siRNA, when any worker task failed; at once
-        when a chromosome-major accessibility pass fails.
+        After the last successful siRNA, when any worker task failed.
     AccessibilityError
-        When the ``memmap`` cache cannot be built (unreadable Parquet,
-        unwritable cache directory).
+        When the accessibility cache cannot be built (unreadable Parquet,
+        unwritable cache directory) or ``accessibility_dir`` holds no profile.
 
     See Also
     --------
@@ -1655,52 +1161,18 @@ def compute_off_targets_directory(
         is a directory.
     compute_off_targets_single : Single-source variant with the full option set.
     """
-    _check_strategy(accessibility_strategy)
     input_dir = Path(input_dir)
     risearch_parser = RIsearchParser()
     all_files = risearch_parser.list_directory_files(input_dir)
     if not all_files:
         raise FileNotFoundError(f"No RIsearch files found in {input_dir}")
-    # Resolve "auto": chromosome-major whenever profiles come from a Parquet
-    # directory (also with one worker; the eager loader cannot hold a human
-    # chromosome), memmap when the directory holds only the npy cache.
-    strategy = (
-        "none"
-        if accessibility_dir is None
-        else _resolve_dir_strategy(
-            Path(accessibility_dir), accessibility_strategy, auto="chrom-major"
-        )
-    )
-    _warn_unused_cache_dir(accessibility_cache_dir, strategy)
-    chrom_major = strategy == "chrom-major"
-    # Only "memmap" ever builds cache files; the workers' service is the eager
-    # loader when cache_dir is None and the memory-mapped cache otherwise.
+    # Check the profiles and build the uint8 cache first: a bad -a then fails
+    # before the GTF parse and self-hybridisation, and before the IPC temp dir
+    # exists. Workers only ever memory-map the finished files.
     cache_dir: Optional[Path] = None
-    if strategy == "memmap":
-        assert accessibility_dir is not None
-        cache_dir = _memmap_cache_dir(Path(accessibility_dir), accessibility_cache_dir)
-
-    # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
-    # it instead of re-parsing the GTF/GFF3. Workers share pages via the OS cache.
-    _ipc_tmp: Optional[str] = None
-    _ipc_path: Optional[Path] = None
-    if gtf_file:
-        trans_parser = AnnotationParser()
-        df_trans = trans_parser.load_gtf(
-            Path(gtf_file),
-            feature=feature_type,
-            score_col=expression_metric,
-            format=transcriptome_format,
-        )
-        df_trans = _drop_unexpressed(df_trans)
-        # Sorted by (chrom, strand, start) so each worker's partitions are
-        # zero-copy slices of the memory-mapped file, and uncompressed so the
-        # file can be memory-mapped at all; see preload_transcriptome.
-        df_trans = sort_for_preload(df_trans)
-        _ipc_tmp = tempfile.mkdtemp(prefix="risearch_ipc_")
-        _ipc_path = Path(_ipc_tmp) / "transcriptome.arrow"
-        df_trans.write_ipc(
-            _ipc_path, compression="uncompressed", compat_level=pl.CompatLevel.oldest()
+    if accessibility_dir is not None:
+        cache_dir = _prepare_accessibility_cache(
+            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
 
     on_target_map: dict[str, str] = {}
@@ -1720,22 +1192,6 @@ def compute_off_targets_directory(
             sirna_fasta, matrix=matrix
         )
 
-    # memmap: build the accessibility cache once, here, so workers only ever
-    # map finished files (and never each decode a whole chromosome).
-    if cache_dir is not None:
-        assert accessibility_dir is not None
-        _t0 = time.perf_counter()
-        built = ensure_accessibility_cache(
-            Path(accessibility_dir), cache_dir, workers=n_workers
-        )
-        if built:
-            logger.info(
-                f"[memmap] built accessibility cache for {len(built)} contig(s) "
-                f"in {cache_dir} in {time.perf_counter() - _t0:.1f}s"
-            )
-        else:
-            logger.info(f"[memmap] accessibility cache in {cache_dir} is complete")
-
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
     theta_vals = _parse_theta(theta)
 
@@ -1744,8 +1200,39 @@ def compute_off_targets_directory(
     polars_threads_per_worker = max(1, n_workers // n_proc)
 
     # spawn: each worker starts a fresh interpreter, avoiding fork+Rayon deadlocks.
-    # Chromosome-major workers never build the eager per-worker loader.
     _ctx = multiprocessing.get_context("spawn")
+
+    # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
+    # it instead of re-parsing the GTF/GFF3. Workers share pages via the OS cache.
+    # Written last before the pool: only the try/finally around the pool removes
+    # it, so nothing that can fail may run in between.
+    _ipc_tmp: Optional[str] = None
+    _ipc_path: Optional[Path] = None
+    if gtf_file:
+        trans_parser = AnnotationParser()
+        df_trans = trans_parser.load_gtf(
+            Path(gtf_file),
+            feature=feature_type,
+            score_col=expression_metric,
+            format=transcriptome_format,
+        )
+        df_trans = _drop_unexpressed(df_trans)
+        # Sorted by (chrom, strand, start) so each worker's partitions are
+        # zero-copy slices of the memory-mapped file, and uncompressed so the
+        # file can be memory-mapped at all; see preload_transcriptome.
+        df_trans = sort_for_preload(df_trans)
+        _ipc_tmp = tempfile.mkdtemp(prefix="risearch_ipc_")
+        _ipc_path = Path(_ipc_tmp) / "transcriptome.arrow"
+        try:
+            df_trans.write_ipc(
+                _ipc_path,
+                compression="uncompressed",
+                compat_level=pl.CompatLevel.oldest(),
+            )
+        except BaseException:
+            shutil.rmtree(_ipc_tmp, ignore_errors=True)
+            raise
+
     # Polars sizes its thread pool when it is imported, which in a spawned
     # worker happens while the initializer is being unpickled -- before the
     # initializer runs. The budget therefore has to be in the environment the
@@ -1755,7 +1242,7 @@ def compute_off_targets_directory(
     os.environ["POLARS_MAX_THREADS"] = str(polars_threads_per_worker)
     _init_args = (
         str(_ipc_path) if gtf_file else "",
-        str(accessibility_dir) if (accessibility_dir and not chrom_major) else "",
+        str(accessibility_dir) if accessibility_dir else "",
         polars_threads_per_worker,
         on_target_map,
         self_hyb_emin,
@@ -1764,7 +1251,6 @@ def compute_off_targets_directory(
         summary_only,
     )
 
-    _run_tmp: Optional[str] = None
     try:
         with ProcessPoolExecutor(
             max_workers=n_proc,
@@ -1772,41 +1258,19 @@ def compute_off_targets_directory(
             initializer=_init_worker,
             initargs=_init_args,
         ) as pool:
-            if chrom_major:
-                assert accessibility_dir is not None
-                _run_tmp = tempfile.mkdtemp(prefix="sioff_chrom_major_")
-                logger.info(
-                    f"[chrom-major] {len(all_files)} siRNAs, {n_proc} workers, "
-                    f"temp dir {_run_tmp}"
-                )
-                yield from _stream_chrom_major(
-                    pool,
-                    all_files,
-                    Path(accessibility_dir),
-                    Path(_run_tmp),
-                    alpha_gamma_pairs,
-                    theta_vals,
-                    on_target_expression,
-                    sense_only,
-                    predictions_type,
-                )
-            else:
-                yield from _stream_eager(
-                    pool,
-                    all_files,
-                    alpha_gamma_pairs,
-                    theta_vals,
-                    on_target_expression,
-                    sense_only,
-                    predictions_type,
-                )
+            yield from _stream_sirnas(
+                pool,
+                all_files,
+                alpha_gamma_pairs,
+                theta_vals,
+                on_target_expression,
+                sense_only,
+                predictions_type,
+            )
     finally:
-        # Clean up the temp Arrow IPC dir used to share the transcriptome and
-        # the chromosome-major run directory.
+        # Clean up the temp Arrow IPC dir used to share the transcriptome.
         if _ipc_tmp:
             shutil.rmtree(_ipc_tmp, ignore_errors=True)
-        if _run_tmp:
-            shutil.rmtree(_run_tmp, ignore_errors=True)
         if _prev_polars_threads is None:
             os.environ.pop("POLARS_MAX_THREADS", None)
         else:

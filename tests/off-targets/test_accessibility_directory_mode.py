@@ -1,17 +1,16 @@
-"""The chromosome-major accessibility gather must equal the eager lookup.
+"""Directory mode looks opening energies up in the memory-mapped cache.
 
-Directory mode used to give every worker its own ``GenomeAccessibilityService``
-that materialises a whole chromosome per strand (chr1: 30 GB) -- 46 workers on
-hg38 were all OOM-killed. The chromosome-major path streams each accessibility
-Parquet once per run, row group by row group, and gathers the opening energies
-of every siRNA's hits in one pass. Its output must be bit-for-bit what the
-eager path (``GenomeAccessibilityService.annotate_opening_energy_vectorized``)
-produces, including the corner cases:
+Every worker memory-maps the uint8 ``.access.npy`` cache the parent built
+before starting the pool (chr1: 30 GB dense per strand would be the cost of
+loading it instead -- 46 workers on hg38 were all OOM-killed). The result must
+be bit-for-bit what the dense lookup
+(``GenomeAccessibilityService.annotate_opening_energy_vectorized``) produces,
+including the corner cases:
 
 - both strands, interaction lengths 1..40 (column clamped at u30);
 - hits at position 1 and at the last position of the contig;
 - hits running past the last position (out of bounds -> 10.0);
-- positions missing from the Parquet (-> 25.5, the eager ``np.full`` default);
+- positions missing from the Parquet (-> 25.5, the dense ``np.full`` default);
 - a strand with no rows in the file (-> 10.0);
 - a contig absent from the accessibility directory (-> 10.0).
 """
@@ -25,7 +24,6 @@ import pyarrow.parquet as pq
 import pytest
 from polars.testing import assert_frame_equal
 
-import sioff.core.off_targets as core
 from sioff.core.off_targets import (
     WorkerFailureError,
     compute_off_targets_directory,
@@ -158,9 +156,8 @@ SORT_KEYS = ["sirna_id", "chrom", "start", "end", "strand", "energy"]
 def _run(
     hits_dir: Path,
     acc_dir: Path,
-    strategy: str,
     n_workers: int,
-    cache_dir: Path | None = None,
+    cache_dir: Path | None,
 ):
     gen = compute_off_targets_directory(
         input_dir=hits_dir,
@@ -170,7 +167,6 @@ def _run(
         gamma="0.9;1",
         theta="0.7",
         n_workers=n_workers,
-        accessibility_strategy=strategy,
     )
     frames, metas = [], {}
     for df, meta in gen:
@@ -179,25 +175,31 @@ def _run(
     return pl.concat(frames).sort(SORT_KEYS), metas
 
 
-def test_chrom_major_equals_eager_path(hits, acc_dir):
-    hits_dir, all_hits = hits
-    eager, eager_z = _run(hits_dir, acc_dir, "eager", n_workers=2)
-    chrom_major, cm_z = _run(hits_dir, acc_dir, "chrom-major", n_workers=2)
+def _dense_oracle(acc_dir: Path, all_hits: pl.DataFrame) -> pl.DataFrame:
+    service = GenomeAccessibilityService.from_frames(
+        {c: pl.read_parquet(acc_dir / f"{c}.accessibility.parquet") for c in CHROM_LEN}
+    )
+    return service.annotate_opening_energy_vectorized(all_hits).sort(SORT_KEYS)
 
-    assert eager.height == all_hits.height
-    assert_frame_equal(chrom_major, eager, check_exact=True)
-    assert cm_z == eager_z
+
+def test_directory_mode_matches_the_dense_lookup(hits, acc_dir, tmp_path):
+    """Independent oracle: the dense lookup on the concatenated hits."""
+    hits_dir, all_hits = hits
+    result, _ = _run(hits_dir, acc_dir, n_workers=3, cache_dir=tmp_path / "cache")
+    expected = _dense_oracle(acc_dir, all_hits)
+    assert result.height == all_hits.height
+    np.testing.assert_array_equal(
+        result["opening_energy"].to_numpy(), expected["opening_energy"].to_numpy()
+    )
 
     # Guard that the fixture really exercised every branch.
-    oe = chrom_major["opening_energy"]
+    oe = result["opening_energy"]
     assert oe.dtype == pl.Float32
     assert (oe == 25.5).sum() > 0, "no position-missing rows"
     assert (oe == 10.0).sum() > 0, "no out-of-bounds/unknown rows"
+    assert result.filter(pl.col("chrom") == "chrC")["opening_energy"].eq(10.0).all()
     assert (
-        chrom_major.filter(pl.col("chrom") == "chrC")["opening_energy"].eq(10.0).all()
-    )
-    assert (
-        chrom_major.filter((pl.col("chrom") == "chrB") & (pl.col("strand") == "-"))[
+        result.filter((pl.col("chrom") == "chrB") & (pl.col("strand") == "-"))[
             "opening_energy"
         ]
         .eq(10.0)
@@ -206,53 +208,18 @@ def test_chrom_major_equals_eager_path(hits, acc_dir):
     assert oe.n_unique() > 20, "values look degenerate"
 
 
-def test_chrom_major_matches_direct_vectorized_lookup(hits, acc_dir):
-    """Independent oracle: the service's own gather on the concatenated hits."""
-    hits_dir, all_hits = hits
-    chrom_major, _ = _run(hits_dir, acc_dir, "chrom-major", n_workers=3)
-    service = GenomeAccessibilityService(acc_dir)
-    expected = service.annotate_opening_energy_vectorized(all_hits).sort(SORT_KEYS)
-    np.testing.assert_array_equal(
-        chrom_major["opening_energy"].to_numpy(), expected["opening_energy"].to_numpy()
-    )
-
-
-def test_auto_is_chrom_major_even_with_one_worker(hits, acc_dir, monkeypatch):
-    """``auto`` with an accessibility dir never uses the eager loader (-j 1 too)."""
-    hits_dir, _ = hits
-    eager, _ = _run(hits_dir, acc_dir, "eager", n_workers=2)
-
-    def _no_eager(*_args, **_kwargs):
-        raise AssertionError("auto fell back to the eager per-worker loader")
-
-    monkeypatch.setattr(core, "_stream_eager", _no_eager)
-    auto1, _ = _run(hits_dir, acc_dir, "auto", n_workers=1)
-    assert_frame_equal(auto1, eager, check_exact=True)
-
-
 def _cache_files(d: Path) -> list[str]:
     return sorted(p.name for p in d.iterdir() if ".access." in p.name)
 
 
-def test_eager_memmap_and_chrom_major_agree(hits, acc_dir, tmp_path):
-    """The three strategies give identical frames and partition functions.
-
-    Only ``memmap`` may create cache files, and only in its cache directory;
-    ``eager`` and ``chrom-major`` leave the accessibility directory untouched.
-    """
+def test_cache_goes_to_cache_dir_or_next_to_the_profiles(hits, acc_dir, tmp_path):
+    """The cache is built in ``cache_dir``, or next to the Parquet without one."""
     hits_dir, all_hits = hits
-    before = _cache_files(acc_dir)
-    eager, eager_z = _run(hits_dir, acc_dir, "eager", n_workers=2)
-    chrom_major, cm_z = _run(hits_dir, acc_dir, "chrom-major", n_workers=2)
-    assert _cache_files(acc_dir) == before == [], "eager/chrom-major wrote a cache"
-
+    assert _cache_files(acc_dir) == []
     cache_dir = tmp_path / "cache"
-    memmap, mm_z = _run(hits_dir, acc_dir, "memmap", n_workers=2, cache_dir=cache_dir)
-    assert eager.height == memmap.height == all_hits.height
-    assert_frame_equal(memmap, eager, check_exact=True)
-    assert_frame_equal(memmap, chrom_major, check_exact=True)
-    assert mm_z == eager_z == cm_z
-    assert _cache_files(acc_dir) == [], "memmap wrote into the accessibility dir"
+    first, first_z = _run(hits_dir, acc_dir, n_workers=2, cache_dir=cache_dir)
+    assert first.height == all_hits.height
+    assert _cache_files(acc_dir) == [], "wrote into the accessibility dir"
     assert _cache_files(cache_dir) == sorted(
         cache_paths(cache_dir, c, s)[k].name
         for c in CHROM_LEN
@@ -265,14 +232,15 @@ def test_eager_memmap_and_chrom_major_agree(hits, acc_dir, tmp_path):
     acc_copy.mkdir()
     for f in acc_dir.iterdir():
         (acc_copy / f.name).write_bytes(f.read_bytes())
-    memmap_default, _ = _run(hits_dir, acc_copy, "memmap", n_workers=1)
-    assert_frame_equal(memmap_default, eager, check_exact=True)
+    default, default_z = _run(hits_dir, acc_copy, n_workers=1, cache_dir=None)
+    assert_frame_equal(default, first, check_exact=True)
+    assert default_z == first_z
     assert _cache_files(acc_copy) == _cache_files(cache_dir)
 
 
 def test_memmap_serves_a_cache_only_dir_without_parquet(hits, acc_dir, tmp_path):
     """A complete cache in --accessibility-cache-dir needs no Parquet at all."""
-    hits_dir, _ = hits
+    hits_dir, all_hits = hits
     cache_only = tmp_path / "cache_only"
     assert ensure_accessibility_cache(acc_dir, cache_only, workers=2) == [
         "chrA",
@@ -280,23 +248,15 @@ def test_memmap_serves_a_cache_only_dir_without_parquet(hits, acc_dir, tmp_path)
     ]
     no_parquet = tmp_path / "no_parquet"
     no_parquet.mkdir()
-    eager, eager_z = _run(hits_dir, acc_dir, "eager", n_workers=2)
-    memmap, mm_z = _run(
-        hits_dir, no_parquet, "memmap", n_workers=2, cache_dir=cache_only
+    result, _ = _run(hits_dir, no_parquet, n_workers=2, cache_dir=cache_only)
+    expected = _dense_oracle(acc_dir, all_hits)
+    np.testing.assert_array_equal(
+        result["opening_energy"].to_numpy(), expected["opening_energy"].to_numpy()
     )
-    assert_frame_equal(memmap, eager, check_exact=True)
-    assert mm_z == eager_z
     assert not list(no_parquet.iterdir())
 
 
-def test_unknown_strategy_is_rejected(hits, acc_dir):
-    hits_dir, _ = hits
-    with pytest.raises(ValueError, match="accessibility_strategy"):
-        list(_run(hits_dir, acc_dir, "lazy", n_workers=1))
-
-
-@pytest.mark.parametrize("strategy", ["eager", "memmap", "chrom-major"])
-def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path, strategy):
+def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path):
     """A worker failure must surface as an error, never as a silent skip."""
     hits_dir, _ = hits
     broken = tmp_path / "broken"
@@ -308,10 +268,9 @@ def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path, strate
     gen = compute_off_targets_directory(
         input_dir=broken,
         accessibility_dir=acc_dir,
-        accessibility_cache_dir=tmp_path / "cache" if strategy == "memmap" else None,
+        accessibility_cache_dir=tmp_path / "cache",
         alpha="0.8;1",
         n_workers=2,
-        accessibility_strategy=strategy,
     )
     frames = []
     with pytest.raises(WorkerFailureError, match=r"1/6 .*failed") as info:
@@ -343,6 +302,8 @@ def test_failed_worker_exits_nonzero_from_cli(hits, acc_dir, tmp_path, plain):
             str(broken),
             "-a",
             str(acc_dir),
+            "--accessibility-cache-dir",
+            str(tmp_path / "cache"),
             "-j",
             "2",
             "-o",
@@ -358,11 +319,10 @@ def test_failed_worker_exits_nonzero_from_cli(hits, acc_dir, tmp_path, plain):
     assert out["sirna_id"].n_unique() == 5
 
 
-@pytest.mark.parametrize("strategy", ["eager", "memmap", "chrom-major"])
-def test_summary_only_returns_sums_without_rows(hits, acc_dir, tmp_path, strategy):
+def test_summary_only_returns_sums_without_rows(hits, acc_dir, tmp_path):
     """--summary-only: no per-site rows leave the workers, the sums are unchanged."""
     hits_dir, _ = hits
-    cache = tmp_path / "cache" if strategy == "memmap" else None
+    cache = tmp_path / "cache"
 
     def run(summary_only):
         metas, n_rows, n_frames = {}, 0, 0
@@ -374,7 +334,6 @@ def test_summary_only_returns_sums_without_rows(hits, acc_dir, tmp_path, strateg
             gamma="0.9;1",
             theta="0.7",
             n_workers=2,
-            accessibility_strategy=strategy,
             summary_only=summary_only,
         ):
             n_frames += 1

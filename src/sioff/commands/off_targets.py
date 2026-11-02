@@ -110,41 +110,20 @@ def run(
         typer.Option(
             "-a",
             "--accessibility-dir",
-            help="Directory of per-chromosome accessibility Parquet files (from 'sioff accessibility'), or of the .access.npy cache files built from them.",
+            help="Accessibility profiles from 'sioff accessibility': the .access.npy cache, or per-chromosome Parquet files (the cache is built from them on the first run).",
             exists=True,
             file_okay=False,
         ),
     ] = None,
-    accessibility_strategy: Annotated[
-        str,
-        typer.Option(
-            "--accessibility-strategy",
-            help=(
-                "How opening energies are looked up from --accessibility-dir: "
-                "'chrom-major' (directory mode) streams each chromosome's Parquet "
-                "once per run for all siRNAs, memory per worker ~ one row group, "
-                "writes nothing; 'memmap' builds a uint8 .access.npy cache per "
-                "chromosome and strand (in --accessibility-cache-dir, default the "
-                "accessibility dir) that all workers memory-map, and is the only "
-                "strategy that writes cache files; 'eager' loads whole-chromosome "
-                "profiles in every worker (small genomes only). 'auto' (default) "
-                "is memmap when the accessibility dir holds only the .access.npy "
-                "cache (what 'sioff accessibility' writes by default), otherwise "
-                "chrom-major in directory mode and eager for a single file."
-            ),
-        ),
-    ] = "auto",
     accessibility_cache_dir: Annotated[
         Optional[Path],
         typer.Option(
             "--accessibility-cache-dir",
             help=(
-                "With --accessibility-strategy memmap: directory of the "
-                "<chrom>_<plus|minus>.access.npy cache, built there from the Parquet "
-                "when missing and created if absent (default: the accessibility dir "
-                "itself). Use it when the accessibility dir is read-only or to stage "
-                "the cache on local disk; it may also hold a complete cache without "
-                "any Parquet. Ignored by the other strategies."
+                "Where the .access.npy cache is read from and built "
+                "(default: the accessibility dir itself). Use it when the "
+                "accessibility dir is read-only or to stage the cache on local "
+                "disk; it may also hold a complete cache without any Parquet."
             ),
             file_okay=False,
         ),
@@ -476,7 +455,6 @@ def run(
                 sense_only=sense_only,
                 predictions_type=predictions_type,
                 n_workers=n_workers,
-                accessibility_strategy=accessibility_strategy,
                 # --summary-only writes the .summary files from the per-siRNA
                 # metadata alone; workers then send back no per-site table.
                 summary_only=summary_only,
@@ -647,7 +625,6 @@ def run(
                 transcriptome_format=transcriptome_format,
                 accessibility_dir=accessibility_dir,
                 accessibility_cache_dir=accessibility_cache_dir,
-                accessibility_strategy=accessibility_strategy,
                 genome_file=genome_file,
                 window_size=window_size,
                 max_span=max_span,

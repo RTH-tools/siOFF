@@ -27,6 +27,11 @@ def test_public_api_exposes_callables() -> None:
         assert callable(getattr(sioff, name)), f"sioff.{name} is not callable"
 
 
+def test_off_targets_has_no_accessibility_strategy() -> None:
+    with pytest.raises(TypeError, match="accessibility_strategy"):
+        sioff.off_targets(risearch_file=RISEARCH_FILE, accessibility_strategy="memmap")
+
+
 def test_off_targets_returns_dataframe_with_probabilities() -> None:
     """sioff.off_targets(...) on a real single-file fixture returns a non-empty
     Polars DataFrame containing the probability column.

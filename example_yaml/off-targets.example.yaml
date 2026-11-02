@@ -60,21 +60,7 @@ off_targets:
   # files with its output_format: parquet.
   accessibility_dir: ../examples/data/accessibility
 
-  # How opening energies are read from accessibility_dir. Default: "auto".
-  # Options: "auto" | "chrom-major" | "memmap" | "eager"
-  #   chrom-major: directory mode; streams each chromosome's Parquet once per
-  #                run for all siRNAs (memory per worker ~ one row group).
-  #   memmap:      builds a uint8 .access.npy cache per chromosome and strand
-  #                that every worker memory-maps; the only strategy that writes
-  #                cache files.
-  #   eager:       loads whole chromosomes into memory in every worker (small
-  #                genomes only).
-  #   auto:        memmap when accessibility_dir holds only the .access.npy
-  #                cache; otherwise chrom-major for a directory of per-siRNA
-  #                files, eager for a single predictions file.
-  # accessibility_strategy: auto
-
-  # memmap only: where the cache is read from and, when missing, built
+  # Where the cache is read from and, when missing, built
   # (created if absent). Defaults to accessibility_dir itself; set it when the
   # accessibility directory is read-only or to stage the cache on node-local
   # disk. A complete cache here needs no Parquet in accessibility_dir.

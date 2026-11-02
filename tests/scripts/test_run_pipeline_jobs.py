@@ -119,6 +119,19 @@ class TestBuildOffTargets:
         assert _flag(cmd, "--transcriptome") == str(tmp_path / "a.gtf")
         assert _flag(cmd, "--alpha") == "1.0"
 
+    def test_accessibility_cache_dir_is_forwarded_as_a_path(self, tmp_path):
+        """The read-only -a error tells users to pass this flag; YAML must reach it."""
+        assert "--accessibility-cache-dir" not in rp._build_off_targets({}, tmp_path)
+
+        cmd = rp._build_off_targets(
+            {"accessibility_dir": "acc/", "accessibility_cache_dir": "scratch/acc"},
+            tmp_path,
+        )
+        assert _flag(cmd, "--accessibility-dir") == str(tmp_path / "acc")
+        assert _flag(cmd, "--accessibility-cache-dir") == str(
+            tmp_path / "scratch" / "acc"
+        )
+
     def test_boolean_flags_are_bare_and_opt_in(self, tmp_path):
         assert "--sense-only" not in rp._build_off_targets({}, tmp_path)
 

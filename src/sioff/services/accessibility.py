@@ -43,8 +43,7 @@ def site_cells(
     """Map RIsearch hits to cells of one strand's opening-energy profile.
 
     The single place that turns a hit into a profile index; every lookup path
-    (eager, in-memory frames, memory-mapped cache, chromosome-major gather,
-    on-target) goes through it.
+    (dense, in-memory frames, memory-mapped cache, on-target) goes through it.
 
     A profile row ``i`` (0-based) and column ``k`` hold the energy to open the
     ``k + 1`` bases ENDING at position ``i + 1`` of the molecule that was folded
@@ -105,6 +104,10 @@ def check_strand_lengths(
     )
     return False
 
+
+_OUT_OF_BOUNDS_ENERGY = (
+    10.0  # the `np.full` default of annotate_opening_energy_vectorized
+)
 
 # Strands `_warn_missing_strand` has reported in this process.
 _WARNED_MISSING_STRANDS: set[str] = set()
@@ -391,14 +394,25 @@ def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     )
 
 
-def holds_only_cache(accessibility_dir: Union[str, Path]) -> bool:
-    """True when the directory has ``.access.npy`` caches and no Parquet profile.
+def has_profiles(directory: Union[str, Path]) -> bool:
+    """Report whether a directory holds any accessibility profile.
 
-    That is what ``sioff accessibility --output-format npy`` writes; only the
-    ``memmap`` lookup strategy can serve it.
+    Parameters
+    ----------
+    directory : str or pathlib.Path
+        Directory to inspect.
+
+    Returns
+    -------
+    bool
+        True when it holds a ``*.access.npy`` cache file or a
+        ``*.accessibility.parquet`` file; False otherwise, including when the
+        directory does not exist.
     """
-    d = Path(accessibility_dir)
-    return any(d.glob(f"*{CACHE_SUFFIX}")) and not any(d.glob(f"*{PARQUET_SUFFIX}"))
+    d = Path(directory)
+    if not d.is_dir():
+        return False
+    return any(d.glob(f"*{CACHE_SUFFIX}")) or any(d.glob(f"*{PARQUET_SUFFIX}"))
 
 
 def _chrom_of(parquet_path: Path) -> str:
@@ -421,7 +435,7 @@ def _encode(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Encode float32 kcal/mol to uint8 codes; also flag the inexact entries.
 
     Uses the very ``np.round(v * 10)`` the consumers apply, so a decoded code
-    re-quantises to the same value the eager path produced.
+    re-quantises to the same value the dense in-memory path produces.
     """
     k = np.round(values * _SCALE)
     codes = np.clip(k, 0, _SENTINEL_CODE).astype(np.uint8)
@@ -625,12 +639,15 @@ def build_accessibility_cache(
     Streams the Parquet by row group (never more than ``batch_rows`` rows in
     flight) into a preallocated ``uint8[max_position, n_u]`` per strand, so
     peak memory is one strand's cache (chr1: 7.5 GB) plus a batch. Positions
-    absent from the Parquet keep code 255 (25.5 kcal/mol), as the eager path
-    did; positions must be unique within a strand, as the writer guarantees.
-    A strand with no rows gets an empty ``(0, n_u)`` cache so the build stays
-    idempotent, and queries on it raise like the eager path.
+    absent from the Parquet keep code 255 (25.5 kcal/mol), as in the dense
+    in-memory path; positions must be unique within a strand, as the writer
+    guarantees. A strand with no rows gets an empty ``(0, n_u)`` cache so the
+    build stays idempotent, and queries on it raise like the dense path.
 
-    Files are written to a temporary name and renamed into place.
+    Files are written to a temporary name and renamed into place. Each
+    ``.npy`` is dated no earlier than the Parquet it was read from, so the
+    age check of `_cache_is_stale` holds even when the Parquet's mtime lies
+    ahead of this machine's clock.
 
     Returns
     -------
@@ -641,6 +658,8 @@ def build_accessibility_cache(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     chrom = _chrom_of(parquet_path)
+    # Taken before reading: a Parquet rewritten mid-build stays newer.
+    folded = parquet_path.stat().st_mtime_ns
     pf = pq.ParquetFile(parquet_path)
     u_cols = _u_columns(pf.schema_arrow.names)
     if not u_cols:
@@ -655,24 +674,30 @@ def build_accessibility_cache(
         int(np.load(built["-"], mmap_mode="r").shape[0]),
         str(parquet_path),
     )
+    for npy_path in built.values():
+        _date_no_earlier_than(npy_path, folded)
     return built
 
 
-def _layout_strand_lengths(
-    layout: list[tuple[int, str, int, int, bool]],
-) -> tuple[Optional[int], Optional[int]]:
-    """``(plus, minus)`` maximum positions from a `_row_group_layout`."""
-    lens: dict[str, int] = {}
-    for _, strand, _, pos_max, _ in layout:
-        lens[strand] = max(lens.get(strand, 0), int(pos_max))
-    return lens.get("+"), lens.get("-")
+def _date_no_earlier_than(npy_path: Path, mtime_ns: int) -> None:
+    """Move a fresh cache file's mtime up to ``mtime_ns`` if it is earlier.
+
+    A Parquet written on a node whose clock runs ahead would otherwise make
+    the cache just built from it look stale, and every run rebuild it. Best
+    effort: if the time cannot be set, the next run rebuilds once more.
+    """
+    try:
+        if npy_path.stat().st_mtime_ns < mtime_ns:
+            os.utime(npy_path, ns=(mtime_ns, mtime_ns))
+    except OSError:
+        pass
 
 
 def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
     """Both files present and the ``.npy`` header is a 2-D uint8 array.
 
-    Only the header is checked (dtype, rank); the row count is not compared
-    with the Parquet, so a cache built from an older Parquet is trusted.
+    Only the header is checked (dtype, rank), never the content. Whether the
+    cache still matches its Parquet is `_cache_is_stale`'s question.
     """
     if not (npy_path.is_file() and npz_path.is_file()):
         return False
@@ -683,6 +708,36 @@ def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
     return arr.ndim == 2 and arr.dtype == np.uint8
 
 
+def _cache_is_stale(cache_dir: Path, chrom: str, parquet_path: Path) -> bool:
+    """Either strand's ``.npy`` in ``cache_dir`` is older than the contig's Parquet.
+
+    Re-folding into the same directory (new ``-W/-L/-u``, a corrected genome)
+    rewrites the Parquet but leaves the cache built from the old one, which
+    would otherwise keep answering. Only modification times are compared: a
+    Parquet copied without its mtime costs an unneeded rebuild, and one given
+    an mtime older than its cache goes unnoticed. A missing ``.npy`` is not
+    stale, it is missing (see `_cache_is_valid`).
+    """
+    try:
+        folded = parquet_path.stat().st_mtime_ns
+    except OSError:
+        return False
+    for strand in _STRAND_NAMES:
+        try:
+            if cache_paths(cache_dir, chrom, strand)[0].stat().st_mtime_ns < folded:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _warn_stale(chrom: str, cache_dir: Path, parquet_path: Path) -> None:
+    logger.warning(
+        f"Accessibility cache for {chrom} in {cache_dir} is older than "
+        f"{parquet_path}; rebuilding it"
+    )
+
+
 def ensure_accessibility_cache(
     parquet_dir: Union[str, Path],
     cache_dir: Optional[Union[str, Path]] = None,
@@ -690,13 +745,15 @@ def ensure_accessibility_cache(
     workers: int = 1,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> list[str]:
-    """Build the uint8 cache for every Parquet contig that lacks one.
+    """Build the uint8 cache for every Parquet contig that lacks a current one.
 
     Meant to run once in the parent process before an off-target worker pool
-    starts, so workers only ever memory-map finished files. Contigs whose two
-    strand caches already exist and pass `_cache_is_valid` are skipped, which
-    makes repeated calls cheap. A directory without any Parquet (only
-    ``.npy`` caches) builds nothing.
+    starts, so workers only ever memory-map finished files. A contig is
+    skipped when both strand caches in ``cache_dir`` pass `_cache_is_valid`
+    and neither ``.npy`` is older than its Parquet, which makes repeated calls
+    cheap. A cache older than its Parquet (the directory was re-folded) is
+    rebuilt with a warning. A directory without any Parquet (only ``.npy``
+    caches) builds nothing.
 
     Parameters
     ----------
@@ -717,6 +774,15 @@ def ensure_accessibility_cache(
     -------
     list[str]
         Names of the contigs that were (re)built, largest file first.
+
+    Raises
+    ------
+    AccessibilityError
+        When a contig's cache cannot be built, naming its Parquet; the
+        original exception (an ``OSError`` for an unwritable ``cache_dir``)
+        is its ``__cause__``.
+    OSError
+        When ``cache_dir`` cannot be created.
     """
     parquet_dir = Path(parquet_dir)
     cache_dir = Path(cache_dir) if cache_dir is not None else parquet_dir
@@ -726,13 +792,14 @@ def ensure_accessibility_cache(
     if contigs is not None:
         wanted = set(contigs)
         files = [f for f in files if _chrom_of(f) in wanted]
-    missing = [
-        f
-        for f in files
-        if not all(
-            _cache_is_valid(*cache_paths(cache_dir, _chrom_of(f), s)) for s in "+-"
-        )
-    ]
+    missing: list[Path] = []
+    for f in files:
+        chrom = _chrom_of(f)
+        if not all(_cache_is_valid(*cache_paths(cache_dir, chrom, s)) for s in "+-"):
+            missing.append(f)
+        elif _cache_is_stale(cache_dir, chrom, f):
+            _warn_stale(chrom, cache_dir, f)
+            missing.append(f)
     if not missing:
         return []
     missing.sort(key=lambda f: f.stat().st_size, reverse=True)
@@ -745,7 +812,12 @@ def ensure_accessibility_cache(
     )
     if n_proc == 1:
         for f in missing:
-            build_accessibility_cache(f, cache_dir, batch_rows)
+            try:
+                build_accessibility_cache(f, cache_dir, batch_rows)
+            except Exception as e:
+                raise AccessibilityError(
+                    f"Failed to build accessibility cache for {f.name}: {e}"
+                ) from e
         return names
 
     # spawn: a fresh interpreter per worker avoids fork + Arrow thread-pool deadlocks.
@@ -766,7 +838,7 @@ def ensure_accessibility_cache(
 
 
 class _DenseProfile:
-    """One strand as the eager float32 ``[n_pos, n_u]`` array (in-memory frames)."""
+    """One strand as a dense float32 ``[n_pos, n_u]`` array (in-memory frames)."""
 
     __slots__ = ("arr",)
 
@@ -847,24 +919,17 @@ class GenomeAccessibilityService:
     Service to pre-compute and query genomic accessibility profiles.
 
     Profiles are stored as per-chromosome Parquet files produced by
-    compute_genome_accessibility() in ``data_dir`` and served one of two ways:
-
-    - eager (``cache_dir=None``, the default): a chromosome's Parquet is read
-      whole, one strand is filtered out and materialised as a dense float32
-      ``[max_pos, n_u]`` array (chr1: 30 GB per strand). Nothing is written.
-    - memory-mapped (``cache_dir`` given): the uint8 cache described at
-      `build_accessibility_cache` (one ``<chrom>_<plus|minus>.access.npy``
-      per strand, plus an exceptions sidecar) in ``cache_dir`` is
-      ``np.load(mmap_mode="r")``-ed, so every process shares one page-cache
-      copy and resident memory is only the pages it touches. A contig whose
-      cache is missing is built from its Parquet on first use (batch runs
-      build it up front with `ensure_accessibility_cache` so worker processes
-      only map finished files); a ``cache_dir`` holding the complete cache
-      needs no Parquet at all. Pass ``cache_dir=data_dir`` to keep the cache
-      next to the Parquet.
-
-    Both answer bit-for-bit alike. The LRU of ``max_cached`` slots bounds the
-    number of loaded profiles (arrays or mappings) per process.
+    compute_genome_accessibility() in ``data_dir`` and served from the uint8
+    cache described at `build_accessibility_cache`: one
+    ``<chrom>_<plus|minus>.access.npy`` per strand plus an exceptions sidecar,
+    ``np.load(mmap_mode="r")``-ed so every process shares one page-cache copy
+    and resident memory is only the pages it touches. The cache is looked up in
+    ``cache_dir`` (default: ``data_dir``), then in ``data_dir``. A contig whose
+    cache is missing, or older than its Parquet, is built from the Parquet
+    into ``cache_dir`` on first use (batch runs build it up front with
+    `ensure_accessibility_cache` so worker processes only map finished files);
+    a directory holding the complete cache needs no Parquet at all. The LRU of
+    ``max_cached`` slots bounds the number of mappings loaded per process.
 
     `from_frames()` builds a service over in-memory per-chromosome
     DataFrames instead (the ``dict[chrom -> DataFrame]`` that
@@ -882,14 +947,20 @@ class GenomeAccessibilityService:
         self.data_dir = data_dir
         if self.data_dir is not None:
             self.data_dir.mkdir(parents=True, exist_ok=True)
-        # None: eager Parquet loader; a path: the memory-mapped uint8 cache there.
+        # Where the uint8 cache is built and first looked for; None only for a
+        # frame-backed service, which has no on-disk profiles.
         self.cache_dir: Optional[Path] = (
-            Path(cache_dir) if cache_dir is not None else None
+            Path(cache_dir)
+            if cache_dir is not None
+            else (Path(data_dir) if data_dir is not None else None)
         )
         self._frames: Mapping[str, pl.DataFrame] = frames if frames is not None else {}
         self._max_cached = max_cached
         self._profiles: OrderedDict[str, _Profile] = OrderedDict()
         self._strands_checked: set[str] = set()
+        # Contigs whose cache was found no older than their Parquet, or was
+        # (re)built here; `_cached_from_disk` does not compare mtimes again.
+        self._current: set[str] = set()
 
     def _require_dir(self) -> Path:
         """The Parquet directory; a frame-backed service has none."""
@@ -932,8 +1003,8 @@ class GenomeAccessibilityService:
         file per chromosome containing columns [position, strand, u1, u2, ...,
         u{unpaired_prob}]; with ``"npy"`` writes the uint8 memory-map cache
         (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
-        sidecars, see `build_accessibility_cache`) instead, which the
-        ``memmap`` lookup strategy reads with no conversion step.
+        sidecars, see `build_accessibility_cache`) instead, which
+        ``off-targets`` reads with no conversion step.
         ``strand="+"`` folds each sequence as given only (see
         `_fold_full_chromosome`).
 
@@ -1065,7 +1136,7 @@ class GenomeAccessibilityService:
 
     @staticmethod
     def _dense_profile(full: pl.DataFrame, strand: str, source: str) -> _DenseProfile:
-        """The eager path: one strand of a whole-chromosome frame as float32[max_pos, n_u].
+        """The dense in-memory path: one strand of a frame as float32[max_pos, n_u].
 
         Positions absent from the frame keep the 25.5 kcal/mol sentinel.
         """
@@ -1080,25 +1151,38 @@ class GenomeAccessibilityService:
             arr[pos_0, col_idx] = df[col_name].to_numpy()
         return _DenseProfile(arr)
 
-    def _dense_from_parquet(self, chrom: str, strand: str) -> tuple[_DenseProfile, str]:
-        """Eager loader: read the chromosome's Parquet whole and densify one strand."""
-        path = self._find_profile(chrom)
-        if not path:
-            raise AccessibilityError(
-                f"Profile for {chrom} not found in {self.data_dir}. "
-                f"Expected {self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'}."
-            )
-        source = str(path)
-        return self._dense_profile(pl.read_parquet(path), strand, source), source
+    def _cache_dirs(self) -> list[Path]:
+        """Directories searched for a cache, in order: ``cache_dir``, ``data_dir``."""
+        return list(
+            dict.fromkeys(d for d in (self.cache_dir, self.data_dir) if d is not None)
+        )
+
+    def _npy_path(self, chrom: str, strand: str) -> Path:
+        """The ``.npy`` the lookup uses: the first searched directory that has it.
+
+        Falls back to the ``cache_dir`` path, where a lazy build would write.
+        """
+        dirs = self._cache_dirs()
+        for directory in dirs:
+            npy = cache_paths(directory, chrom, strand)[0]
+            if npy.is_file():
+                return npy
+        return cache_paths(dirs[0], chrom, strand)[0]
+
+    def _cache_location(self, chrom: str, strand: str) -> Optional[Path]:
+        """The first searched directory holding both files of the strand's cache."""
+        for directory in self._cache_dirs():
+            npy_path, npz_path = cache_paths(directory, chrom, strand)
+            if npy_path.is_file() and npz_path.is_file():
+                return directory
+        return None
 
     def _open_cache(self, chrom: str, strand: str) -> _CachedProfile | None:
         """Memory-map the (chrom, strand) cache if both its files exist."""
-        cache_dir = self.cache_dir
-        if cache_dir is None:
+        directory = self._cache_location(chrom, strand)
+        if directory is None:
             return None
-        npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
-        if not (npy_path.is_file() and npz_path.is_file()):
-            return None
+        npy_path, npz_path = cache_paths(directory, chrom, strand)
         try:
             codes = np.load(npy_path, mmap_mode="r")
             with np.load(npz_path) as side:
@@ -1118,21 +1202,37 @@ class GenomeAccessibilityService:
         return _CachedProfile(codes, exc_index, exc_value)
 
     def _cached_from_disk(self, chrom: str, strand: str) -> _CachedProfile:
-        """Map the cache for (chrom, strand), building it from Parquet if absent."""
-        profile = self._open_cache(chrom, strand)
+        """Map the cache for (chrom, strand), building it from Parquet if needed.
+
+        Built when absent, and rebuilt (with a warning) when the cache found is
+        older than the contig's Parquet in ``data_dir`` (see `_cache_is_stale`).
+        The age check runs until the contig's cache is known current, so the
+        second strand and later re-mappings after LRU eviction skip it.
+        """
+        parquet = self._find_profile(chrom)
+        stale_in: Optional[Path] = None
+        if parquet is not None and chrom not in self._current:
+            found = self._cache_location(chrom, strand)
+            if found is not None and _cache_is_stale(found, chrom, parquet):
+                stale_in = found
+        profile = None if stale_in is not None else self._open_cache(chrom, strand)
         if profile is None:
-            parquet = self._find_profile(chrom)
             if parquet is None:
-                expected_npy = cache_paths(cast(Path, self.cache_dir), chrom, strand)[0]
+                searched = " or ".join(
+                    str(cache_paths(d, chrom, strand)[0]) for d in self._cache_dirs()
+                )
                 raise AccessibilityError(
                     f"Profile for {chrom} not found: neither the cache "
-                    f"{expected_npy} nor the Parquet "
+                    f"{searched} nor the Parquet "
                     f"{self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'} exists."
                 )
-            logger.info(
-                f"Accessibility cache for {chrom} missing in {self.cache_dir}; "
-                f"building it from {parquet}"
-            )
+            if stale_in is not None:
+                _warn_stale(chrom, stale_in, parquet)
+            else:
+                logger.info(
+                    f"Accessibility cache for {chrom} missing in {self.cache_dir}; "
+                    f"building it from {parquet}"
+                )
             try:
                 build_accessibility_cache(parquet, cast(Path, self.cache_dir))
             except OSError as e:
@@ -1147,6 +1247,8 @@ class GenomeAccessibilityService:
                     f"Accessibility cache for {chrom} {strand} still missing after "
                     f"building from {parquet}"
                 )
+        if parquet is not None:
+            self._current.add(chrom)
         if profile.n_pos == 0:
             raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
         return profile
@@ -1157,11 +1259,10 @@ class GenomeAccessibilityService:
 
         Returns the profile_key string.
 
-        In-memory frames and, without ``cache_dir``, on-disk Parquet are
-        materialised as a dense float32 array (the eager path); with
-        ``cache_dir`` on-disk profiles are memory-mapped from the uint8 cache,
-        built from the Parquet first if needed. Positions absent from the
-        source keep the default sentinel value of 25.5 kcal/mol in all cases.
+        In-memory frames are materialised as a dense float32 array; on-disk
+        profiles are memory-mapped from the uint8 cache, built from the Parquet
+        first if needed. Positions absent from the source keep the default
+        sentinel value of 25.5 kcal/mol in both cases.
 
         Complexity: O(1) amortized. Eviction drops the oldest cached profile
         (an array, or a mapping) when the cache exceeds max_cached slots.
@@ -1181,11 +1282,8 @@ class GenomeAccessibilityService:
                     f"Profile for {chrom} not found among the in-memory "
                     f"accessibility frames ({', '.join(sorted(self._frames)) or 'none'})."
                 )
-            if self.cache_dir is None:
-                profile, source = self._dense_from_parquet(chrom, strand)
-            else:
-                profile = self._cached_from_disk(chrom, strand)
-                source = str(cache_paths(self.cache_dir, chrom, strand)[0])
+            profile = self._cached_from_disk(chrom, strand)
+            source = str(self._npy_path(chrom, strand))
 
         self._profiles[profile_key] = profile
         logger.info(f"Loaded accessibility profile for {chrom} {strand} from {source}")
@@ -1202,8 +1300,8 @@ class GenomeAccessibilityService:
     def _strand_lengths(self, chrom: str) -> tuple[Optional[int], Optional[int]]:
         """``(plus, minus)`` profile lengths from the cheapest available source.
 
-        In-memory frames: a group-by on ``position``. Parquet: row-group
-        statistics (no data read). Cache: the ``.npy`` headers. Any failure
+        In-memory frames: a group-by on ``position``. Cache: the ``.npy``
+        headers, read from ``cache_dir`` first, then ``data_dir``. Any failure
         yields ``None`` for that strand: this feeds a warning only and must
         never break a lookup.
         """
@@ -1214,20 +1312,13 @@ class GenomeAccessibilityService:
                 )
                 lens = dict(zip(agg["strand"].to_list(), agg["position"].to_list()))
                 return lens.get("+"), lens.get("-")
-            if self.cache_dir is not None:
-                out: list[Optional[int]] = []
-                for strand in ("+", "-"):
-                    npy = cache_paths(self.cache_dir, chrom, strand)[0]
-                    out.append(
-                        int(np.load(npy, mmap_mode="r").shape[0])
-                        if npy.is_file()
-                        else None
-                    )
-                return out[0], out[1]
-            path = self._find_profile(chrom)
-            if path is None:
-                return None, None
-            return _layout_strand_lengths(_row_group_layout(pq.ParquetFile(path)))
+            out: list[Optional[int]] = []
+            for strand in ("+", "-"):
+                npy = self._npy_path(chrom, strand)
+                out.append(
+                    int(np.load(npy, mmap_mode="r").shape[0]) if npy.is_file() else None
+                )
+            return out[0], out[1]
         except Exception as exc:  # noqa: BLE001 - diagnostics only
             logger.debug(f"could not determine strand lengths for {chrom}: {exc}")
             return None, None
@@ -1329,183 +1420,3 @@ class GenomeAccessibilityService:
         return df.with_columns(
             pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
         )
-
-
-# ---------------------------------------------------------------------------
-# Streaming gather: one contig Parquet, read row group by row group.
-# ---------------------------------------------------------------------------
-_OUT_OF_BOUNDS_ENERGY = (
-    10.0  # the `np.full` default of annotate_opening_energy_vectorized
-)
-_MISSING_POSITION_ENERGY = 25.5  # the `np.full` default of _ensure_profile
-
-
-def _row_group_layout(pf: pq.ParquetFile) -> list[tuple[int, str, int, int, bool]]:
-    """Describe each row group as ``(index, strand, pos_min, pos_max, mixed)``.
-
-    Taken from the Parquet column statistics when they are present and the
-    row group holds a single strand (what ``_fold_full_chromosome`` writes);
-    otherwise the two key columns of that row group are read (cheap: ~5 B/row)
-    and a mixed-strand row group yields one entry per strand with
-    ``mixed=True`` so the reader masks rows by strand.
-    """
-    md = pf.metadata
-    names = pf.schema_arrow.names
-    i_pos = names.index("position")
-    i_strand = names.index("strand")
-    layout: list[tuple[int, str, int, int, bool]] = []
-    for rg in range(md.num_row_groups):
-        rgm = md.row_group(rg)
-        if rgm.num_rows == 0:
-            continue
-        ps = rgm.column(i_pos).statistics
-        ss = rgm.column(i_strand).statistics
-        if (
-            ps is not None
-            and ps.has_min_max
-            and ss is not None
-            and ss.has_min_max
-            and ss.min == ss.max
-        ):
-            strand = ss.min.decode() if isinstance(ss.min, bytes) else str(ss.min)
-            layout.append((rg, strand, int(ps.min), int(ps.max), False))
-            continue
-        tbl = pf.read_row_group(rg, columns=["position", "strand"])
-        pos = tbl.column("position").to_numpy()
-        strands = tbl.column("strand").to_numpy(zero_copy_only=False)
-        uniq = np.unique(strands)
-        for strand in uniq:
-            m = strands == strand if len(uniq) > 1 else slice(None)
-            p = pos[m]
-            layout.append((rg, str(strand), int(p.min()), int(p.max()), len(uniq) > 1))
-    return layout
-
-
-def gather_opening_energies(
-    parquet_path: Path,
-    strands: np.ndarray,
-    starts: np.ndarray,
-    ends: np.ndarray,
-) -> tuple[np.ndarray, dict]:
-    """Opening energies for hits on one contig, streamed from its Parquet file.
-
-    Bit-for-bit equivalent to ``annotate_opening_energy_vectorized`` restricted
-    to one contig, but never materialises the dense ``[max_pos, u]`` profile:
-    the needed positions are sorted, the row-group statistics select the row
-    groups that hold them, and each of those is read once with only the ``u``
-    columns the hits in it need (peak memory ~ one row group).
-
-    Parameters
-    ----------
-    parquet_path : pathlib.Path
-        ``{chrom}.accessibility.parquet`` written by ``sioff accessibility``.
-    strands : numpy.ndarray
-        ``'+'``/``'-'`` per hit (any array comparable to those strings).
-    starts, ends : numpy.ndarray
-        1-based inclusive RIsearch coordinates per hit.
-
-    Returns
-    -------
-    tuple[numpy.ndarray, dict]
-        ``energies`` (float32, one per hit, quantised to 0.1; 10.0 when out of
-        bounds or when the strand has no rows; 25.5 when the position is absent
-        from the file) and ``stats`` with ``row_groups_total``,
-        ``row_groups_read``, ``bytes_read`` (compressed column-chunk bytes
-        actually read) and ``bytes_file`` (all column chunks of the file).
-    """
-    pf = pq.ParquetFile(parquet_path)
-    md = pf.metadata
-    names = pf.schema_arrow.names
-    u_cols = sorted(
-        [c for c in names if c.startswith("u") and c[1:].isdigit()],
-        key=lambda x: int(x[1:]),
-    )
-    n_u = len(u_cols)
-    col_index = {c: names.index(c) for c in names}
-    layout = _row_group_layout(pf)
-    check_strand_lengths(
-        _chrom_of(parquet_path), *_layout_strand_lengths(layout), str(parquet_path)
-    )
-
-    stats = {
-        "row_groups_total": md.num_row_groups,
-        "row_groups_read": 0,
-        "bytes_read": 0,
-        "bytes_file": sum(
-            md.row_group(rg).column(c).total_compressed_size
-            for rg in range(md.num_row_groups)
-            for c in range(md.num_columns)
-        ),
-    }
-
-    starts = np.asarray(starts).astype(np.int64)
-    ends = np.asarray(ends).astype(np.int64)
-    strands = np.asarray(strands)
-    out = np.full(len(starts), _OUT_OF_BOUNDS_ENERGY, dtype=np.float32)
-
-    for strand in ("+", "-"):
-        sel = np.flatnonzero(strands == strand)
-        if sel.size == 0:
-            continue
-        rgs = [e for e in layout if e[1] == strand]
-        if not rgs:
-            # The eager path raises "No data for strand" and skips the group.
-            _warn_missing_strand(_chrom_of(parquet_path), strand)
-            continue
-        seq_len = max(e[3] for e in rgs)
-
-        # Same cells as annotate_opening_energy_vectorized.
-        row_idx, col_idx, in_bounds = site_cells(
-            strand, starts[sel], ends[sel], seq_len, n_u
-        )
-
-        ib = np.flatnonzero(in_bounds)
-        vals = np.full(ib.size, _MISSING_POSITION_ENERGY, dtype=np.float32)
-        want_pos = row_idx[ib] + 1  # back to the file's 1-based positions
-        want_col = col_idx[ib]
-        order = np.argsort(want_pos, kind="stable")
-        sorted_pos = want_pos[order]
-
-        for rg, _, pos_min, pos_max, mixed in rgs:
-            lo = int(np.searchsorted(sorted_pos, pos_min, side="left"))
-            hi = int(np.searchsorted(sorted_pos, pos_max, side="right"))
-            if lo == hi:
-                continue
-            sub = order[lo:hi]
-            cols_needed = np.unique(want_col[sub])
-            read_cols = ["position"] + (["strand"] if mixed else [])
-            read_cols += [u_cols[int(c)] for c in cols_needed]
-            tbl = pf.read_row_group(rg, columns=read_cols)
-            rgm = md.row_group(rg)
-            stats["row_groups_read"] += 1
-            stats["bytes_read"] += sum(
-                rgm.column(col_index[c]).total_compressed_size for c in read_cols
-            )
-
-            pos = tbl.column("position").to_numpy()
-            mask = None
-            if mixed:
-                mask = tbl.column("strand").to_numpy(zero_copy_only=False) == strand
-                pos = pos[mask]
-            reorder = None
-            if pos.size > 1 and not np.all(pos[1:] >= pos[:-1]):
-                reorder = np.argsort(pos, kind="stable")
-                pos = pos[reorder]
-
-            j = np.searchsorted(pos, sorted_pos[lo:hi], side="right") - 1
-            hit = (j >= 0) & (pos[np.maximum(j, 0)] == sorted_pos[lo:hi])
-            sub_cols = want_col[sub]
-            for c in cols_needed:
-                arr = tbl.column(u_cols[int(c)]).to_numpy()
-                if mask is not None:
-                    arr = arr[mask]
-                if reorder is not None:
-                    arr = arr[reorder]
-                m = hit & (sub_cols == c)
-                vals[sub[m]] = arr[j[m]]
-
-        # Quantize to 0.1 resolution (match legacy query_single behaviour)
-        vals = (np.round(vals * 10.0) / 10.0).astype(np.float32)
-        out[sel[ib]] = vals
-
-    return out, stats

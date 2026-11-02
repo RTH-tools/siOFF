@@ -20,7 +20,6 @@ class OffTargetsConfig:
     expression_metric: str = "RPKM"
     accessibility_dir: Optional[str] = None
     accessibility_cache_dir: Optional[str] = None
-    accessibility_strategy: str = "auto"
     output: Optional[str] = None
     fasta: Optional[str] = None
     window: int = 80

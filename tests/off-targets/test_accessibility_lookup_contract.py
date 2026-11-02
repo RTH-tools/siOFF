@@ -36,7 +36,6 @@ import pytest
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
     _fold_full_chromosome,
-    gather_opening_energies,
 )
 
 CHROM = "chrT"
@@ -69,10 +68,6 @@ def _annotate(service, hits):
     return out["opening_energy"].to_numpy()
 
 
-def _path_eager(pdir, ppath, cdir, hits):
-    return _annotate(GenomeAccessibilityService(pdir), hits)
-
-
 def _path_frames(pdir, ppath, cdir, hits):
     frames = {CHROM: pl.read_parquet(ppath)}
     return _annotate(GenomeAccessibilityService.from_frames(frames), hits)
@@ -83,29 +78,17 @@ def _path_memmap(pdir, ppath, cdir, hits):
 
 
 def _path_query_single(pdir, ppath, cdir, hits):
-    service = GenomeAccessibilityService(pdir)
+    service = GenomeAccessibilityService(pdir, cache_dir=cdir)
     return np.array(
         [service.query_single(CHROM, s, e, strand) for strand, s, e in hits],
         dtype=np.float32,
     )
 
 
-def _path_chrom_major(pdir, ppath, cdir, hits):
-    energies, _ = gather_opening_energies(
-        ppath,
-        np.array([h[0] for h in hits]),
-        np.array([h[1] for h in hits], dtype=np.int64),
-        np.array([h[2] for h in hits], dtype=np.int64),
-    )
-    return energies
-
-
 PATHS = {
-    "eager": _path_eager,
     "from_frames": _path_frames,
     "memmap": _path_memmap,
     "query_single": _path_query_single,
-    "chrom_major": _path_chrom_major,
 }
 
 

@@ -309,8 +309,7 @@ cache that `off-targets` memory-maps: `{chrom}_{plus,minus}.access.npy`
 holding exactly the few values a byte cannot (above 25.5 kcal/mol), so
 `off-targets -a` reads it with no conversion step. `--output-format parquet`
 writes one `{chrom}.accessibility.parquet` per chromosome instead (columns
-`position`, `strand`, `u1..u{u}`), for other tools or the `chrom-major`
-strategy.
+`position`, `strand`, `u1..u{u}`), for other tools.
 Each sequence is folded as given (`+`) and as its reverse complement (`-`).
 For a transcriptome FASTA, whose records are already in sense orientation,
 `--strand +` skips the reverse complement and halves the work; run
@@ -345,26 +344,19 @@ separated values, each combination adds a `P_off_target:...` column),
 config for reproducibility — [`example_yaml/off-targets.example.yaml`](example_yaml/off-targets.example.yaml)
 documents every option; run it with `sioff -c my-config.yaml`.
 
-#### Accessibility lookup strategy (large genomes)
+#### Accessibility cache
 
-`--accessibility-strategy` selects how the opening energies are read from
-`-a` in the directory (per-siRNA batch) mode. All three give identical results;
-an `-a` directory written with the default `--output-format npy` holds only the
-cache, so `auto` reads it with `memmap` and the two Parquet strategies refuse it:
-
-| Strategy | What it does | Memory | Writes |
-|----------|--------------|--------|--------|
-| `chrom-major` (`auto` on a Parquet directory) | Three passes: intersect every siRNA, stream each chromosome's Parquet **once** for the hits of all siRNAs, then score. | ~ one Parquet row group per worker | nothing (a temp dir under `TMPDIR`) |
-| `memmap` (`auto` on an npy directory) | Every worker memory-maps a uint8 `{chrom}_{plus,minus}.access.npy` cache (+ `.access.exceptions.npz` sidecar) per chromosome and strand: one shared page-cache copy. The cache is what `accessibility` writes by default; from Parquet it is built once in `--accessibility-cache-dir` (default: the accessibility dir). | the pages the hits touch; 7.5 GB per chr1 strand while building | the cache files (the only strategy that does) |
-| `eager` | The original loader: each worker reads whole chromosomes into dense float32 arrays. | 30 GB per chr1 strand **per worker** — small genomes only | nothing |
-
-`auto` is `memmap` when `-a` holds only the npy cache; on a Parquet directory it
-is `chrom-major` (also with `-j 1`), except that a single predictions file
-(`-r file`) has no chromosome-major path and uses the eager loader unless
-`memmap` is requested. `memmap` suits repeated runs against the
-same genome: the cache is reused across runs, may live on node-local disk
-(`--accessibility-cache-dir /scratch/acc_cache`), and a cache directory that is
-complete needs no Parquet at all (`-a` may then point at an empty directory).
+`off-targets` memory-maps the uint8 `{chrom}_{plus,minus}.access.npy` cache,
+so every worker shares one page-cache copy. `sioff accessibility` writes the
+cache by default. A Parquet `-a` gets it built on the first run, next to the
+Parquet or in `--accessibility-cache-dir` (for example node-local scratch, or
+when `-a` is read-only), and rebuilt (with a warning) once the Parquet is newer
+than it, as after re-folding into the same directory. The cache takes one byte
+per position and `u` on each strand, about 186 GB for hg38 at `-u 30`; use
+`--accessibility-cache-dir` to put it on a disk with room. A cache directory
+that holds a complete cache needs no Parquet in `-a`. `off-targets` stops
+with an error when neither `-a` nor `--accessibility-cache-dir` holds any
+profile, and when it cannot write the cache.
 A failed worker never passes silently: the successful siRNAs are written, then
 `off-targets` reports `N/M siRNAs failed ...; first error: ...` and exits 1.
 
@@ -421,8 +413,7 @@ Available on `sioff` itself, before any subcommand.
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
 | `-a / --accessibility-dir` | Directory of per-chromosome accessibility profiles from the `accessibility` command: the `.access.npy` cache (its default) or Parquet files |
-| `--accessibility-strategy` | `auto` (default; `memmap` on an npy directory), `chrom-major`, `memmap` or `eager` — see [Accessibility lookup strategy](#accessibility-lookup-strategy-large-genomes) |
-| `--accessibility-cache-dir` | `memmap` only: where the `.access.npy` cache is read from / built (default: the accessibility dir) |
+| `--accessibility-cache-dir` | Where the `.access.npy` cache is read from / built (default: the accessibility dir) |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
 | `--sense-only` | Keep only `+`-strand predictions (use it with profiles from `accessibility --strand +`) |

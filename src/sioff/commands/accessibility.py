@@ -89,7 +89,7 @@ def run(
 
     Folds every chromosome in the FASTA with ViennaRNA RNAplfold and writes
     its opening energies to the output directory. The default npy format is
-    the uint8 cache the memmap lookup strategy memory-maps: per chromosome and
+    the uint8 cache that off-targets memory-maps: per chromosome and
     strand a {chrom}_{plus,minus}.access.npy code matrix [position, u] plus an
     .access.exceptions.npz sidecar of the values a code cannot hold exactly.
     --output-format parquet writes one {chrom}.accessibility.parquet per

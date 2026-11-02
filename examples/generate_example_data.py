@@ -12,8 +12,8 @@ Files written (all under examples/data/):
     annotation.gtf       7 single-exon genes with RPKM expression values
     predictions.out      RIsearch2-format predictions of sirnas.fa vs genome.fa,
                          produced by the in-process RIsearch bindings
-    accessibility/       per-chromosome accessibility profiles from
-                         `sioff accessibility` (ViennaRNA RNAplfold)
+    accessibility/       the memory-mapped npy cache from `sioff accessibility`
+                         (ViennaRNA RNAplfold)
 
 Usage:
     python examples/generate_example_data.py
