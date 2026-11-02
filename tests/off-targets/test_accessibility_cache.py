@@ -14,6 +14,7 @@ materialises a dense float32 array, the very code the Parquet path ran before
 the cache became the only on-disk path.
 """
 
+import contextlib
 import os
 import shutil
 from pathlib import Path
@@ -243,6 +244,35 @@ def test_cache_in_profile_dir_is_found_with_another_cache_dir(
     assert not elsewhere.exists() or not any(elsewhere.iterdir())
 
 
+def test_cache_dir_is_read_before_the_profile_dir(
+    tmp_path: Path, parquet_dir: Path, eager
+) -> None:
+    """Both directories hold a complete cache: --accessibility-cache-dir wins."""
+    cache_dir = tmp_path / "cache"
+    ensure_accessibility_cache(parquet_dir, cache_dir)
+    other = tmp_path / "other_fold"
+    other.mkdir()
+    for chrom, frame in _synthetic_frames(seed=8).items():
+        frame.write_parquet(other / f"{chrom}.accessibility.parquet")
+    npy_only = tmp_path / "npy_only"
+    ensure_accessibility_cache(other, npy_only)
+    in_a, in_cache_dir = (cache_paths(d, "chrA", "+")[0] for d in (npy_only, cache_dir))
+    assert in_a.read_bytes() != in_cache_dir.read_bytes(), "the caches must differ"
+
+    _assert_same_answers(
+        eager, GenomeAccessibilityService(npy_only, cache_dir=cache_dir)
+    )
+
+
+def test_not_found_names_both_directories(tmp_path: Path) -> None:
+    profile_dir, cache_dir = tmp_path / "acc", tmp_path / "cache"
+    service = GenomeAccessibilityService(profile_dir, cache_dir=cache_dir)
+    with pytest.raises(AccessibilityError, match="chrQ") as exc_info:
+        service.query("chrQ", 0, 10, "+")
+    for directory in (cache_dir, profile_dir):
+        assert str(cache_paths(directory, "chrQ", "+")[0]) in str(exc_info.value)
+
+
 def test_service_builds_a_missing_cache_lazily(
     tmp_path: Path, parquet_dir: Path, eager
 ) -> None:
@@ -274,6 +304,107 @@ def test_npy_only_directory_works(tmp_path: Path, parquet_dir: Path, eager) -> N
     empty = tmp_path / "empty"
     empty.mkdir()
     _assert_same_answers(eager, GenomeAccessibilityService(empty, cache_dir=npy_only))
+
+
+# --- (v) a cache older than its Parquet is rebuilt -----------------------------
+
+
+@contextlib.contextmanager
+def _capture_warnings():
+    """WARNING messages logged in this process inside the block.
+
+    A CLI invocation resets loguru's handlers, so start capturing after it.
+    """
+    from loguru import logger
+
+    seen: list[str] = []
+    handler = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    try:
+        yield seen
+    finally:
+        logger.remove(handler)
+
+
+@pytest.fixture
+def warnings_seen():
+    with _capture_warnings() as seen:
+        yield seen
+
+
+def _stale_warnings(seen: list[str]) -> list[str]:
+    return [m for m in seen if "is older than" in m]
+
+
+def _refolded(frame: pl.DataFrame) -> pl.DataFrame:
+    """Another fold of the same contig: other values and only 20 u columns."""
+    u_cols = [f"u{u}" for u in range(1, 21)]
+    return frame.select("position", "strand", *[pl.col(c).reverse() for c in u_cols])
+
+
+def _rewrite_parquet(
+    parquet_dir: Path, cache_dir: Path, chrom: str, frame: pl.DataFrame
+) -> Path:
+    """Overwrite one contig's Parquet, dated after its cache like a later re-fold.
+
+    The mtime is set explicitly, 5 s past the cache's, so a coarse filesystem
+    clock cannot give the two the same timestamp. That is also ahead of this
+    machine's clock, as a Parquet written on a node whose clock runs fast.
+    """
+    path = parquet_dir / f"{chrom}.accessibility.parquet"
+    frame.write_parquet(path)
+    built = max(cache_paths(cache_dir, chrom, s)[0].stat().st_mtime_ns for s in "+-")
+    os.utime(path, ns=(built + 5_000_000_000, built + 5_000_000_000))
+    return path
+
+
+def test_ensure_rebuilds_a_cache_older_than_its_parquet(
+    parquet_dir: Path, frames, warnings_seen
+) -> None:
+    assert sorted(ensure_accessibility_cache(parquet_dir, parquet_dir)) == [
+        "chrA",
+        "chrB",
+    ]
+    refolded = _refolded(frames["chrA"])
+    parquet = _rewrite_parquet(parquet_dir, parquet_dir, "chrA", refolded)
+
+    assert ensure_accessibility_cache(parquet_dir, parquet_dir) == ["chrA"]
+    assert _stale_warnings(warnings_seen) == [
+        f"Accessibility cache for chrA in {parquet_dir} is older than {parquet}; "
+        "rebuilding it"
+    ]
+    assert np.load(cache_paths(parquet_dir, "chrA", "+")[0]).shape[1] == 20
+    # The rebuilt cache is dated no earlier than its Parquet, even though that
+    # lies ahead of the clock: nothing more to do on the next run.
+    assert ensure_accessibility_cache(parquet_dir, parquet_dir) == []
+    assert len(_stale_warnings(warnings_seen)) == 1
+
+    reference = GenomeAccessibilityService.from_frames(
+        {"chrA": refolded, "chrB": frames["chrB"]}
+    )
+    _assert_same_answers(reference, GenomeAccessibilityService(parquet_dir))
+
+
+@pytest.mark.parametrize(
+    "layout", ["next_to_parquet", "in_cache_dir", "next_to_parquet_with_cache_dir"]
+)
+def test_service_rebuilds_a_cache_older_than_its_parquet(
+    tmp_path: Path, parquet_dir: Path, frames, warnings_seen, layout: str
+) -> None:
+    """The lazy path (no ensure_accessibility_cache first) rebuilds it too."""
+    stale_dir = tmp_path / "cache" if layout == "in_cache_dir" else parquet_dir
+    ensure_accessibility_cache(parquet_dir, stale_dir)
+    cache_dir = parquet_dir if layout == "next_to_parquet" else tmp_path / "cache"
+    refolded = _refolded(frames["chrA"])
+    _rewrite_parquet(parquet_dir, stale_dir, "chrA", refolded)
+
+    service = GenomeAccessibilityService(parquet_dir, cache_dir=cache_dir)
+    reference = GenomeAccessibilityService.from_frames(
+        {"chrA": refolded, "chrB": frames["chrB"]}
+    )
+    _assert_same_answers(reference, service)
+    stale = _stale_warnings(warnings_seen)
+    assert len(stale) == 1 and "for chrA in" in stale[0], stale
+    assert np.load(cache_paths(cache_dir, "chrA", "-")[0]).shape[1] == 20
 
 
 # --- (iv) neither cache nor Parquet -> AccessibilityError ----------------------
@@ -500,3 +631,72 @@ def test_read_only_parquet_dir_without_cache_dir_is_reported(tmp_path, form):
                 list(out)
     finally:
         acc.chmod(0o755)
+
+
+KEYS = ["sirna_id", "chrom", "start", "end", "strand", "energy"]
+
+
+def _fold_to_parquet(out: Path, window: int, span: int, unpaired: int) -> None:
+    from typer.testing import CliRunner
+
+    from sioff.cli import app
+
+    result = CliRunner().invoke(
+        app,
+        [
+            "accessibility",
+            "-f",
+            str(GENOME),
+            "-o",
+            str(out),
+            "-W",
+            str(window),
+            "-L",
+            str(span),
+            "-u",
+            str(unpaired),
+            "--output-format",
+            "parquet",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+
+
+@pytest.mark.parametrize("form", ["single", "directory"])
+def test_refolding_a_parquet_dir_rebuilds_its_cache(tmp_path, form):
+    """Re-fold into the -a of an earlier run: the next run must not read the old cache."""
+    import sioff
+
+    acc = tmp_path / "acc"
+    source = PREDICTIONS if form == "single" else _in_dir(tmp_path, PREDICTIONS)
+
+    def run() -> pl.DataFrame:
+        out = sioff.off_targets(
+            risearch_file=source, accessibility_dir=acc, n_workers=1
+        )
+        return out if isinstance(out, pl.DataFrame) else pl.concat(list(out))
+
+    _fold_to_parquet(acc, 40, 20, 10)
+    first = run()
+    assert cache_paths(acc, "chr1", "+")[0].exists()
+
+    _fold_to_parquet(acc, 80, 40, 20)
+    parquet = acc / "chr1.accessibility.parquet"
+    built = max(cache_paths(acc, "chr1", s)[0].stat().st_mtime_ns for s in "+-")
+    if parquet.stat().st_mtime_ns <= built:  # coarse filesystem clock
+        os.utime(parquet, ns=(built + 5_000_000_000, built + 5_000_000_000))
+    with _capture_warnings() as seen:
+        second = run()
+
+    reference = sioff.off_targets(
+        risearch_file=PREDICTIONS, accessibility={"chr1": pl.read_parquet(parquet)}
+    )
+    _assert_looked_up(reference)
+    common = [c for c in second.columns if c in reference.columns]
+    ref = reference.select(common).sort(KEYS)
+    assert (first.sort(KEYS)["opening_energy"] != ref["opening_energy"]).any(), (
+        "the two folds must give different energies"
+    )
+    assert second.select(common).sort(KEYS).equals(ref)
+    stale = _stale_warnings(seen)
+    assert len(stale) == 1 and str(parquet) in stale[0], stale

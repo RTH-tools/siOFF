@@ -644,7 +644,10 @@ def build_accessibility_cache(
     A strand with no rows gets an empty ``(0, n_u)`` cache so the build stays
     idempotent, and queries on it raise like the eager path.
 
-    Files are written to a temporary name and renamed into place.
+    Files are written to a temporary name and renamed into place. Each
+    ``.npy`` is dated no earlier than the Parquet it was read from, so the
+    age check of `_cache_is_stale` holds even when the Parquet's mtime lies
+    ahead of this machine's clock.
 
     Returns
     -------
@@ -655,6 +658,8 @@ def build_accessibility_cache(
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     chrom = _chrom_of(parquet_path)
+    # Taken before reading: a Parquet rewritten mid-build stays newer.
+    folded = parquet_path.stat().st_mtime_ns
     pf = pq.ParquetFile(parquet_path)
     u_cols = _u_columns(pf.schema_arrow.names)
     if not u_cols:
@@ -669,14 +674,30 @@ def build_accessibility_cache(
         int(np.load(built["-"], mmap_mode="r").shape[0]),
         str(parquet_path),
     )
+    for npy_path in built.values():
+        _date_no_earlier_than(npy_path, folded)
     return built
+
+
+def _date_no_earlier_than(npy_path: Path, mtime_ns: int) -> None:
+    """Move a fresh cache file's mtime up to ``mtime_ns`` if it is earlier.
+
+    A Parquet written on a node whose clock runs ahead would otherwise make
+    the cache just built from it look stale, and every run rebuild it. Best
+    effort: if the time cannot be set, the next run rebuilds once more.
+    """
+    try:
+        if npy_path.stat().st_mtime_ns < mtime_ns:
+            os.utime(npy_path, ns=(mtime_ns, mtime_ns))
+    except OSError:
+        pass
 
 
 def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
     """Both files present and the ``.npy`` header is a 2-D uint8 array.
 
-    Only the header is checked (dtype, rank); the row count is not compared
-    with the Parquet, so a cache built from an older Parquet is trusted.
+    Only the header is checked (dtype, rank), never the content. Whether the
+    cache still matches its Parquet is `_cache_is_stale`'s question.
     """
     if not (npy_path.is_file() and npz_path.is_file()):
         return False
@@ -687,6 +708,36 @@ def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
     return arr.ndim == 2 and arr.dtype == np.uint8
 
 
+def _cache_is_stale(cache_dir: Path, chrom: str, parquet_path: Path) -> bool:
+    """Either strand's ``.npy`` in ``cache_dir`` is older than the contig's Parquet.
+
+    Re-folding into the same directory (new ``-W/-L/-u``, a corrected genome)
+    rewrites the Parquet but leaves the cache built from the old one, which
+    would otherwise keep answering. Only modification times are compared: a
+    Parquet copied without its mtime costs an unneeded rebuild, and one given
+    an mtime older than its cache goes unnoticed. A missing ``.npy`` is not
+    stale, it is missing (see `_cache_is_valid`).
+    """
+    try:
+        folded = parquet_path.stat().st_mtime_ns
+    except OSError:
+        return False
+    for strand in _STRAND_NAMES:
+        try:
+            if cache_paths(cache_dir, chrom, strand)[0].stat().st_mtime_ns < folded:
+                return True
+        except OSError:
+            continue
+    return False
+
+
+def _warn_stale(chrom: str, cache_dir: Path, parquet_path: Path) -> None:
+    logger.warning(
+        f"Accessibility cache for {chrom} in {cache_dir} is older than "
+        f"{parquet_path}; rebuilding it"
+    )
+
+
 def ensure_accessibility_cache(
     parquet_dir: Union[str, Path],
     cache_dir: Optional[Union[str, Path]] = None,
@@ -694,13 +745,15 @@ def ensure_accessibility_cache(
     workers: int = 1,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> list[str]:
-    """Build the uint8 cache for every Parquet contig that lacks one.
+    """Build the uint8 cache for every Parquet contig that lacks a current one.
 
     Meant to run once in the parent process before an off-target worker pool
-    starts, so workers only ever memory-map finished files. Contigs whose two
-    strand caches already exist and pass `_cache_is_valid` are skipped, which
-    makes repeated calls cheap. A directory without any Parquet (only
-    ``.npy`` caches) builds nothing.
+    starts, so workers only ever memory-map finished files. A contig is
+    skipped when both strand caches in ``cache_dir`` pass `_cache_is_valid`
+    and neither ``.npy`` is older than its Parquet, which makes repeated calls
+    cheap. A cache older than its Parquet (the directory was re-folded) is
+    rebuilt with a warning. A directory without any Parquet (only ``.npy``
+    caches) builds nothing.
 
     Parameters
     ----------
@@ -730,13 +783,14 @@ def ensure_accessibility_cache(
     if contigs is not None:
         wanted = set(contigs)
         files = [f for f in files if _chrom_of(f) in wanted]
-    missing = [
-        f
-        for f in files
-        if not all(
-            _cache_is_valid(*cache_paths(cache_dir, _chrom_of(f), s)) for s in "+-"
-        )
-    ]
+    missing: list[Path] = []
+    for f in files:
+        chrom = _chrom_of(f)
+        if not all(_cache_is_valid(*cache_paths(cache_dir, chrom, s)) for s in "+-"):
+            missing.append(f)
+        elif _cache_is_stale(cache_dir, chrom, f):
+            _warn_stale(chrom, cache_dir, f)
+            missing.append(f)
     if not missing:
         return []
     missing.sort(key=lambda f: f.stat().st_size, reverse=True)
@@ -857,11 +911,11 @@ class GenomeAccessibilityService:
     ``np.load(mmap_mode="r")``-ed so every process shares one page-cache copy
     and resident memory is only the pages it touches. The cache is looked up in
     ``cache_dir`` (default: ``data_dir``), then in ``data_dir``. A contig whose
-    cache is missing is built from its Parquet into ``cache_dir`` on first use
-    (batch runs build it up front with `ensure_accessibility_cache` so worker
-    processes only map finished files); a directory holding the complete cache
-    needs no Parquet at all. The LRU of ``max_cached`` slots bounds the number
-    of mappings loaded per process.
+    cache is missing, or older than its Parquet, is built from the Parquet
+    into ``cache_dir`` on first use (batch runs build it up front with
+    `ensure_accessibility_cache` so worker processes only map finished files);
+    a directory holding the complete cache needs no Parquet at all. The LRU of
+    ``max_cached`` slots bounds the number of mappings loaded per process.
 
     `from_frames()` builds a service over in-memory per-chromosome
     DataFrames instead (the ``dict[chrom -> DataFrame]`` that
@@ -890,6 +944,9 @@ class GenomeAccessibilityService:
         self._max_cached = max_cached
         self._profiles: OrderedDict[str, _Profile] = OrderedDict()
         self._strands_checked: set[str] = set()
+        # Contigs whose cache was found no older than their Parquet, or was
+        # (re)built here; `_cached_from_disk` does not compare mtimes again.
+        self._current: set[str] = set()
 
     def _require_dir(self) -> Path:
         """The Parquet directory; a frame-backed service has none."""
@@ -1098,14 +1155,20 @@ class GenomeAccessibilityService:
                 return npy
         return cache_paths(dirs[0], chrom, strand)[0]
 
-    def _open_cache(self, chrom: str, strand: str) -> _CachedProfile | None:
-        """Memory-map the (chrom, strand) cache if both its files exist."""
+    def _cache_location(self, chrom: str, strand: str) -> Optional[Path]:
+        """The first searched directory holding both files of the strand's cache."""
         for directory in self._cache_dirs():
             npy_path, npz_path = cache_paths(directory, chrom, strand)
             if npy_path.is_file() and npz_path.is_file():
-                break
-        else:
+                return directory
+        return None
+
+    def _open_cache(self, chrom: str, strand: str) -> _CachedProfile | None:
+        """Memory-map the (chrom, strand) cache if both its files exist."""
+        directory = self._cache_location(chrom, strand)
+        if directory is None:
             return None
+        npy_path, npz_path = cache_paths(directory, chrom, strand)
         try:
             codes = np.load(npy_path, mmap_mode="r")
             with np.load(npz_path) as side:
@@ -1125,10 +1188,21 @@ class GenomeAccessibilityService:
         return _CachedProfile(codes, exc_index, exc_value)
 
     def _cached_from_disk(self, chrom: str, strand: str) -> _CachedProfile:
-        """Map the cache for (chrom, strand), building it from Parquet if absent."""
-        profile = self._open_cache(chrom, strand)
+        """Map the cache for (chrom, strand), building it from Parquet if needed.
+
+        Built when absent, and rebuilt (with a warning) when the cache found is
+        older than the contig's Parquet in ``data_dir`` (see `_cache_is_stale`).
+        The age check runs until the contig's cache is known current, so the
+        second strand and later re-mappings after LRU eviction skip it.
+        """
+        parquet = self._find_profile(chrom)
+        stale_in: Optional[Path] = None
+        if parquet is not None and chrom not in self._current:
+            found = self._cache_location(chrom, strand)
+            if found is not None and _cache_is_stale(found, chrom, parquet):
+                stale_in = found
+        profile = None if stale_in is not None else self._open_cache(chrom, strand)
         if profile is None:
-            parquet = self._find_profile(chrom)
             if parquet is None:
                 searched = " or ".join(
                     str(cache_paths(d, chrom, strand)[0]) for d in self._cache_dirs()
@@ -1138,10 +1212,13 @@ class GenomeAccessibilityService:
                     f"{searched} nor the Parquet "
                     f"{self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'} exists."
                 )
-            logger.info(
-                f"Accessibility cache for {chrom} missing in {self.cache_dir}; "
-                f"building it from {parquet}"
-            )
+            if stale_in is not None:
+                _warn_stale(chrom, stale_in, parquet)
+            else:
+                logger.info(
+                    f"Accessibility cache for {chrom} missing in {self.cache_dir}; "
+                    f"building it from {parquet}"
+                )
             try:
                 build_accessibility_cache(parquet, cast(Path, self.cache_dir))
             except OSError as e:
@@ -1156,6 +1233,8 @@ class GenomeAccessibilityService:
                     f"Accessibility cache for {chrom} {strand} still missing after "
                     f"building from {parquet}"
                 )
+        if parquet is not None:
+            self._current.add(chrom)
         if profile.n_pos == 0:
             raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
         return profile
