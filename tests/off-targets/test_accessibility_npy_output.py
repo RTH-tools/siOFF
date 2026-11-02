@@ -146,3 +146,22 @@ def test_npy_and_parquet_directories_give_the_same_results(
         frames[0].select(common).sort(common).equals(single.select(common).sort(common))
     )
     assert sorted(f.name for f in npy_dir.iterdir()) == before
+
+
+def test_on_the_fly_fold_equals_precomputed_profiles(dirs) -> None:
+    import sioff
+
+    npy_dir = dirs[0]
+    on_the_fly = sioff.off_targets(
+        risearch_file=PREDICTIONS,
+        genome_file=GENOME,
+        window_size=40,
+        max_span=20,
+        unpaired_prob=10,
+    )
+    precomputed = sioff.off_targets(
+        risearch_file=PREDICTIONS, accessibility_dir=npy_dir
+    )
+    assert on_the_fly.sort(on_the_fly.columns).equals(
+        precomputed.sort(precomputed.columns)
+    )

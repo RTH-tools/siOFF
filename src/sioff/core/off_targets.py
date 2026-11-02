@@ -992,6 +992,7 @@ def compute_off_targets_single(
                 unpaired_prob=unpaired_prob,
                 progress_callback=accessibility_progress_callback,
                 temperature=temperature,
+                output_format="npy",
             )
             prob_service = ProbabilityService(acc_service, temperature=temperature)
             return _finish(prob_service, df)
