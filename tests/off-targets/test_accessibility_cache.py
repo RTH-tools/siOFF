@@ -31,7 +31,12 @@ from sioff.services.accessibility import (
     ensure_accessibility_cache,
 )
 
-PREDICTIONS = Path(__file__).parent / "data" / "risearch_genome_example.out"
+# The off_targets tests run on the example data (read-only; folds go to
+# tmp_path): a 6 kb genome whose hits lie inside it on both strands, so the
+# compared opening energies are looked up rather than the 10.0 default.
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "data"
+GENOME = EXAMPLES / "genome.fa"
+PREDICTIONS = EXAMPLES / "predictions.out"
 N_U = 30
 CONTIGS = {"chrA": 700, "chrB": 300}
 
@@ -332,12 +337,17 @@ def test_build_is_atomic(parquet_dir: Path) -> None:
 # --- the option reaches both public forms --------------------------------------
 
 
+def _assert_looked_up(df: pl.DataFrame) -> None:
+    """Guard: some opening energy is not the 10.0 out-of-bounds default."""
+    assert (df["opening_energy"] != 10.0).any(), "every hit fell back to 10.0"
+
+
 def _rounded_profiles() -> dict[str, pl.DataFrame]:
     """sioff.accessibility profiles rounded to 0.1, as the Parquet writer does."""
     import sioff
 
     profiles = sioff.accessibility(
-        Path(__file__).parent / "data" / "genome.fa",
+        GENOME,
         window_size=40,
         max_span=20,
         unpaired_prob=10,
@@ -362,13 +372,13 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     acc_dir.mkdir()
     for chrom, frame in profiles.items():
         frame.write_parquet(acc_dir / f"{chrom}.accessibility.parquet")
-    predictions = Path(__file__).parent / "data" / "risearch_genome_example.out"
 
-    from_frames = sioff.off_targets(risearch_file=predictions, accessibility=profiles)
+    from_frames = sioff.off_targets(risearch_file=PREDICTIONS, accessibility=profiles)
+    _assert_looked_up(from_frames)
 
     cache_dir = tmp_path / "cache"
     single = sioff.off_targets(
-        risearch_file=predictions,
+        risearch_file=PREDICTIONS,
         accessibility_dir=acc_dir,
         accessibility_cache_dir=cache_dir,
     )
@@ -380,7 +390,7 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     # Directory form: the cache is built up front, before the pool starts.
     in_dir = tmp_path / "in"
     in_dir.mkdir()
-    (in_dir / predictions.name).write_bytes(predictions.read_bytes())
+    (in_dir / PREDICTIONS.name).write_bytes(PREDICTIONS.read_bytes())
     cache_dir2 = tmp_path / "cache2"
     gen = sioff.off_targets(
         risearch_file=in_dir,
@@ -397,7 +407,7 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     assert batch.select(common).sort(common).equals(single.select(common).sort(common))
 
     # Default: no cache dir, so the cache is built next to the Parquet.
-    default = sioff.off_targets(risearch_file=predictions, accessibility_dir=acc_dir)
+    default = sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=acc_dir)
     assert isinstance(default, pl.DataFrame)
     assert default.sort(default.columns).equals(from_frames.sort(from_frames.columns))
     assert cache_paths(acc_dir, "chr1", "+")[0].exists()
@@ -458,6 +468,7 @@ def test_single_file_with_empty_dir_reads_a_complete_cache_dir(tmp_path):
         accessibility_cache_dir=cache,
     )
     ref = sioff.off_targets(risearch_file=PREDICTIONS, accessibility=profiles)
+    _assert_looked_up(ref)
     assert got.sort(got.columns).equals(ref.sort(ref.columns))
     assert not any(empty.iterdir())
 

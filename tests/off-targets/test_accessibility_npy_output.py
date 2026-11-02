@@ -1,9 +1,13 @@
-"""``sioff accessibility`` writes the memmap cache directly (``--output-format npy``).
+"""``sioff accessibility`` writes the uint8 cache directly (``--output-format npy``).
 
 The npy output must be the very files `build_accessibility_cache` makes from
-the Parquet of the same fold, so the ``memmap`` strategy answers the same
-whichever way the cache came about, and ``auto`` must pick ``memmap`` for a
-directory that holds only that cache.
+the Parquet of the same fold, so ``off-targets`` answers the same whichever way
+the cache came about: an npy-only ``-a``, a Parquet ``-a`` with its cache built
+on the first run, or a genome folded on the fly.
+
+The off-target comparisons run on the example data (6 kb genome, hits on both
+strands inside it), so the opening energies they compare are looked up, not the
+10.0 default every out-of-bounds hit gets.
 """
 
 from pathlib import Path
@@ -20,10 +24,25 @@ from sioff.services.accessibility import (
     cache_paths,
 )
 
-DATA = Path(__file__).parent / "data"
-GENOME = DATA / "genome.fa"
-PREDICTIONS = DATA / "risearch_genome_example.out"
-FOLD = ["-W", "40", "-L", "20", "-u", "10"]
+# Read-only: folds and caches go to tmp_path.
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "data"
+GENOME = EXAMPLES / "genome.fa"
+PREDICTIONS = EXAMPLES / "predictions.out"
+# One set of fold parameters for the CLI folds and the on-the-fly fold.
+FOLD_KW = {"window_size": 40, "max_span": 20, "unpaired_prob": 10}
+FOLD = [
+    "-W",
+    str(FOLD_KW["window_size"]),
+    "-L",
+    str(FOLD_KW["max_span"]),
+    "-u",
+    str(FOLD_KW["unpaired_prob"]),
+]
+
+
+def _assert_looked_up(df: pl.DataFrame) -> None:
+    """Guard: some opening energy is not the 10.0 out-of-bounds default."""
+    assert (df["opening_energy"] != 10.0).any(), "every hit fell back to 10.0"
 
 
 def _assert_same_cache(a: Path, b: Path, chroms) -> None:
@@ -132,6 +151,7 @@ def test_npy_and_parquet_directories_give_the_same_results(
     )
     single = sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=npy_dir)
     assert isinstance(reference, pl.DataFrame) and isinstance(single, pl.DataFrame)
+    _assert_looked_up(reference)
     assert single.sort(single.columns).equals(reference.sort(reference.columns))
 
     in_dir = tmp_path / "in"
@@ -153,15 +173,12 @@ def test_on_the_fly_fold_equals_precomputed_profiles(dirs) -> None:
 
     npy_dir = dirs[0]
     on_the_fly = sioff.off_targets(
-        risearch_file=PREDICTIONS,
-        genome_file=GENOME,
-        window_size=40,
-        max_span=20,
-        unpaired_prob=10,
+        risearch_file=PREDICTIONS, genome_file=GENOME, **FOLD_KW
     )
     precomputed = sioff.off_targets(
         risearch_file=PREDICTIONS, accessibility_dir=npy_dir
     )
+    _assert_looked_up(precomputed)
     assert on_the_fly.sort(on_the_fly.columns).equals(
         precomputed.sort(precomputed.columns)
     )
