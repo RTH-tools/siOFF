@@ -4,7 +4,7 @@ import multiprocessing
 import os
 from collections import OrderedDict, defaultdict
 from collections.abc import Iterable, Sequence
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Union, cast
 
@@ -431,14 +431,17 @@ def has_profiles(directory: Union[str, Path]) -> bool:
     Returns
     -------
     bool
-        True when it holds a ``*.access.npy`` cache file or a
-        ``*.accessibility.parquet`` file; False otherwise, including when the
+        True when it holds a ``*.packed.npy`` or ``*.access.npy`` cache file or
+        a ``*.accessibility.parquet`` file; False otherwise, including when the
         directory does not exist.
     """
     d = Path(directory)
     if not d.is_dir():
         return False
-    return any(d.glob(f"*{CACHE_SUFFIX}")) or any(d.glob(f"*{PARQUET_SUFFIX}"))
+    return any(
+        any(d.glob(f"*{suffix}"))
+        for suffix in (PACKED_SUFFIX, CACHE_SUFFIX, PARQUET_SUFFIX)
+    )
 
 
 def _chrom_of(parquet_path: Path) -> str:
@@ -679,6 +682,10 @@ def build_accessibility_cache(
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> dict[str, Path]:
     """Re-encode one contig's Parquet into the per-strand uint8 cache files.
+
+    This is the v0.2.0 per-record layout, kept as the reference the packed
+    cache (`pack_parquet_profiles`) is tested against; the pipeline itself
+    packs a Parquet directory with `ensure_accessibility_cache`.
 
     Streams the Parquet by row group (never more than ``batch_rows`` rows in
     flight) into a preallocated ``uint8[max_position, n_u]`` per strand, so
@@ -998,103 +1005,125 @@ def _warn_stale(chrom: str, cache_dir: Path, parquet_path: Path) -> None:
     )
 
 
+def _pack_is_current(pack_dir: Path, parquet_files: list[Path]) -> bool:
+    """Every packed pair in ``pack_dir`` was built from exactly these Parquet files.
+
+    For each strand that has any packed file, all three must hold: both files
+    are present and pass the header checks, the ``.npz`` ``names`` equal the
+    records of ``parquet_files`` (in the order given, the packer's sorted
+    file-name order), and the ``.npy`` is no older than the newest Parquet. A
+    directory with no packed file is not current. Content is never read, only
+    the ``names`` list, so this stays cheap on a genome-sized pack.
+    """
+    want = [_chrom_of(f) for f in parquet_files]
+    try:
+        newest = max(f.stat().st_mtime_ns for f in parquet_files)
+    except (OSError, ValueError):
+        return False
+    found = False
+    for strand in _STRAND_NAMES:
+        npy_path, npz_path = packed_paths(pack_dir, strand)
+        if not (npy_path.exists() or npz_path.exists()):
+            continue
+        found = True
+        if not _cache_is_valid(npy_path, npz_path):
+            return False
+        try:
+            with np.load(npz_path) as side:
+                names = np.asarray(side["names"]).tolist()
+            if names != want or npy_path.stat().st_mtime_ns < newest:
+                return False
+        except (OSError, ValueError, KeyError):
+            return False
+    return found
+
+
 def ensure_accessibility_cache(
     parquet_dir: Union[str, Path],
     cache_dir: Optional[Union[str, Path]] = None,
-    contigs: Optional[Iterable[str]] = None,
     workers: int = 1,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> list[str]:
-    """Build the uint8 cache for every Parquet contig that lacks a current one.
+    """Pack a directory of Parquet profiles into the memory-mapped cache.
 
     Meant to run once in the parent process before an off-target worker pool
-    starts, so workers only ever memory-map finished files. A contig is
-    skipped when both strand caches in ``cache_dir`` pass `_cache_is_valid`
-    and neither ``.npy`` is older than its Parquet, which makes repeated calls
-    cheap. A cache older than its Parquet (the directory was re-folded) is
-    rebuilt with a warning. A directory without any Parquet (only ``.npy``
-    caches) builds nothing.
+    starts, so workers only ever memory-map finished files. In order:
+
+    1. A directory without Parquet (only caches) packs nothing.
+    2. A packed pair in ``cache_dir`` or ``parquet_dir`` (searched in that
+       order, the first one holding any packed file) that was built from
+       exactly these Parquet files, and is no older than the newest of them,
+       is kept.
+    3. With no pack, and a valid, current per-record cache (the v0.2.0 layout
+       of `build_accessibility_cache`) in ``cache_dir`` for every Parquet
+       contig, that cache is reused and nothing is packed, so a genome-sized
+       cache is never duplicated.
+    4. Otherwise `pack_parquet_profiles` packs every Parquet, in sorted
+       file-name order. A pack that existed but no longer matches its Parquet
+       (the directory was re-folded, or a record was added or removed) is
+       rebuilt with a warning.
 
     Parameters
     ----------
     parquet_dir : str or pathlib.Path
         Directory of ``<chrom>.accessibility.parquet`` files.
     cache_dir : str or pathlib.Path, optional
-        Where the ``.npy``/``.npz`` files go; created if missing. Defaults to
+        Where the packed files go; created if missing. Defaults to
         ``parquet_dir``.
-    contigs : iterable of str, optional
-        Restrict the build to these contig names; default all Parquet present.
     workers : int, default 1
-        Contigs built in parallel: ``min(workers, 4)`` spawned processes, each
-        holding one strand's cache (chr1: 7.5 GB) at its peak.
+        Processes filling the packed matrix: ``min(workers, 4)``.
     batch_rows : int, default 1_000_000
         Rows decoded per Parquet batch while streaming.
 
     Returns
     -------
     list[str]
-        Names of the contigs that were (re)built, largest file first.
+        Names of the records that were packed, in pack order; empty when
+        nothing had to be built.
 
     Raises
     ------
     AccessibilityError
-        When a contig's cache cannot be built, naming its Parquet; the
-        original exception (an ``OSError`` for an unwritable ``cache_dir``)
-        is its ``__cause__``.
+        When the profiles cannot be packed; the original exception (an
+        ``OSError`` for an unwritable ``cache_dir``) is its ``__cause__``.
     OSError
         When ``cache_dir`` cannot be created.
     """
     parquet_dir = Path(parquet_dir)
     cache_dir = Path(cache_dir) if cache_dir is not None else parquet_dir
+    files = sorted(parquet_dir.glob(f"*{PARQUET_SUFFIX}"))
+    if not files:
+        return []
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(parquet_dir.glob(f"*{PARQUET_SUFFIX}"))
-    if contigs is not None:
-        wanted = set(contigs)
-        files = [f for f in files if _chrom_of(f) in wanted]
-    missing: list[Path] = []
-    for f in files:
-        chrom = _chrom_of(f)
-        if not all(_cache_is_valid(*cache_paths(cache_dir, chrom, s)) for s in "+-"):
-            missing.append(f)
-        elif _cache_is_stale(cache_dir, chrom, f):
-            _warn_stale(chrom, cache_dir, f)
-            missing.append(f)
-    if not missing:
+    stale_in: Optional[Path] = None
+    for directory in dict.fromkeys((cache_dir, parquet_dir)):
+        if any(p.exists() for s in _STRAND_NAMES for p in packed_paths(directory, s)):
+            if _pack_is_current(directory, files):
+                return []
+            stale_in = directory
+            break
+    if stale_in is None and all(
+        all(_cache_is_valid(*cache_paths(cache_dir, _chrom_of(f), s)) for s in "+-")
+        and not _cache_is_stale(cache_dir, _chrom_of(f), f)
+        for f in files
+    ):
         return []
-    missing.sort(key=lambda f: f.stat().st_size, reverse=True)
-    names = [_chrom_of(f) for f in missing]
-
-    n_proc = max(1, min(workers, 4, len(missing)))
+    if stale_in is not None:
+        logger.warning(
+            f"Packed accessibility cache in {stale_in} does not match the "
+            f"Parquet profiles in {parquet_dir}; rebuilding it"
+        )
     logger.info(
-        f"Building accessibility cache for {len(missing)} contig(s) in {cache_dir} "
-        f"with {n_proc} process(es)"
+        f"Packing {len(files)} accessibility profile(s) into {cache_dir} "
+        f"with {max(1, min(workers, 4))} process(es)"
     )
-    if n_proc == 1:
-        for f in missing:
-            try:
-                build_accessibility_cache(f, cache_dir, batch_rows)
-            except Exception as e:
-                raise AccessibilityError(
-                    f"Failed to build accessibility cache for {f.name}: {e}"
-                ) from e
-        return names
-
-    # spawn: a fresh interpreter per worker avoids fork + Arrow thread-pool deadlocks.
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=n_proc, mp_context=ctx) as pool:
-        futures = {
-            pool.submit(build_accessibility_cache, f, cache_dir, batch_rows): f
-            for f in missing
-        }
-        for fut in as_completed(futures):
-            try:
-                fut.result()
-            except Exception as e:
-                raise AccessibilityError(
-                    f"Failed to build accessibility cache for {futures[fut].name}: {e}"
-                ) from e
-    return names
+    try:
+        return pack_parquet_profiles(parquet_dir, cache_dir, workers, batch_rows)
+    except Exception as e:
+        raise AccessibilityError(
+            f"Failed to pack accessibility profiles from {parquet_dir}: {e}"
+        ) from e
 
 
 _UNRESOLVED = object()
@@ -1271,17 +1300,21 @@ class GenomeAccessibilityService:
     Service to pre-compute and query genomic accessibility profiles.
 
     Profiles are stored as per-chromosome Parquet files produced by
-    compute_genome_accessibility() in ``data_dir`` and served from the uint8
-    cache described at `build_accessibility_cache`: one
-    ``<chrom>_<plus|minus>.access.npy`` per strand plus an exceptions sidecar,
-    ``np.load(mmap_mode="r")``-ed so every process shares one page-cache copy
-    and resident memory is only the pages it touches. The cache is looked up in
-    ``cache_dir`` (default: ``data_dir``), then in ``data_dir``. A contig whose
-    cache is missing, or older than its Parquet, is built from the Parquet
-    into ``cache_dir`` on first use (batch runs build it up front with
+    compute_genome_accessibility() in ``data_dir`` and served from a uint8
+    cache, ``np.load(mmap_mode="r")``-ed so every process shares one page-cache
+    copy and resident memory is only the pages it touches. The cache is the
+    packed pair of `pack_parquet_profiles` (one ``.packed.npy`` plus index
+    ``.packed.npz`` per strand, every record in it), or, for a directory
+    written by v0.2.0, the per-record files of `build_accessibility_cache`. It
+    is looked up in ``cache_dir`` (default: ``data_dir``), then in ``data_dir``,
+    and a pack is preferred over per-record files. A pack that does not match
+    the Parquet in ``data_dir`` (a different set of records, or a Parquet newer
+    than the pack) is rebuilt on first use, as is a contig whose per-record
+    cache is missing or older than its Parquet (batch runs pack up front with
     `ensure_accessibility_cache` so worker processes only map finished files);
     a directory holding the complete cache needs no Parquet at all. The LRU of
-    ``max_cached`` slots bounds the number of mappings loaded per process.
+    ``max_cached`` slots bounds the number of per-record mappings loaded per
+    process.
 
     `from_frames()` builds a service over in-memory per-chromosome
     DataFrames instead (the ``dict[chrom -> DataFrame]`` that
@@ -1318,25 +1351,56 @@ class GenomeAccessibilityService:
         self._packed_root: object = _UNRESOLVED
         self._packed_strands: dict[str, Optional[_PackedStrand]] = {}
 
+    def _reset_packed(self) -> None:
+        """Forget the resolved pack directory and every loaded strand.
+
+        Called after a lazy (re)pack: keeping a cached ``None`` strand or a
+        memory map of the replaced file would go on serving the old answer.
+        """
+        self._packed_root = _UNRESOLVED
+        self._packed_strands = {}
+
     def _packed_dir(self) -> Optional[Path]:
-        """The first searched directory holding a packed cache pair, or ``None``."""
+        """The first searched directory holding packed files, or ``None``.
+
+        When ``data_dir`` holds Parquet the pack must match it (see
+        `_pack_is_current`), checked once per process; one that does not is
+        ignored, so the next lookup goes through `_cached_from_disk`, which
+        repacks it.
+        """
         if self._packed_root is _UNRESOLVED:
             root: Optional[Path] = None
             for directory in self._cache_dirs():
-                if any(packed_paths(directory, s)[0].is_file() for s in "+-"):
+                if any(
+                    p.is_file()
+                    for s in _STRAND_NAMES
+                    for p in packed_paths(directory, s)
+                ):
                     root = directory
                     break
+            if root is not None and self.data_dir is not None:
+                files = sorted(self.data_dir.glob(f"*{PARQUET_SUFFIX}"))
+                if files and not _pack_is_current(root, files):
+                    logger.info(
+                        f"Packed accessibility cache in {root} does not match the "
+                        f"Parquet profiles in {self.data_dir}; not using it"
+                    )
+                    root = None
             if root is not None:
                 logger.info(f"Using the packed accessibility cache in {root}")
             self._packed_root = root
         return cast(Optional[Path], self._packed_root)
 
     def _packed_strand(self, strand: str) -> Optional[_PackedStrand]:
-        """The packed cache of one strand, loaded once; ``None`` if it has none."""
+        """The packed cache of one strand, loaded once; ``None`` if it has none.
+
+        A pair with only one of its two files (an interrupted pack) is corrupt,
+        not missing.
+        """
         if strand not in self._packed_strands:
             root = self._packed_dir()
             loaded = None
-            if root is not None and all(
+            if root is not None and any(
                 p.is_file() for p in packed_paths(root, strand)
             ):
                 loaded = _load_packed_strand(root, strand)
@@ -1583,10 +1647,12 @@ class GenomeAccessibilityService:
         return _CachedProfile(codes, exc_index, exc_value)
 
     def _cached_from_disk(self, chrom: str, strand: str) -> _CachedProfile:
-        """Map the cache for (chrom, strand), building it from Parquet if needed.
+        """Map the per-record cache for (chrom, strand), packing it if needed.
 
-        Built when absent, and rebuilt (with a warning) when the cache found is
-        older than the contig's Parquet in ``data_dir`` (see `_cache_is_stale`).
+        Reached when no current pack exists. A missing cache, or one older than
+        the contig's Parquet in ``data_dir`` (see `_cache_is_stale`, warned
+        about), makes `ensure_accessibility_cache` pack the Parquet directory;
+        the contig is then served from the pack.
         The age check runs until the contig's cache is known current, so the
         second strand and later re-mappings after LRU eviction skip it.
         """
@@ -1612,16 +1678,26 @@ class GenomeAccessibilityService:
             else:
                 logger.info(
                     f"Accessibility cache for {chrom} missing in {self.cache_dir}; "
-                    f"building it from {parquet}"
+                    f"packing the profiles in {self.data_dir}"
                 )
             try:
-                build_accessibility_cache(parquet, cast(Path, self.cache_dir))
-            except OSError as e:
+                ensure_accessibility_cache(
+                    cast(Path, self.data_dir), cast(Path, self.cache_dir)
+                )
+            except (AccessibilityError, OSError) as e:
+                cause = e.__cause__ if isinstance(e, AccessibilityError) else e
+                if not isinstance(cause, OSError):
+                    raise
                 raise AccessibilityError(
                     f"Cannot write the accessibility cache for {chrom} to "
-                    f"{self.cache_dir}: {e}. Pass a writable cache directory "
+                    f"{self.cache_dir}: {cause}. Pass a writable cache directory "
                     "(--accessibility-cache-dir)."
-                ) from e
+                ) from cause
+            self._reset_packed()
+            packed_root = self._packed_dir()
+            if packed_root is not None:
+                self._current.add(chrom)
+                return self._packed_profile(chrom, strand, packed_root)[0]
             profile = self._open_cache(chrom, strand)
             if profile is None:
                 raise AccessibilityError(
@@ -1687,7 +1763,12 @@ class GenomeAccessibilityService:
                 profile, source = self._packed_profile(chrom, strand, packed_root)
             else:
                 profile = self._cached_from_disk(chrom, strand)
-                source = str(self._npy_path(chrom, strand))
+                packed_root = self._packed_dir()
+                source = str(
+                    packed_paths(packed_root, strand)[0]
+                    if packed_root is not None
+                    else self._npy_path(chrom, strand)
+                )
 
         self._profiles[profile_key] = profile
         logger.info(f"Loaded accessibility profile for {chrom} {strand} from {source}")

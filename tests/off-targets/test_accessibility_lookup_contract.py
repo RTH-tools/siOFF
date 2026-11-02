@@ -88,7 +88,11 @@ def _path_query_single(pdir, ppath, cdir, hits):
 
 def _path_packed(pdir, ppath, cdir, hits):
     pack_parquet_profiles(pdir, cdir / "packed")
-    return _annotate(GenomeAccessibilityService(pdir, cache_dir=cdir / "packed"), hits)
+    service = GenomeAccessibilityService(pdir, cache_dir=cdir / "packed")
+    # The service must really read the pack, not repack or fall back to per-record.
+    assert service._packed_dir() == cdir / "packed"
+    assert service._packed_strand("+") is not None
+    return _annotate(service, hits)
 
 
 PATHS = {

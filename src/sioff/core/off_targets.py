@@ -86,7 +86,7 @@ def _prepare_accessibility_cache(
     accessibility_cache_dir : pathlib.Path, optional
         Where the cache lives; defaults to ``accessibility_dir``.
     workers : int
-        Processes used to build missing contigs.
+        Processes used to pack the profiles.
 
     Returns
     -------
@@ -135,7 +135,7 @@ def _prepare_accessibility_cache(
         ) from write_error
     if built:
         logger.info(
-            f"[accessibility] built accessibility cache for {len(built)} contig(s) "
+            f"[accessibility] packed accessibility cache for {len(built)} record(s) "
             f"in {cache_dir} in {time.perf_counter() - t0:.1f}s"
         )
     else:

@@ -28,8 +28,10 @@ import pytest
 from sioff.services.accessibility import (
     AccessibilityError,
     GenomeAccessibilityService,
+    build_accessibility_cache,
     cache_paths,
     ensure_accessibility_cache,
+    packed_paths,
 )
 
 # The off_targets tests run on the example data (read-only; folds go to
@@ -177,9 +179,27 @@ def _assert_same_answers(
 
 
 def test_cache_build_equals_eager_array(parquet_dir: Path, eager) -> None:
+    """The per-record layout (`build_accessibility_cache`, the reference) and the
+    packed pair hold the eager array, re-encoded."""
     built = ensure_accessibility_cache(parquet_dir, parquet_dir, workers=2)
-    assert sorted(built) == ["chrA", "chrB"]
+    assert built == ["chrA", "chrB"]
+    for strand in "+-":
+        codes = np.load(packed_paths(parquet_dir, strand)[0], mmap_mode="r")
+        assert codes.dtype == np.uint8 and codes.shape == (sum(CONTIGS.values()), N_U)
+        expected = np.concatenate(
+            [
+                np.clip(
+                    np.round(eager.query(chrom, 0, n_pos, strand) * 10.0), 0, 255
+                ).astype(np.uint8)
+                for chrom, n_pos in CONTIGS.items()
+            ]
+        )
+        np.testing.assert_array_equal(np.asarray(codes), expected)
 
+    for chrom in CONTIGS:
+        build_accessibility_cache(
+            parquet_dir / f"{chrom}.accessibility.parquet", parquet_dir
+        )
     for chrom, n_pos in CONTIGS.items():
         for strand in "+-":
             npy, exceptions = cache_paths(parquet_dir, chrom, strand)
@@ -199,18 +219,12 @@ def test_cache_build_equals_eager_array(parquet_dir: Path, eager) -> None:
             )
 
 
-def test_cache_build_is_idempotent_and_can_be_restricted(parquet_dir: Path) -> None:
-    assert ensure_accessibility_cache(parquet_dir, parquet_dir, contigs=["chrB"]) == [
-        "chrB"
-    ]
-    npy_b, _ = cache_paths(parquet_dir, "chrB", "+")
-    npy_a, _ = cache_paths(parquet_dir, "chrA", "+")
-    assert npy_b.exists() and not npy_a.exists()
-    before = npy_b.stat().st_mtime_ns
-
-    assert sorted(ensure_accessibility_cache(parquet_dir, parquet_dir)) == ["chrA"]
+def test_cache_build_is_idempotent(parquet_dir: Path) -> None:
+    assert ensure_accessibility_cache(parquet_dir, parquet_dir) == ["chrA", "chrB"]
+    npy, _ = packed_paths(parquet_dir, "+")
+    before = npy.stat().st_mtime_ns
     assert ensure_accessibility_cache(parquet_dir, parquet_dir) == []
-    assert npy_b.stat().st_mtime_ns == before
+    assert npy.stat().st_mtime_ns == before
 
 
 # --- (ii) lookups through the memmap equal the eager path ----------------------
@@ -225,7 +239,7 @@ def test_memmap_service_matches_eager(parquet_dir: Path, eager) -> None:
 def test_default_cache_dir_is_the_profile_dir(parquet_dir: Path, eager) -> None:
     """With no cache_dir the service builds and reads the cache next to the Parquet."""
     _assert_same_answers(eager, GenomeAccessibilityService(parquet_dir))
-    assert cache_paths(parquet_dir, "chrA", "-")[0].exists()
+    assert packed_paths(parquet_dir, "-")[0].exists()
 
 
 def test_cache_in_profile_dir_is_found_with_another_cache_dir(
@@ -256,7 +270,7 @@ def test_cache_dir_is_read_before_the_profile_dir(
         frame.write_parquet(other / f"{chrom}.accessibility.parquet")
     npy_only = tmp_path / "npy_only"
     ensure_accessibility_cache(other, npy_only)
-    in_a, in_cache_dir = (cache_paths(d, "chrA", "+")[0] for d in (npy_only, cache_dir))
+    in_a, in_cache_dir = (packed_paths(d, "+")[0] for d in (npy_only, cache_dir))
     assert in_a.read_bytes() != in_cache_dir.read_bytes(), "the caches must differ"
 
     _assert_same_answers(
@@ -280,7 +294,7 @@ def test_service_builds_a_missing_cache_lazily(
     assert not cache_dir.exists()
     cached = GenomeAccessibilityService(parquet_dir, cache_dir=cache_dir)
     _assert_same_answers(eager, cached)
-    assert cache_paths(cache_dir, "chrA", "-")[0].exists()
+    assert packed_paths(cache_dir, "-")[0].exists()
     assert not list(parquet_dir.glob("*.npy")), "cache written next to the Parquet"
 
 
@@ -292,7 +306,7 @@ def test_npy_only_directory_works(tmp_path: Path, parquet_dir: Path, eager) -> N
     npy_only = tmp_path / "npy_only"
     npy_only.mkdir()
     for f in parquet_dir.iterdir():
-        if ".access." in f.name:
+        if ".packed." in f.name:
             shutil.copy(f, npy_only / f.name)
     assert not list(npy_only.glob("*.parquet"))
 
@@ -332,7 +346,7 @@ def warnings_seen():
 
 
 def _stale_warnings(seen: list[str]) -> list[str]:
-    return [m for m in seen if "is older than" in m]
+    return [m for m in seen if "does not match the Parquet profiles" in m]
 
 
 def _refolded(frame: pl.DataFrame) -> pl.DataFrame:
@@ -344,15 +358,15 @@ def _refolded(frame: pl.DataFrame) -> pl.DataFrame:
 def _rewrite_parquet(
     parquet_dir: Path, cache_dir: Path, chrom: str, frame: pl.DataFrame
 ) -> Path:
-    """Overwrite one contig's Parquet, dated after its cache like a later re-fold.
+    """Overwrite one contig's Parquet, dated after its pack like a later re-fold.
 
-    The mtime is set explicitly, 5 s past the cache's, so a coarse filesystem
+    The mtime is set explicitly, 5 s past the pack's, so a coarse filesystem
     clock cannot give the two the same timestamp. That is also ahead of this
     machine's clock, as a Parquet written on a node whose clock runs fast.
     """
     path = parquet_dir / f"{chrom}.accessibility.parquet"
     frame.write_parquet(path)
-    built = max(cache_paths(cache_dir, chrom, s)[0].stat().st_mtime_ns for s in "+-")
+    built = max(packed_paths(cache_dir, s)[0].stat().st_mtime_ns for s in "+-")
     os.utime(path, ns=(built + 5_000_000_000, built + 5_000_000_000))
     return path
 
@@ -360,27 +374,23 @@ def _rewrite_parquet(
 def test_ensure_rebuilds_a_cache_older_than_its_parquet(
     parquet_dir: Path, frames, warnings_seen
 ) -> None:
-    assert sorted(ensure_accessibility_cache(parquet_dir, parquet_dir)) == [
-        "chrA",
-        "chrB",
-    ]
-    refolded = _refolded(frames["chrA"])
-    parquet = _rewrite_parquet(parquet_dir, parquet_dir, "chrA", refolded)
+    assert ensure_accessibility_cache(parquet_dir, parquet_dir) == ["chrA", "chrB"]
+    refolded = {c: _refolded(f) for c, f in frames.items()}
+    for chrom, frame in refolded.items():
+        _rewrite_parquet(parquet_dir, parquet_dir, chrom, frame)
 
-    assert ensure_accessibility_cache(parquet_dir, parquet_dir) == ["chrA"]
+    assert ensure_accessibility_cache(parquet_dir, parquet_dir) == ["chrA", "chrB"]
     assert _stale_warnings(warnings_seen) == [
-        f"Accessibility cache for chrA in {parquet_dir} is older than {parquet}; "
-        "rebuilding it"
+        f"Packed accessibility cache in {parquet_dir} does not match the Parquet "
+        f"profiles in {parquet_dir}; rebuilding it"
     ]
-    assert np.load(cache_paths(parquet_dir, "chrA", "+")[0]).shape[1] == 20
-    # The rebuilt cache is dated no earlier than its Parquet, even though that
+    assert np.load(packed_paths(parquet_dir, "+")[0]).shape[1] == 20
+    # The rebuilt pack is dated no earlier than its Parquet, even though that
     # lies ahead of the clock: nothing more to do on the next run.
     assert ensure_accessibility_cache(parquet_dir, parquet_dir) == []
     assert len(_stale_warnings(warnings_seen)) == 1
 
-    reference = GenomeAccessibilityService.from_frames(
-        {"chrA": refolded, "chrB": frames["chrB"]}
-    )
+    reference = GenomeAccessibilityService.from_frames(refolded)
     _assert_same_answers(reference, GenomeAccessibilityService(parquet_dir))
 
 
@@ -390,21 +400,19 @@ def test_ensure_rebuilds_a_cache_older_than_its_parquet(
 def test_service_rebuilds_a_cache_older_than_its_parquet(
     tmp_path: Path, parquet_dir: Path, frames, warnings_seen, layout: str
 ) -> None:
-    """The lazy path (no ensure_accessibility_cache first) rebuilds it too."""
+    """The lazy path (no ensure_accessibility_cache first) repacks it too."""
     stale_dir = tmp_path / "cache" if layout == "in_cache_dir" else parquet_dir
     ensure_accessibility_cache(parquet_dir, stale_dir)
     cache_dir = parquet_dir if layout == "next_to_parquet" else tmp_path / "cache"
-    refolded = _refolded(frames["chrA"])
-    _rewrite_parquet(parquet_dir, stale_dir, "chrA", refolded)
+    refolded = {c: _refolded(f) for c, f in frames.items()}
+    for chrom, frame in refolded.items():
+        _rewrite_parquet(parquet_dir, stale_dir, chrom, frame)
 
     service = GenomeAccessibilityService(parquet_dir, cache_dir=cache_dir)
-    reference = GenomeAccessibilityService.from_frames(
-        {"chrA": refolded, "chrB": frames["chrB"]}
-    )
+    reference = GenomeAccessibilityService.from_frames(refolded)
     _assert_same_answers(reference, service)
-    stale = _stale_warnings(warnings_seen)
-    assert len(stale) == 1 and "for chrA in" in stale[0], stale
-    assert np.load(cache_paths(cache_dir, "chrA", "-")[0]).shape[1] == 20
+    assert len(_stale_warnings(warnings_seen)) == 1, warnings_seen
+    assert np.load(packed_paths(cache_dir, "-")[0]).shape[1] == 20
 
 
 # --- (iv) neither cache nor Parquet -> AccessibilityError ----------------------
@@ -425,14 +433,25 @@ def test_missing_cache_and_parquet_raise(tmp_path: Path) -> None:
     assert out["opening_energy"].to_list() == [10.0]
 
 
-def test_corrupt_cache_file_is_reported(parquet_dir: Path) -> None:
+def test_corrupt_cache_file_is_reported(tmp_path: Path, parquet_dir: Path) -> None:
     ensure_accessibility_cache(parquet_dir, parquet_dir)
-    npy, _ = cache_paths(parquet_dir, "chrA", "+")
-    np.save(npy, np.zeros((5, 3), dtype=np.float32))
-    with pytest.raises(AccessibilityError, match="chrA"):
-        GenomeAccessibilityService(parquet_dir, cache_dir=parquet_dir).query(
+    cache_only = tmp_path / "cache_only"
+    shutil.copytree(
+        parquet_dir,
+        cache_only,
+        ignore=shutil.ignore_patterns("*.accessibility.parquet"),
+    )
+    np.save(packed_paths(cache_only, "+")[0], np.zeros((5, 3), dtype=np.float32))
+    with pytest.raises(AccessibilityError, match="Corrupt packed"):
+        GenomeAccessibilityService(cache_only, cache_dir=cache_only).query(
             "chrA", 0, 1, "+"
         )
+
+
+def test_corrupt_pack_next_to_its_parquet_is_rebuilt(parquet_dir: Path, eager) -> None:
+    ensure_accessibility_cache(parquet_dir, parquet_dir)
+    np.save(packed_paths(parquet_dir, "+")[0], np.zeros((5, 3), dtype=np.float32))
+    _assert_same_answers(eager, GenomeAccessibilityService(parquet_dir))
 
 
 def test_strand_absent_from_parquet_raises_like_eager(tmp_path: Path) -> None:
@@ -467,7 +486,7 @@ def test_unreadable_parquet_is_reported_by_name(
     (parquet_dir / "chrX.accessibility.parquet").write_bytes(b"not a parquet file")
     with pytest.raises(
         AccessibilityError,
-        match="Failed to build accessibility cache for chrX.accessibility.parquet",
+        match="Failed to pack accessibility profiles from",
     ) as exc_info:
         ensure_accessibility_cache(parquet_dir, parquet_dir, workers=workers)
     assert exc_info.value.__cause__ is not None
@@ -477,6 +496,7 @@ def test_build_is_atomic(parquet_dir: Path) -> None:
     ensure_accessibility_cache(parquet_dir, parquet_dir)
     leftovers = [f for f in os.listdir(parquet_dir) if ".tmp" in f]
     assert leftovers == []
+    assert all(p.is_file() for s in "+-" for p in packed_paths(parquet_dir, s))
 
 
 # --- the option reaches both public forms --------------------------------------
@@ -529,7 +549,7 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     )
     assert isinstance(single, pl.DataFrame)
     assert single.sort(single.columns).equals(from_frames.sort(from_frames.columns))
-    assert cache_paths(cache_dir, "chr1", "+")[0].exists()
+    assert packed_paths(cache_dir, "+")[0].exists()
     assert not list(acc_dir.glob("*.npy")), "cache written into the Parquet dir"
 
     # Directory form: the cache is built up front, before the pool starts.
@@ -544,7 +564,7 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
         n_workers=1,
     )
     first = next(gen)
-    assert cache_paths(cache_dir2, "chr1", "-")[0].exists()
+    assert packed_paths(cache_dir2, "-")[0].exists()
     frames = [first, *gen]
     assert len(frames) == 1
     batch = frames[0]
@@ -555,7 +575,7 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     default = sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=acc_dir)
     assert isinstance(default, pl.DataFrame)
     assert default.sort(default.columns).equals(from_frames.sort(from_frames.columns))
-    assert cache_paths(acc_dir, "chr1", "+")[0].exists()
+    assert packed_paths(acc_dir, "+")[0].exists()
 
 
 # --- off_targets prepares the cache before scoring ---
@@ -732,7 +752,8 @@ def test_single_file_mode_builds_every_contig_up_front(tmp_path):
     acc = _parquet_dir(tmp_path, _rounded_profiles(), extra_contig="chrNoHits")
     sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=acc)
     for strand in "+-":
-        assert cache_paths(acc, "chrNoHits", strand)[0].exists()
+        with np.load(packed_paths(acc, strand)[1]) as side:
+            assert "chrNoHits" in side["names"].tolist()
 
 
 @pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
@@ -799,11 +820,11 @@ def test_refolding_a_parquet_dir_rebuilds_its_cache(tmp_path, form):
 
     _fold_to_parquet(acc, 40, 20, 10)
     first = run()
-    assert cache_paths(acc, "chr1", "+")[0].exists()
+    assert packed_paths(acc, "+")[0].exists()
 
     _fold_to_parquet(acc, 80, 40, 20)
     parquet = acc / "chr1.accessibility.parquet"
-    built = max(cache_paths(acc, "chr1", s)[0].stat().st_mtime_ns for s in "+-")
+    built = max(packed_paths(acc, s)[0].stat().st_mtime_ns for s in "+-")
     if parquet.stat().st_mtime_ns <= built:  # coarse filesystem clock
         os.utime(parquet, ns=(built + 5_000_000_000, built + 5_000_000_000))
     with _capture_warnings() as seen:
@@ -820,4 +841,4 @@ def test_refolding_a_parquet_dir_rebuilds_its_cache(tmp_path, form):
     )
     assert second.select(common).sort(KEYS).equals(ref)
     stale = _stale_warnings(seen)
-    assert len(stale) == 1 and str(parquet) in stale[0], stale
+    assert len(stale) == 1 and str(acc) in stale[0], stale

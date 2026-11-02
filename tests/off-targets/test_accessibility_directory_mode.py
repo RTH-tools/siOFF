@@ -1,6 +1,6 @@
 """Directory mode looks opening energies up in the memory-mapped cache.
 
-Every worker memory-maps the uint8 ``.access.npy`` cache the parent built
+Every worker memory-maps the uint8 packed cache the parent built
 before starting the pool (chr1: 30 GB dense per strand would be the cost of
 loading it instead -- 46 workers on hg38 were all OOM-killed). The result must
 be bit-for-bit what the dense lookup
@@ -30,8 +30,8 @@ from sioff.core.off_targets import (
 )
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
-    cache_paths,
     ensure_accessibility_cache,
+    packed_paths,
 )
 
 N_U = 30
@@ -209,7 +209,7 @@ def test_directory_mode_matches_the_dense_lookup(hits, acc_dir, tmp_path):
 
 
 def _cache_files(d: Path) -> list[str]:
-    return sorted(p.name for p in d.iterdir() if ".access." in p.name)
+    return sorted(p.name for p in d.iterdir() if ".packed." in p.name)
 
 
 def test_cache_goes_to_cache_dir_or_next_to_the_profiles(hits, acc_dir, tmp_path):
@@ -221,10 +221,7 @@ def test_cache_goes_to_cache_dir_or_next_to_the_profiles(hits, acc_dir, tmp_path
     assert first.height == all_hits.height
     assert _cache_files(acc_dir) == [], "wrote into the accessibility dir"
     assert _cache_files(cache_dir) == sorted(
-        cache_paths(cache_dir, c, s)[k].name
-        for c in CHROM_LEN
-        for s in "+-"
-        for k in (0, 1)
+        p.name for s in "+-" for p in packed_paths(cache_dir, s)
     )
 
     # Default cache dir is the accessibility dir itself (on a private copy).

@@ -7,13 +7,16 @@ into ``tmp_path`` from the same Parquet files.
 """
 
 import os
+import shutil
 from pathlib import Path
 
 import numpy as np
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 from loguru import logger
 
+import sioff
 import sioff.services.accessibility as acc
 from sioff.services.accessibility import (
     AccessibilityError,
@@ -21,6 +24,8 @@ from sioff.services.accessibility import (
     _fold_full_chromosome,
     build_accessibility_cache,
     cache_paths,
+    ensure_accessibility_cache,
+    has_profiles,
     pack_parquet_profiles,
     packed_paths,
 )
@@ -438,3 +443,209 @@ def test_site_cells_accepts_per_hit_lengths():
     for i, n in enumerate((10, 20)):
         r1, c1, o1 = acc.site_cells("-", [1], [5], n, 30)
         assert (rows[i], cols[i], ok[i]) == (r1[0], c1[0], o1[0])
+
+
+# --------------------------------------------------------------------------
+# A Parquet directory is packed; the pack goes stale with its Parquet.
+# --------------------------------------------------------------------------
+
+PACKED_NAMES = sorted(p.name for s in "+-" for p in packed_paths(Path("."), s))
+
+
+@pytest.fixture
+def pq_copy(parquet_records, tmp_path):
+    """A private copy of the Parquet fixture directory, safe to pack in place."""
+    pdir, seqs = parquet_records
+    d = tmp_path / "pq"
+    shutil.copytree(pdir, d)
+    return d, seqs
+
+
+def _listing(d: Path) -> list[str]:
+    return sorted(p.name for p in d.iterdir())
+
+
+def _pack_names(d: Path, strand: str = "+") -> list[str]:
+    with np.load(packed_paths(d, strand)[1]) as side:
+        return side["names"].tolist()
+
+
+def test_ensure_packs_a_parquet_dir(pq_copy):
+    d, seqs = pq_copy
+    assert ensure_accessibility_cache(d) == sorted(seqs)
+    assert _listing(d) == sorted(
+        [f"{n}.accessibility.parquet" for n in seqs] + PACKED_NAMES
+    )
+    assert not any(".access." in n for n in _listing(d))
+    assert ensure_accessibility_cache(d) == []
+
+
+def test_ensure_reuses_a_complete_per_record_cache(pq_copy):
+    d, seqs = pq_copy
+    for name in seqs:
+        build_accessibility_cache(d / f"{name}.accessibility.parquet", d)
+    assert ensure_accessibility_cache(d) == []
+    assert not any(n.endswith(acc.PACKED_SUFFIX) for n in _listing(d))
+
+
+def _refold_recB(d):
+    rng = np.random.default_rng(99)
+    _fold_full_chromosome(
+        _random_seq(700, rng),
+        "recB",
+        60,
+        40,
+        30,
+        str(d / "recB.accessibility.parquet"),
+        700,
+    )
+    return ["recA", "recB", "recC"]
+
+
+def _delete_recC(d):
+    (d / "recC.accessibility.parquet").unlink()
+    return ["recA", "recB"]
+
+
+def _add_recD(d):
+    shutil.copy(d / "recA.accessibility.parquet", d / "recD.accessibility.parquet")
+    return ["recA", "recB", "recC", "recD"]
+
+
+@pytest.mark.parametrize("change", [_refold_recB, _delete_recC, _add_recD])
+def test_ensure_repacks_when_the_parquet_dir_changes(pq_copy, warnings_seen, change):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    later = packed_paths(d, "+")[0].stat().st_mtime + 10
+    want = change(d)
+    for f in d.glob("*.accessibility.parquet"):
+        os.utime(f, (later, later))
+    assert ensure_accessibility_cache(d) == want
+    assert any("does not match the Parquet profiles" in m for m in warnings_seen)
+    assert _pack_names(d) == want
+    assert ensure_accessibility_cache(d) == []
+
+
+def test_mixed_generation_pair_is_repacked(pq_copy, warnings_seen):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    # The minus pair is left over from an older pack; the plus pair is fresh.
+    npy = packed_paths(d, "-")[0]
+    old = npy.stat().st_mtime - 100
+    os.utime(npy, (old, old))
+    assert ensure_accessibility_cache(d) == sorted(seqs)
+    assert any("does not match the Parquet profiles" in m for m in warnings_seen)
+    assert ensure_accessibility_cache(d) == []
+
+
+def test_service_packs_lazily(pq_copy):
+    d, seqs = pq_copy
+    ref = _per_record_dir(d, ["recB"], d.parent / "rec")
+    want = acc.GenomeAccessibilityService(d.parent / "e", cache_dir=ref).query_single(
+        "recB", 10, 20, "+"
+    )
+    got = acc.GenomeAccessibilityService(d).query_single("recB", 10, 20, "+")
+    assert got == want
+    assert [n for n in _listing(d) if n.endswith((".packed.npy", ".packed.npz"))] == (
+        PACKED_NAMES
+    )
+    assert not any(".access." in n for n in _listing(d))
+
+
+def test_service_repacks_a_stale_pack_and_serves_the_new_one(pq_copy):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    later = packed_paths(d, "+")[0].stat().st_mtime + 10
+    _delete_recC(d)
+    for f in d.glob("*.accessibility.parquet"):
+        os.utime(f, (later, later))
+    service = acc.GenomeAccessibilityService(d)
+    service.query_single("recB", 10, 20, "+")
+    assert _pack_names(d) == ["recA", "recB"]
+    assert service._packed_strand("+") is not None
+    assert "recB" in service._packed_strand("+").names.tolist()
+
+
+def test_half_present_pair_is_corrupt(packed_and_reference, tmp_path):
+    pdir, seqs, packed, ref = packed_and_reference
+    packed_paths(packed, "+")[1].unlink()
+    svc = acc.GenomeAccessibilityService(tmp_path / "empty", cache_dir=packed)
+    with pytest.raises(AccessibilityError, match="Corrupt packed accessibility cache"):
+        svc.query("recA", 0, 5, "+")
+
+
+def test_has_profiles_sees_a_packed_dir(parquet_records, tmp_path):
+    pdir, seqs = parquet_records
+    assert not has_profiles(tmp_path)
+    pack_parquet_profiles(pdir, tmp_path)
+    for f in tmp_path.glob("*.accessibility.parquet"):
+        f.unlink()
+    assert has_profiles(tmp_path)
+
+
+def _synthetic_hits(seqs):
+    rng = np.random.default_rng(13)
+    frames = []
+    for name, seq in seqs.items():
+        n = 100
+        length = rng.integers(5, 25, n)
+        start = np.array([rng.integers(1, max(2, len(seq) - int(w))) for w in length])
+        frames.append(
+            pl.DataFrame(
+                {
+                    "chrom": [name] * n,
+                    "start": start,
+                    "end": start + length - 1,
+                    "strand": rng.choice(["+", "-"], n),
+                    "energy": rng.uniform(-30.0, -8.0, n),
+                }
+            )
+        )
+    df = pl.concat(frames).with_columns(
+        pl.Series("sirna_id", [f"siRNA{i % 3}" for i in range(300)]),
+        pl.col("start").cast(pl.Int32),
+        pl.col("end").cast(pl.Int32),
+        pl.col("energy").cast(pl.Float32),
+    )
+    return df.select("sirna_id", "chrom", "start", "end", "strand", "energy")
+
+
+@pytest.mark.parametrize("form", ["single", "directory"])
+def test_off_targets_packed_equals_per_record(pq_copy, tmp_path, form):
+    d, seqs = pq_copy
+    hits = _synthetic_hits(seqs)
+    per_record = _per_record_dir(d, seqs, tmp_path / "rec")
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    keys = ["sirna_id", "chrom", "start", "end", "strand", "energy"]
+
+    def run(acc_dir, cache_dir):
+        if form == "single":
+            out = sioff.off_targets(
+                predictions=hits,
+                accessibility_dir=acc_dir,
+                accessibility_cache_dir=cache_dir,
+            )
+        else:
+            hits_dir = tmp_path / "hits"
+            hits_dir.mkdir(exist_ok=True)
+            for (sid,), part in hits.group_by("sirna_id"):
+                part.write_parquet(hits_dir / f"risearch_{sid}.parquet")
+            out = pl.concat(
+                list(
+                    sioff.off_targets(
+                        risearch_file=hits_dir,
+                        accessibility_dir=acc_dir,
+                        accessibility_cache_dir=cache_dir,
+                        n_workers=2,
+                    )
+                )
+            )
+        return out.sort(keys)
+
+    packed = run(d, None)
+    assert any(n.endswith(acc.PACKED_SUFFIX) for n in _listing(d))
+    reference = run(empty, per_record)
+    assert (packed["opening_energy"] != 10.0).any()
+    assert (reference["opening_energy"] != 10.0).any()
+    assert_frame_equal(packed, reference, check_exact=True)
