@@ -13,6 +13,16 @@ from sioff.cli import app
 runner = CliRunner()
 
 
+def test_accessibility_strategy_option_is_gone(plain) -> None:
+    tsv_path = Path(__file__).parent / "data" / "risearch_siRNAID.out"
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(tsv_path), "--accessibility-strategy", "memmap"],
+    )
+    assert result.exit_code == 2
+    assert "No such option" in plain(result.output)
+
+
 class TestCLIMain:
     """Tests for the main command."""
 

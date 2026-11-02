@@ -105,7 +105,6 @@ def off_targets(
     sense_only: bool = False,
     predictions_type: str = "gw",
     n_workers: int = 1,
-    accessibility_strategy: str = "auto",
 ) -> Union[pl.DataFrame, Iterator[pl.DataFrame]]:
     """Analyse siRNA off-target predictions, returning results in memory.
 
@@ -188,19 +187,16 @@ def off_targets(
         returned by [`accessibility`][sioff.accessibility]. Accepted by the single-frame forms
         only; mutually exclusive with ``accessibility_dir``. No CLI equivalent.
     accessibility_dir : str or pathlib.Path, optional
-        Directory of per-chromosome ``{chrom}.accessibility.parquet`` files
-        written by ``sioff accessibility`` (with
-        ``accessibility_strategy="memmap"``, it may instead hold only the
-        ``.access.npy`` cache files built from them). The only accessibility
-        source the directory form accepts. CLI: ``-a/--accessibility-dir``.
+        The npy cache from ``sioff accessibility`` or per-chromosome Parquet
+        files. For Parquet the cache is built in ``accessibility_cache_dir``
+        on first use (the directory form builds it before its workers start).
+        The only accessibility source the directory form accepts. CLI:
+        ``-a/--accessibility-dir``.
     accessibility_cache_dir : str or pathlib.Path, optional
-        ``accessibility_strategy="memmap"`` only: directory of the
-        memory-mapped ``<chrom>_<plus|minus>.access.npy`` accessibility cache
-        (as ``sioff accessibility`` writes it), built there from the Parquet
-        when missing and created if absent; the
-        directory form builds every missing contig before its workers start.
-        Default: ``accessibility_dir`` itself. Ignored (with a warning) by the
-        other strategies. CLI: ``--accessibility-cache-dir``.
+        Where the cache is read from and built; default ``accessibility_dir``.
+        Created if absent; use it when ``accessibility_dir`` is read-only or
+        to stage the cache on local disk. It may also hold a complete cache
+        without any Parquet. CLI: ``--accessibility-cache-dir``.
     genome_file : str or pathlib.Path, optional
         Genome FASTA to fold on the fly; the profiles go to a temporary
         directory that is removed when the call returns. Ignored when
@@ -278,21 +274,6 @@ def off_targets(
         single-frame forms, and the number of spawned worker processes (one
         siRNA file at a time each) for the directory form. CLI:
         ``-j/--workers``, whose default is the CPU count.
-    accessibility_strategy : {"auto", "eager", "memmap", "chrom-major"}, default "auto"
-        How opening energies are looked up from ``accessibility_dir``.
-        ``"chrom-major"`` (directory form) streams each chromosome's Parquet
-        once per run for the hits of every siRNA, so memory per worker stays
-        about one Parquet row group, and writes nothing; ``"memmap"`` builds
-        a uint8 ``.access.npy`` cache per chromosome and strand (in
-        ``accessibility_cache_dir``) that every worker memory-maps, and is the
-        only strategy that writes cache files; ``"eager"`` loads
-        whole-chromosome profiles into memory (30 GB per chr1 strand on hg38).
-        ``"auto"`` is ``"memmap"`` when ``accessibility_dir`` holds only the
-        ``.access.npy`` cache (the default output of ``sioff accessibility``),
-        which the two Parquet strategies refuse; otherwise it is
-        chromosome-major for the directory form and eager for the single-frame
-        forms, which have no chromosome-major path. Results are identical.
-        CLI: ``--accessibility-strategy``.
 
     Returns
     -------
@@ -389,7 +370,6 @@ def off_targets(
             sense_only=sense_only,
             predictions_type=predictions_type,
             n_workers=n_workers,
-            accessibility_strategy=accessibility_strategy,
         )
         # Yield bare per-siRNA DataFrames (the core yields (df, meta) tuples).
         # Closing this generator propagates GeneratorExit to core_gen, tearing
@@ -427,7 +407,6 @@ def off_targets(
         sense_only=sense_only,
         predictions_type=predictions_type,
         n_workers=n_workers,
-        accessibility_strategy=accessibility_strategy,
     )
     return df
 

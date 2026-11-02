@@ -10,6 +10,17 @@ from sioff.config import load_config, config_to_kwargs
 
 
 class TestLoadConfig:
+    def test_removed_accessibility_strategy_key_is_rejected(self, tmp_path):
+        from omegaconf.errors import ConfigKeyError
+
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text(
+            "command: off-targets\noff_targets:\n  risearch_file: x.out\n"
+            "  accessibility_strategy: memmap\n"
+        )
+        with pytest.raises(ConfigKeyError, match="accessibility_strategy"):
+            load_config(cfg)
+
     def test_load_off_targets_config(self, tmp_path):
         config_file = tmp_path / "config.yaml"
         # Create dummy path for risearch_file

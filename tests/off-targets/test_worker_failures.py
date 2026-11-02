@@ -4,8 +4,8 @@ A run whose every worker was OOM-killed used to print "Warning: No predictions
 to process" and exit 0. The core generator now raises `WorkerFailureError`
 once all files have been attempted (successful siRNAs are still yielded
 first), and the CLI turns that into a non-zero exit with a summary. These runs
-have no accessibility directory, so they exercise the per-siRNA pool; the
-chromosome-major passes are covered in test_accessibility_chrom_major.py.
+have no accessibility directory, so they exercise the per-siRNA pool; runs with
+an accessibility directory are covered in test_accessibility_directory_mode.py.
 """
 
 from pathlib import Path

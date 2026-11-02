@@ -43,8 +43,7 @@ def site_cells(
     """Map RIsearch hits to cells of one strand's opening-energy profile.
 
     The single place that turns a hit into a profile index; every lookup path
-    (eager, in-memory frames, memory-mapped cache, chromosome-major gather,
-    on-target) goes through it.
+    (dense, in-memory frames, memory-mapped cache, on-target) goes through it.
 
     A profile row ``i`` (0-based) and column ``k`` hold the energy to open the
     ``k + 1`` bases ENDING at position ``i + 1`` of the molecule that was folded
@@ -105,6 +104,10 @@ def check_strand_lengths(
     )
     return False
 
+
+_OUT_OF_BOUNDS_ENERGY = (
+    10.0  # the `np.full` default of annotate_opening_energy_vectorized
+)
 
 # Strands `_warn_missing_strand` has reported in this process.
 _WARNED_MISSING_STRANDS: set[str] = set()
@@ -389,16 +392,6 @@ def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
         Path(cache_dir) / f"{stem}{CACHE_SUFFIX}",
         Path(cache_dir) / f"{stem}{EXCEPTIONS_SUFFIX}",
     )
-
-
-def holds_only_cache(accessibility_dir: Union[str, Path]) -> bool:
-    """True when the directory has ``.access.npy`` caches and no Parquet profile.
-
-    That is what ``sioff accessibility --output-format npy`` writes; only the
-    ``memmap`` lookup strategy can serve it.
-    """
-    d = Path(accessibility_dir)
-    return any(d.glob(f"*{CACHE_SUFFIX}")) and not any(d.glob(f"*{PARQUET_SUFFIX}"))
 
 
 def _chrom_of(parquet_path: Path) -> str:
@@ -933,7 +926,7 @@ class GenomeAccessibilityService:
         u{unpaired_prob}]; with ``"npy"`` writes the uint8 memory-map cache
         (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
         sidecars, see `build_accessibility_cache`) instead, which the
-        ``memmap`` lookup strategy reads with no conversion step.
+        ``off-targets`` reads with no conversion step.
         ``strand="+"`` folds each sequence as given only (see
         `_fold_full_chromosome`).
 
@@ -1332,12 +1325,8 @@ class GenomeAccessibilityService:
 
 
 # ---------------------------------------------------------------------------
-# Streaming gather: one contig Parquet, read row group by row group.
+# Parquet row-group layout: strand and position range of each row group.
 # ---------------------------------------------------------------------------
-_OUT_OF_BOUNDS_ENERGY = (
-    10.0  # the `np.full` default of annotate_opening_energy_vectorized
-)
-_MISSING_POSITION_ENERGY = 25.5  # the `np.full` default of _ensure_profile
 
 
 def _row_group_layout(pf: pq.ParquetFile) -> list[tuple[int, str, int, int, bool]]:
@@ -1379,133 +1368,3 @@ def _row_group_layout(pf: pq.ParquetFile) -> list[tuple[int, str, int, int, bool
             p = pos[m]
             layout.append((rg, str(strand), int(p.min()), int(p.max()), len(uniq) > 1))
     return layout
-
-
-def gather_opening_energies(
-    parquet_path: Path,
-    strands: np.ndarray,
-    starts: np.ndarray,
-    ends: np.ndarray,
-) -> tuple[np.ndarray, dict]:
-    """Opening energies for hits on one contig, streamed from its Parquet file.
-
-    Bit-for-bit equivalent to ``annotate_opening_energy_vectorized`` restricted
-    to one contig, but never materialises the dense ``[max_pos, u]`` profile:
-    the needed positions are sorted, the row-group statistics select the row
-    groups that hold them, and each of those is read once with only the ``u``
-    columns the hits in it need (peak memory ~ one row group).
-
-    Parameters
-    ----------
-    parquet_path : pathlib.Path
-        ``{chrom}.accessibility.parquet`` written by ``sioff accessibility``.
-    strands : numpy.ndarray
-        ``'+'``/``'-'`` per hit (any array comparable to those strings).
-    starts, ends : numpy.ndarray
-        1-based inclusive RIsearch coordinates per hit.
-
-    Returns
-    -------
-    tuple[numpy.ndarray, dict]
-        ``energies`` (float32, one per hit, quantised to 0.1; 10.0 when out of
-        bounds or when the strand has no rows; 25.5 when the position is absent
-        from the file) and ``stats`` with ``row_groups_total``,
-        ``row_groups_read``, ``bytes_read`` (compressed column-chunk bytes
-        actually read) and ``bytes_file`` (all column chunks of the file).
-    """
-    pf = pq.ParquetFile(parquet_path)
-    md = pf.metadata
-    names = pf.schema_arrow.names
-    u_cols = sorted(
-        [c for c in names if c.startswith("u") and c[1:].isdigit()],
-        key=lambda x: int(x[1:]),
-    )
-    n_u = len(u_cols)
-    col_index = {c: names.index(c) for c in names}
-    layout = _row_group_layout(pf)
-    check_strand_lengths(
-        _chrom_of(parquet_path), *_layout_strand_lengths(layout), str(parquet_path)
-    )
-
-    stats = {
-        "row_groups_total": md.num_row_groups,
-        "row_groups_read": 0,
-        "bytes_read": 0,
-        "bytes_file": sum(
-            md.row_group(rg).column(c).total_compressed_size
-            for rg in range(md.num_row_groups)
-            for c in range(md.num_columns)
-        ),
-    }
-
-    starts = np.asarray(starts).astype(np.int64)
-    ends = np.asarray(ends).astype(np.int64)
-    strands = np.asarray(strands)
-    out = np.full(len(starts), _OUT_OF_BOUNDS_ENERGY, dtype=np.float32)
-
-    for strand in ("+", "-"):
-        sel = np.flatnonzero(strands == strand)
-        if sel.size == 0:
-            continue
-        rgs = [e for e in layout if e[1] == strand]
-        if not rgs:
-            # The eager path raises "No data for strand" and skips the group.
-            _warn_missing_strand(_chrom_of(parquet_path), strand)
-            continue
-        seq_len = max(e[3] for e in rgs)
-
-        # Same cells as annotate_opening_energy_vectorized.
-        row_idx, col_idx, in_bounds = site_cells(
-            strand, starts[sel], ends[sel], seq_len, n_u
-        )
-
-        ib = np.flatnonzero(in_bounds)
-        vals = np.full(ib.size, _MISSING_POSITION_ENERGY, dtype=np.float32)
-        want_pos = row_idx[ib] + 1  # back to the file's 1-based positions
-        want_col = col_idx[ib]
-        order = np.argsort(want_pos, kind="stable")
-        sorted_pos = want_pos[order]
-
-        for rg, _, pos_min, pos_max, mixed in rgs:
-            lo = int(np.searchsorted(sorted_pos, pos_min, side="left"))
-            hi = int(np.searchsorted(sorted_pos, pos_max, side="right"))
-            if lo == hi:
-                continue
-            sub = order[lo:hi]
-            cols_needed = np.unique(want_col[sub])
-            read_cols = ["position"] + (["strand"] if mixed else [])
-            read_cols += [u_cols[int(c)] for c in cols_needed]
-            tbl = pf.read_row_group(rg, columns=read_cols)
-            rgm = md.row_group(rg)
-            stats["row_groups_read"] += 1
-            stats["bytes_read"] += sum(
-                rgm.column(col_index[c]).total_compressed_size for c in read_cols
-            )
-
-            pos = tbl.column("position").to_numpy()
-            mask = None
-            if mixed:
-                mask = tbl.column("strand").to_numpy(zero_copy_only=False) == strand
-                pos = pos[mask]
-            reorder = None
-            if pos.size > 1 and not np.all(pos[1:] >= pos[:-1]):
-                reorder = np.argsort(pos, kind="stable")
-                pos = pos[reorder]
-
-            j = np.searchsorted(pos, sorted_pos[lo:hi], side="right") - 1
-            hit = (j >= 0) & (pos[np.maximum(j, 0)] == sorted_pos[lo:hi])
-            sub_cols = want_col[sub]
-            for c in cols_needed:
-                arr = tbl.column(u_cols[int(c)]).to_numpy()
-                if mask is not None:
-                    arr = arr[mask]
-                if reorder is not None:
-                    arr = arr[reorder]
-                m = hit & (sub_cols == c)
-                vals[sub[m]] = arr[j[m]]
-
-        # Quantize to 0.1 resolution (match legacy query_single behaviour)
-        vals = (np.round(vals * 10.0) / 10.0).astype(np.float32)
-        out[sel[ib]] = vals
-
-    return out, stats

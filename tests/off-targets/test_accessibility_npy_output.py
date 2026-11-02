@@ -15,7 +15,6 @@ from typer.testing import CliRunner
 
 from sioff.cli import app
 from sioff.services.accessibility import (
-    AccessibilityError,
     _fold_full_chromosome,
     build_accessibility_cache,
     cache_paths,
@@ -119,7 +118,9 @@ def test_unknown_output_format_is_rejected(tmp_path: Path) -> None:
     assert "--output-format" in result.output
 
 
-def test_auto_reads_an_npy_directory_as_memmap(dirs, tmp_path: Path) -> None:
+def test_npy_and_parquet_directories_give_the_same_results(
+    dirs, tmp_path: Path
+) -> None:
     import sioff
 
     npy_dir, parquet_dir, _ = dirs
@@ -143,25 +144,3 @@ def test_auto_reads_an_npy_directory_as_memmap(dirs, tmp_path: Path) -> None:
         frames[0].select(common).sort(common).equals(single.select(common).sort(common))
     )
     assert sorted(f.name for f in npy_dir.iterdir()) == before
-
-
-@pytest.mark.parametrize("strategy", ["eager", "chrom-major"])
-def test_parquet_strategies_refuse_an_npy_directory(
-    dirs, tmp_path: Path, strategy: str
-) -> None:
-    import sioff
-
-    npy_dir = dirs[0]
-    in_dir = tmp_path / "in"
-    in_dir.mkdir()
-    (in_dir / PREDICTIONS.name).write_bytes(PREDICTIONS.read_bytes())
-    for source in (PREDICTIONS, in_dir):
-        with pytest.raises(AccessibilityError, match="--output-format parquet"):
-            out = sioff.off_targets(
-                risearch_file=source,
-                accessibility_dir=npy_dir,
-                accessibility_strategy=strategy,
-                n_workers=1,
-            )
-            if not isinstance(out, pl.DataFrame):
-                list(out)

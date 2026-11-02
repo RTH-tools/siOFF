@@ -7,8 +7,8 @@ compact uint8 cache (``<chrom>_<plus|minus>.access.npy``, value
 ``round(E * 10)``) that every worker memory-maps, so the OS page cache holds
 one shared copy. Entries that the code cannot represent exactly (opening
 energies above 25.5, negative or unrounded values) live in a small sorted
-sidecar, which keeps the cache lossless for any input. Only that memory-mapped
-mode (``--accessibility-strategy memmap``) ever writes cache files.
+sidecar, which keeps the cache lossless for any input. Only the memory-mapped
+mode (``cache_dir`` set, as ``off-targets`` always does) writes cache files.
 
 The reference for every test here is the frame-backed service: it runs the
 very code the Parquet path ran before the cache existed (filter one strand,
@@ -356,20 +356,11 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
 
     from_frames = sioff.off_targets(risearch_file=predictions, accessibility=profiles)
 
-    # Default strategy on a single file: the eager loader, no cache files.
-    default = sioff.off_targets(risearch_file=predictions, accessibility_dir=acc_dir)
-    assert isinstance(default, pl.DataFrame)
-    assert default.sort(default.columns).equals(from_frames.sort(from_frames.columns))
-    assert not [f for f in acc_dir.iterdir() if ".access." in f.name], (
-        "the default strategy wrote cache files"
-    )
-
     cache_dir = tmp_path / "cache"
     single = sioff.off_targets(
         risearch_file=predictions,
         accessibility_dir=acc_dir,
         accessibility_cache_dir=cache_dir,
-        accessibility_strategy="memmap",
     )
     assert isinstance(single, pl.DataFrame)
     assert single.sort(single.columns).equals(from_frames.sort(from_frames.columns))
@@ -385,7 +376,6 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
         risearch_file=in_dir,
         accessibility_dir=acc_dir,
         accessibility_cache_dir=cache_dir2,
-        accessibility_strategy="memmap",
         n_workers=1,
     )
     first = next(gen)
@@ -395,3 +385,9 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     batch = frames[0]
     common = [c for c in single.columns if c in batch.columns]
     assert batch.select(common).sort(common).equals(single.select(common).sort(common))
+
+    # Default: no cache dir, so the cache is built next to the Parquet.
+    default = sioff.off_targets(risearch_file=predictions, accessibility_dir=acc_dir)
+    assert isinstance(default, pl.DataFrame)
+    assert default.sort(default.columns).equals(from_frames.sort(from_frames.columns))
+    assert cache_paths(acc_dir, "chr1", "+")[0].exists()

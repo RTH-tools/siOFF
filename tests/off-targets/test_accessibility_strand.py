@@ -28,7 +28,6 @@ from sioff.services.accessibility import (
     _fold_full_chromosome,
     build_accessibility_cache,
     cache_paths,
-    gather_opening_energies,
 )
 
 DATA = Path(__file__).parent / "data"
@@ -227,21 +226,10 @@ def _memmap(d: Path, hits, tmp: Path) -> np.ndarray:
     return _via_service(GenomeAccessibilityService(d, cache_dir=tmp / d.name), hits)
 
 
-def _chrom_major(d: Path, hits, tmp: Path) -> np.ndarray:
-    energies, _ = gather_opening_energies(
-        d / f"{CHROM}.accessibility.parquet",
-        np.array([h[0] for h in hits]),
-        np.array([h[1] for h in hits], dtype=np.int64),
-        np.array([h[2] for h in hits], dtype=np.int64),
-    )
-    return energies
-
-
 PATHS = {
     "eager": _eager,
     "from_frames": _frames,
     "memmap": _memmap,
-    "chrom_major": _chrom_major,
 }
 
 
