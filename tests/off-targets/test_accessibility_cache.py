@@ -631,6 +631,27 @@ def test_directory_mode_checks_profiles_before_the_transcriptome(tmp_path, monke
     assert called == []
 
 
+def test_directory_mode_leaves_no_ipc_dir_when_setup_fails(tmp_path, monkeypatch):
+    """Any failure before the pool starts (here a bad --alpha) cleans up too."""
+    import tempfile
+
+    import sioff.core.off_targets as core
+
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    with pytest.raises(ValueError):
+        list(
+            core.compute_off_targets_directory(
+                input_dir=_in_dir(tmp_path, PREDICTIONS),
+                gtf_file=EXAMPLES / "annotation.gtf",
+                alpha="0.8,1.0",
+                n_workers=1,
+            )
+        )
+    assert not list(scratch.glob("risearch_ipc_*")), "transcriptome IPC dir leaked"
+
+
 @pytest.mark.parametrize("source", ["risearch_file", "sirna_fasta"])
 def test_single_file_checks_profiles_before_reading_predictions(
     tmp_path, monkeypatch, source

@@ -1175,29 +1175,6 @@ def compute_off_targets_directory(
             Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
 
-    # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
-    # it instead of re-parsing the GTF/GFF3. Workers share pages via the OS cache.
-    _ipc_tmp: Optional[str] = None
-    _ipc_path: Optional[Path] = None
-    if gtf_file:
-        trans_parser = AnnotationParser()
-        df_trans = trans_parser.load_gtf(
-            Path(gtf_file),
-            feature=feature_type,
-            score_col=expression_metric,
-            format=transcriptome_format,
-        )
-        df_trans = _drop_unexpressed(df_trans)
-        # Sorted by (chrom, strand, start) so each worker's partitions are
-        # zero-copy slices of the memory-mapped file, and uncompressed so the
-        # file can be memory-mapped at all; see preload_transcriptome.
-        df_trans = sort_for_preload(df_trans)
-        _ipc_tmp = tempfile.mkdtemp(prefix="risearch_ipc_")
-        _ipc_path = Path(_ipc_tmp) / "transcriptome.arrow"
-        df_trans.write_ipc(
-            _ipc_path, compression="uncompressed", compat_level=pl.CompatLevel.oldest()
-        )
-
     on_target_map: dict[str, str] = {}
     if on_target_ids_file is not None:
         with open(on_target_ids_file, "r") as f:
@@ -1224,6 +1201,38 @@ def compute_off_targets_directory(
 
     # spawn: each worker starts a fresh interpreter, avoiding fork+Rayon deadlocks.
     _ctx = multiprocessing.get_context("spawn")
+
+    # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
+    # it instead of re-parsing the GTF/GFF3. Workers share pages via the OS cache.
+    # Written last before the pool: only the try/finally around the pool removes
+    # it, so nothing that can fail may run in between.
+    _ipc_tmp: Optional[str] = None
+    _ipc_path: Optional[Path] = None
+    if gtf_file:
+        trans_parser = AnnotationParser()
+        df_trans = trans_parser.load_gtf(
+            Path(gtf_file),
+            feature=feature_type,
+            score_col=expression_metric,
+            format=transcriptome_format,
+        )
+        df_trans = _drop_unexpressed(df_trans)
+        # Sorted by (chrom, strand, start) so each worker's partitions are
+        # zero-copy slices of the memory-mapped file, and uncompressed so the
+        # file can be memory-mapped at all; see preload_transcriptome.
+        df_trans = sort_for_preload(df_trans)
+        _ipc_tmp = tempfile.mkdtemp(prefix="risearch_ipc_")
+        _ipc_path = Path(_ipc_tmp) / "transcriptome.arrow"
+        try:
+            df_trans.write_ipc(
+                _ipc_path,
+                compression="uncompressed",
+                compat_level=pl.CompatLevel.oldest(),
+            )
+        except BaseException:
+            shutil.rmtree(_ipc_tmp, ignore_errors=True)
+            raise
+
     # Polars sizes its thread pool when it is imported, which in a spawned
     # worker happens while the initializer is being unpickled -- before the
     # initializer runs. The budget therefore has to be in the environment the
