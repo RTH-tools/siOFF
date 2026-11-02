@@ -26,6 +26,10 @@ class MissingStrandError(AccessibilityError):
     """The contig's profile has no rows for the strand looked up."""
 
 
+class ProfileNotFoundError(AccessibilityError):
+    """No accessibility profile exists for the contig looked up."""
+
+
 _COMPLEMENT_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
 _GAS_CONSTANT = 0.001987  # kcal / (mol·K)
 
@@ -1827,32 +1831,24 @@ class GenomeAccessibilityService:
             dict.fromkeys(d for d in (self.cache_dir, self.data_dir) if d is not None)
         )
 
-    def _npy_path(self, chrom: str, strand: str) -> Path:
-        """The ``.npy`` the lookup uses: the first searched directory that has it.
+    def _find_cache(self, chrom: str, strand: str) -> Optional[tuple[Path, Path]]:
+        """``(npy, npz)`` of the strand's per-record cache, or ``None``.
 
-        Falls back to the ``cache_dir`` path, where a lazy build would write.
+        The first searched directory holding both files; a lone ``.npy`` does
+        not count, so it cannot shadow a complete cache further down the list.
         """
-        dirs = self._cache_dirs()
-        for directory in dirs:
-            npy = cache_paths(directory, chrom, strand)[0]
-            if npy.is_file():
-                return npy
-        return cache_paths(dirs[0], chrom, strand)[0]
-
-    def _cache_location(self, chrom: str, strand: str) -> Optional[Path]:
-        """The first searched directory holding both files of the strand's cache."""
         for directory in self._cache_dirs():
             npy_path, npz_path = cache_paths(directory, chrom, strand)
             if npy_path.is_file() and npz_path.is_file():
-                return directory
+                return npy_path, npz_path
         return None
 
     def _open_cache(self, chrom: str, strand: str) -> _CachedProfile | None:
         """Memory-map the (chrom, strand) cache if both its files exist."""
-        directory = self._cache_location(chrom, strand)
-        if directory is None:
+        found = self._find_cache(chrom, strand)
+        if found is None:
             return None
-        npy_path, npz_path = cache_paths(directory, chrom, strand)
+        npy_path, npz_path = found
         try:
             codes = np.load(npy_path, mmap_mode="r")
             with np.load(npz_path) as side:
@@ -1884,16 +1880,16 @@ class GenomeAccessibilityService:
         parquet = self._find_profile(chrom)
         stale_in: Optional[Path] = None
         if parquet is not None and chrom not in self._current:
-            found = self._cache_location(chrom, strand)
-            if found is not None and _cache_is_stale(found, chrom, parquet):
-                stale_in = found
+            found = self._find_cache(chrom, strand)
+            if found is not None and _cache_is_stale(found[0].parent, chrom, parquet):
+                stale_in = found[0].parent
         profile = None if stale_in is not None else self._open_cache(chrom, strand)
         if profile is None:
             if parquet is None:
                 searched = " or ".join(
                     str(cache_paths(d, chrom, strand)[0]) for d in self._cache_dirs()
                 )
-                raise AccessibilityError(
+                raise ProfileNotFoundError(
                     f"Profile for {chrom} not found: neither the cache "
                     f"{searched} nor the Parquet "
                     f"{self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'} exists."
@@ -1947,7 +1943,7 @@ class GenomeAccessibilityService:
         npy = str(packed_paths(root, strand)[0])
         profile = packed.record(chrom)
         if profile is None:
-            raise AccessibilityError(
+            raise ProfileNotFoundError(
                 f"Profile for {chrom} not found in the packed cache {npy}"
             )
         if profile.n_pos == 0:
@@ -1979,7 +1975,7 @@ class GenomeAccessibilityService:
             profile: _Profile = self._dense_profile(self._frames[chrom], strand, source)
         else:
             if self.data_dir is None:
-                raise AccessibilityError(
+                raise ProfileNotFoundError(
                     f"Profile for {chrom} not found among the in-memory "
                     f"accessibility frames ({', '.join(sorted(self._frames)) or 'none'})."
                 )
@@ -1989,10 +1985,15 @@ class GenomeAccessibilityService:
             else:
                 profile = self._cached_from_disk(chrom, strand)
                 packed_root = self._packed_dir()
+                found = (
+                    None if packed_root is not None else self._find_cache(chrom, strand)
+                )
                 source = str(
                     packed_paths(packed_root, strand)[0]
                     if packed_root is not None
-                    else self._npy_path(chrom, strand)
+                    else found[0]
+                    if found is not None
+                    else "the accessibility cache"
                 )
 
         self._profiles[profile_key] = profile
@@ -2037,9 +2038,11 @@ class GenomeAccessibilityService:
                 return packed_lens[0], packed_lens[1]
             out: list[Optional[int]] = []
             for strand in ("+", "-"):
-                npy = self._npy_path(chrom, strand)
+                found = self._find_cache(chrom, strand)
                 out.append(
-                    int(np.load(npy, mmap_mode="r").shape[0]) if npy.is_file() else None
+                    None
+                    if found is None
+                    else int(np.load(found[0], mmap_mode="r").shape[0])
                 )
             return out[0], out[1]
         except Exception as exc:  # noqa: BLE001 - diagnostics only
@@ -2125,12 +2128,14 @@ class GenomeAccessibilityService:
             groups[(c, str(strands[i]))].append(i)
 
         for (chrom, strand), row_indices in groups.items():
+            if strand not in ("+", "-"):
+                continue
             try:
                 profile_key = self._ensure_profile(chrom, strand)
             except MissingStrandError:
                 _warn_missing_strand(chrom, strand)
                 continue
-            except Exception:
+            except ProfileNotFoundError:
                 continue
 
             profile = self._profiles[profile_key]
@@ -2176,7 +2181,11 @@ class GenomeAccessibilityService:
                 continue
             rid = packed.record_ids(chroms[sel])
             known = rid >= 0
-            lengths = np.where(known, packed.lengths[np.maximum(rid, 0)], 0)
+            lengths = (
+                np.where(known, packed.lengths[np.maximum(rid, 0)], 0)
+                if packed.lengths.size
+                else np.zeros(rid.shape, dtype=np.int64)
+            )
             empty = known & (lengths == 0)
             if empty.any():
                 _warn_missing_strand(str(chroms[sel[np.argmax(empty)]]), strand)

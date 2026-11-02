@@ -934,3 +934,29 @@ def test_many_short_records(tmp_path):
                 _per_record_slice(rec, name, strand),
                 (name, strand),
             )
+
+
+def test_empty_pack_keeps_the_default(tmp_path: Path) -> None:
+    """A pack with no records answers every hit with the 10.0 default."""
+    for strand in "+-":
+        npy, npz = packed_paths(tmp_path, strand)
+        np.save(npy, np.zeros((0, 30), dtype=np.uint8))
+        np.savez(
+            npz,
+            names=np.array([], dtype="U1"),
+            offsets=np.array([], dtype=np.int64),
+            lengths=np.array([], dtype=np.int64),
+            index=np.array([], dtype=np.int64),
+            value=np.array([], dtype=np.float32),
+        )
+    service = acc.GenomeAccessibilityService(tmp_path)
+    hits = pl.DataFrame(
+        {
+            "chrom": ["chrA", "chrB", "onTarget"],
+            "start": [10, 5, 1],
+            "end": [30, 25, 20],
+            "strand": ["+", "-", "+"],
+        }
+    )
+    out = service.annotate_opening_energy_vectorized(hits)
+    assert out["opening_energy"].to_list() == [10.0, 10.0, 10.0]

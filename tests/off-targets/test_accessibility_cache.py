@@ -28,6 +28,7 @@ import pytest
 from sioff.services.accessibility import (
     AccessibilityError,
     GenomeAccessibilityService,
+    ProfileNotFoundError,
     build_accessibility_cache,
     cache_paths,
     ensure_accessibility_cache,
@@ -431,6 +432,77 @@ def test_missing_cache_and_parquet_raise(tmp_path: Path) -> None:
     # The vectorised annotator keeps the old contract: unknown contig -> 10.0.
     out = service.annotate_opening_energy_vectorized(hits)
     assert out["opening_energy"].to_list() == [10.0]
+
+
+def test_unknown_contig_still_defaults_silently(tmp_path: Path) -> None:
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    service = GenomeAccessibilityService(empty)
+    hits = pl.DataFrame(
+        {"chrom": ["chrQ"], "start": [10], "end": [30], "strand": ["+"]}
+    )
+    with _capture_warnings() as seen:
+        out = service.annotate_opening_energy_vectorized(hits)
+    assert out["opening_energy"].to_list() == [10.0]
+    assert seen == []
+
+
+def test_unknown_contig_is_a_profile_not_found_error(tmp_path: Path) -> None:
+    service = GenomeAccessibilityService(tmp_path)
+    with pytest.raises(ProfileNotFoundError, match="chrQ"):
+        service.query("chrQ", 0, 10, "+")
+    assert issubclass(ProfileNotFoundError, AccessibilityError)
+
+
+def _per_record_cache(parquet_dir: Path, cache_dir: Path) -> None:
+    """A per-record (chrom, strand) cache of the profiles in ``parquet_dir``."""
+    build_accessibility_cache(parquet_dir / "chrA.accessibility.parquet", cache_dir)
+
+
+def test_corrupt_cache_raises_instead_of_defaulting(
+    tmp_path: Path, parquet_dir: Path
+) -> None:
+    cache_dir = tmp_path / "cache"
+    _per_record_cache(parquet_dir, cache_dir)
+    cache_paths(cache_dir, "chrA", "+")[1].write_bytes(b"not an npz")
+    service = GenomeAccessibilityService(tmp_path / "none", cache_dir=cache_dir)
+    hits = pl.DataFrame(
+        {"chrom": ["chrA"], "start": [10], "end": [30], "strand": ["+"]}
+    )
+    with pytest.raises(AccessibilityError, match="Corrupt"):
+        service.annotate_opening_energy_vectorized(hits)
+
+
+def test_lone_npy_in_cache_dir_does_not_shadow_a_complete_cache(
+    tmp_path: Path, parquet_dir: Path
+) -> None:
+    from loguru import logger
+
+    data_dir, cache_dir = tmp_path / "data", tmp_path / "cache"
+    cache_dir.mkdir()
+    _per_record_cache(parquet_dir, data_dir)
+    real_npy = cache_paths(data_dir, "chrA", "+")[0]
+    stale = cache_paths(cache_dir, "chrA", "+")[0]
+    np.save(stale, np.zeros_like(np.load(real_npy)))
+    hits = pl.DataFrame(
+        {"chrom": ["chrA"], "start": [100], "end": [120], "strand": ["+"]}
+    )
+    want = GenomeAccessibilityService(
+        data_dir, cache_dir=data_dir
+    ).annotate_opening_energy_vectorized(hits)
+
+    infos: list[str] = []
+    handler = logger.add(lambda m: infos.append(m.record["message"]), level="INFO")
+    try:
+        got = GenomeAccessibilityService(
+            data_dir, cache_dir=cache_dir
+        ).annotate_opening_energy_vectorized(hits)
+    finally:
+        logger.remove(handler)
+    assert got["opening_energy"].to_list() == want["opening_energy"].to_list()
+    assert want["opening_energy"][0] != 10.0
+    assert any(str(real_npy) in m for m in infos), infos
+    assert not any(str(stale) in m for m in infos), infos
 
 
 def test_corrupt_cache_file_is_reported(tmp_path: Path, parquet_dir: Path) -> None:

@@ -230,7 +230,7 @@ def _init_worker(
     on_target_map: dict,
     self_hyb_emin: dict,
     temperature: float = 37.0,
-    accessibility_cache_dir: str = "",
+    accessibility_cache_dir: Optional[str] = None,
     summary_only: bool = False,
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
@@ -264,7 +264,11 @@ def _init_worker(
         acc_service = GenomeAccessibilityService(
             Path(accessibility_dir),
             max_cached=4,
-            cache_dir=Path(accessibility_cache_dir),
+            cache_dir=(
+                Path(accessibility_cache_dir)
+                if accessibility_cache_dir is not None
+                else None
+            ),
         )
 
     _WORKER_PROB_SERVICE = ProbabilityService(acc_service, temperature=temperature)
@@ -1247,7 +1251,7 @@ def compute_off_targets_directory(
         on_target_map,
         self_hyb_emin,
         temperature,
-        str(cache_dir) if cache_dir is not None else "",
+        str(cache_dir) if cache_dir is not None else None,
         summary_only,
     )
 
