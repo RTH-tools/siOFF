@@ -188,10 +188,10 @@ def off_targets(
         only; mutually exclusive with ``accessibility_dir``. No CLI equivalent.
     accessibility_dir : str or pathlib.Path, optional
         The npy cache from ``sioff accessibility`` or per-chromosome Parquet
-        files. For Parquet the cache is built in ``accessibility_cache_dir``
-        on first use (the directory form builds it before its workers start).
-        The only accessibility source the directory form accepts. CLI:
-        ``-a/--accessibility-dir``.
+        files. For Parquet every contig's cache is built in
+        ``accessibility_cache_dir`` before scoring starts, in both forms, and
+        rebuilt when it is older than its Parquet. The only accessibility
+        source the directory form accepts. CLI: ``-a/--accessibility-dir``.
     accessibility_cache_dir : str or pathlib.Path, optional
         Where the cache is read from and built; default ``accessibility_dir``.
         Created if absent; use it when ``accessibility_dir`` is read-only or

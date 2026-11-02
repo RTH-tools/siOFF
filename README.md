@@ -350,9 +350,13 @@ documents every option; run it with `sioff -c my-config.yaml`.
 so every worker shares one page-cache copy. `sioff accessibility` writes the
 cache by default. A Parquet `-a` gets it built on the first run, next to the
 Parquet or in `--accessibility-cache-dir` (for example node-local scratch, or
-when `-a` is read-only). A cache directory that holds a complete cache needs
-no Parquet in `-a`. `off-targets` stops with an error when neither `-a` nor
-`--accessibility-cache-dir` holds any profile, and when it cannot write the cache.
+when `-a` is read-only), and rebuilt (with a warning) once the Parquet is newer
+than it, as after re-folding into the same directory. The cache takes one byte
+per position and `u` on each strand, about 186 GB for hg38 at `-u 30`; use
+`--accessibility-cache-dir` to put it on a disk with room. A cache directory
+that holds a complete cache needs no Parquet in `-a`. `off-targets` stops
+with an error when neither `-a` nor `--accessibility-cache-dir` holds any
+profile, and when it cannot write the cache.
 A failed worker never passes silently: the successful siRNAs are written, then
 `off-targets` reports `N/M siRNAs failed ...; first error: ...` and exits 1.
 

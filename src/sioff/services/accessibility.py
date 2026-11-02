@@ -435,7 +435,7 @@ def _encode(values: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     """Encode float32 kcal/mol to uint8 codes; also flag the inexact entries.
 
     Uses the very ``np.round(v * 10)`` the consumers apply, so a decoded code
-    re-quantises to the same value the eager path produced.
+    re-quantises to the same value the dense in-memory path produces.
     """
     k = np.round(values * _SCALE)
     codes = np.clip(k, 0, _SENTINEL_CODE).astype(np.uint8)
@@ -639,10 +639,10 @@ def build_accessibility_cache(
     Streams the Parquet by row group (never more than ``batch_rows`` rows in
     flight) into a preallocated ``uint8[max_position, n_u]`` per strand, so
     peak memory is one strand's cache (chr1: 7.5 GB) plus a batch. Positions
-    absent from the Parquet keep code 255 (25.5 kcal/mol), as the eager path
-    did; positions must be unique within a strand, as the writer guarantees.
-    A strand with no rows gets an empty ``(0, n_u)`` cache so the build stays
-    idempotent, and queries on it raise like the eager path.
+    absent from the Parquet keep code 255 (25.5 kcal/mol), as in the dense
+    in-memory path; positions must be unique within a strand, as the writer
+    guarantees. A strand with no rows gets an empty ``(0, n_u)`` cache so the
+    build stays idempotent, and queries on it raise like the dense path.
 
     Files are written to a temporary name and renamed into place. Each
     ``.npy`` is dated no earlier than the Parquet it was read from, so the
@@ -838,7 +838,7 @@ def ensure_accessibility_cache(
 
 
 class _DenseProfile:
-    """One strand as the eager float32 ``[n_pos, n_u]`` array (in-memory frames)."""
+    """One strand as a dense float32 ``[n_pos, n_u]`` array (in-memory frames)."""
 
     __slots__ = ("arr",)
 
@@ -1003,7 +1003,7 @@ class GenomeAccessibilityService:
         file per chromosome containing columns [position, strand, u1, u2, ...,
         u{unpaired_prob}]; with ``"npy"`` writes the uint8 memory-map cache
         (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
-        sidecars, see `build_accessibility_cache`) instead, which the
+        sidecars, see `build_accessibility_cache`) instead, which
         ``off-targets`` reads with no conversion step.
         ``strand="+"`` folds each sequence as given only (see
         `_fold_full_chromosome`).
@@ -1136,7 +1136,7 @@ class GenomeAccessibilityService:
 
     @staticmethod
     def _dense_profile(full: pl.DataFrame, strand: str, source: str) -> _DenseProfile:
-        """The eager path: one strand of a whole-chromosome frame as float32[max_pos, n_u].
+        """The dense in-memory path: one strand of a frame as float32[max_pos, n_u].
 
         Positions absent from the frame keep the 25.5 kcal/mol sentinel.
         """
