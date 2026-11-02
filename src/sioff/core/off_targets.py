@@ -666,9 +666,10 @@ def compute_off_targets_single(
         ``accessibility_dir``.
     accessibility_dir : pathlib.Path, optional
         The npy cache from ``sioff accessibility`` or per-chromosome Parquet
-        files (CLI ``-a/--accessibility-dir``); for Parquet the cache is built
-        in ``accessibility_cache_dir`` on first use. Mutually exclusive with
-        ``accessibility``.
+        files (CLI ``-a/--accessibility-dir``); for Parquet the cache of every
+        contig is built (or rebuilt, when older than its Parquet) in
+        ``accessibility_cache_dir`` before the predictions are read. Mutually
+        exclusive with ``accessibility``.
     accessibility_cache_dir : pathlib.Path, optional
         Where the cache is read from and built; default ``accessibility_dir``
         (CLI ``--accessibility-cache-dir``). Created if absent.
@@ -817,6 +818,14 @@ def compute_off_targets_single(
     if is_running_risearch and target_fasta is None:
         raise ValueError(
             "sirna_fasta requires target_fasta when running RIsearch dynamically"
+        )
+
+    # Check the profiles and build the uint8 cache before the predictions are
+    # loaded, searched or intersected, so a bad -a fails at once.
+    cache_dir: Optional[Path] = None
+    if accessibility_dir:
+        cache_dir = _prepare_accessibility_cache(
+            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
 
     # --- Acquire predictions ---
@@ -971,9 +980,6 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
-        cache_dir = _prepare_accessibility_cache(
-            Path(accessibility_dir), accessibility_cache_dir, n_workers
-        )
         acc_service = GenomeAccessibilityService(
             Path(accessibility_dir), max_cached=4, cache_dir=cache_dir
         )
@@ -1073,12 +1079,13 @@ def compute_off_targets_directory(
     accessibility_dir : pathlib.Path, optional
         The npy cache from ``sioff accessibility`` or per-chromosome Parquet
         files (CLI ``-a/--accessibility-dir``); for Parquet the cache is built
-        in ``accessibility_cache_dir`` before the pool starts. Without it,
-        opening energies are treated as zero.
+        (or rebuilt, when older than its Parquet) in ``accessibility_cache_dir``
+        first, before the transcriptome is parsed or the pool starts. Without
+        it, opening energies are treated as zero.
     accessibility_cache_dir : pathlib.Path, optional
         Where the cache is read from and built; default ``accessibility_dir``
         (CLI ``--accessibility-cache-dir``); created if absent. Every contig
-        that has a Parquet but no cache is built here, in the parent
+        that has a Parquet but no current cache is built here, in the parent
         (``min(n_workers, 4)`` build processes, one strand's cache in memory
         each), and each worker then memory-maps the finished files.
     temperature : float, default 37.0
@@ -1159,14 +1166,13 @@ def compute_off_targets_directory(
     all_files = risearch_parser.list_directory_files(input_dir)
     if not all_files:
         raise FileNotFoundError(f"No RIsearch files found in {input_dir}")
-    # Workers memory-map the uint8 cache; it lives in the cache dir, which
-    # defaults to the accessibility dir.
+    # Check the profiles and build the uint8 cache first: a bad -a then fails
+    # before the GTF parse and self-hybridisation, and before the IPC temp dir
+    # exists. Workers only ever memory-map the finished files.
     cache_dir: Optional[Path] = None
     if accessibility_dir is not None:
-        cache_dir = (
-            Path(accessibility_cache_dir)
-            if accessibility_cache_dir is not None
-            else Path(accessibility_dir)
+        cache_dir = _prepare_accessibility_cache(
+            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
 
     # Serialize transcriptome to a temp Arrow IPC file so workers can memory-map
@@ -1207,14 +1213,6 @@ def compute_off_targets_directory(
     if sirna_fasta is not None:
         self_hyb_emin = RIsearchService().self_hybridization_emin_batch(
             sirna_fasta, matrix=matrix
-        )
-
-    # Build the accessibility cache once, here, so workers only ever
-    # map finished files (and never each decode a whole chromosome).
-    if cache_dir is not None:
-        assert accessibility_dir is not None
-        _prepare_accessibility_cache(
-            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
 
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)

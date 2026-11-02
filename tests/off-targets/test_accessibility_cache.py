@@ -584,6 +584,92 @@ def test_off_targets_refuses_a_directory_without_profiles(tmp_path, form):
             list(out)
 
 
+def _record_calls(monkeypatch, targets, called: list[str]) -> None:
+    """Spy on ``(class, method)`` pairs: record each call, then run the method."""
+    for cls, name in targets:
+        original = getattr(cls, name)
+
+        def spy(*args, _original=original, _name=name, **kwargs):
+            called.append(_name)
+            return _original(*args, **kwargs)
+
+        monkeypatch.setattr(cls, name, spy)
+
+
+def test_directory_mode_checks_profiles_before_the_transcriptome(tmp_path, monkeypatch):
+    """An empty -a fails before the GTF parse and self-hybridisation, and leaves
+    no transcriptome IPC temp dir behind."""
+    import tempfile
+
+    import sioff.core.off_targets as core
+
+    scratch = tmp_path / "tmp"
+    scratch.mkdir()
+    monkeypatch.setattr(tempfile, "tempdir", str(scratch))
+    called: list[str] = []
+    _record_calls(
+        monkeypatch,
+        [
+            (core.AnnotationParser, "load_gtf"),
+            (core.RIsearchService, "self_hybridization_emin_batch"),
+        ],
+        called,
+    )
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    with pytest.raises(AccessibilityError, match="No accessibility profiles in"):
+        list(
+            core.compute_off_targets_directory(
+                input_dir=_in_dir(tmp_path, PREDICTIONS),
+                sirna_fasta=EXAMPLES / "sirnas.fa",
+                gtf_file=EXAMPLES / "annotation.gtf",
+                accessibility_dir=empty,
+                n_workers=1,
+            )
+        )
+    assert not list(scratch.glob("risearch_ipc_*")), "transcriptome IPC dir leaked"
+    assert called == []
+
+
+@pytest.mark.parametrize("source", ["risearch_file", "sirna_fasta"])
+def test_single_file_checks_profiles_before_reading_predictions(
+    tmp_path, monkeypatch, source
+):
+    """An empty -a fails before predictions are loaded, searched or intersected."""
+    import sioff.core.off_targets as core
+
+    called: list[str] = []
+    _record_calls(
+        monkeypatch,
+        [
+            (core.RIsearchParser, "load"),
+            (core.RIsearchService, "validate_sirna_fasta"),
+            (core.RIsearchService, "index_target"),
+            (core.RIsearchService, "run_search"),
+            (core.AnnotationParser, "load_gtf"),
+        ],
+        called,
+    )
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    predictions = (
+        {"risearch_file": PREDICTIONS}
+        if source == "risearch_file"
+        else {
+            "sirna_fasta": EXAMPLES / "sirnas.fa",
+            "target_fasta": GENOME,
+            "target_index": tmp_path / "missing.idx",
+        }
+    )
+    with pytest.raises(AccessibilityError, match="No accessibility profiles in"):
+        core.compute_off_targets_single(
+            **predictions,
+            gtf_file=EXAMPLES / "annotation.gtf",
+            accessibility_dir=empty,
+        )
+    assert called == []
+
+
 def test_single_file_with_empty_dir_reads_a_complete_cache_dir(tmp_path):
     import sioff
 
