@@ -239,7 +239,9 @@ def _init_worker(
     rather than being re-parsed from the original GTF/GFF3, so all workers share
     the same physical memory pages via the OS page cache. With
     ``accessibility_dir`` the service memory-maps the uint8 cache the parent
-    built in ``accessibility_cache_dir`` before starting the pool.
+    built and checked in ``accessibility_cache_dir`` (``None``: in
+    ``accessibility_dir``) before starting the pool, so the worker does not
+    check it against the Parquet again.
     """
     os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
     # pyarrow reads the shared transcriptome IPC and the cache-building Parquet,
@@ -269,6 +271,7 @@ def _init_worker(
                 if accessibility_cache_dir is not None
                 else None
             ),
+            verify_pack=False,
         )
 
     _WORKER_PROB_SERVICE = ProbabilityService(acc_service, temperature=temperature)
@@ -984,8 +987,12 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
+        # _prepare_accessibility_cache checked (or rebuilt) the pack above.
         acc_service = GenomeAccessibilityService(
-            Path(accessibility_dir), max_cached=4, cache_dir=cache_dir
+            Path(accessibility_dir),
+            max_cached=4,
+            cache_dir=cache_dir,
+            verify_pack=False,
         )
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)

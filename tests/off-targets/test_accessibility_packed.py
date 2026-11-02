@@ -8,6 +8,7 @@ into ``tmp_path`` from the same Parquet files.
 
 import os
 import shutil
+import time
 from pathlib import Path
 
 import numpy as np
@@ -214,7 +215,7 @@ def test_packing_closes_each_parquet_before_the_next(tmp_path, monkeypatch):
         held = 0
         for fd in fd_dir.iterdir():
             try:
-                held += os.readlink(fd).startswith(str(pdir) + os.sep)
+                held += os.readlink(fd).startswith(str(pdir.resolve()) + os.sep)
             except OSError:
                 pass
         peak = max(peak, held)
@@ -223,7 +224,7 @@ def test_packing_closes_each_parquet_before_the_next(tmp_path, monkeypatch):
     monkeypatch.setattr(acc, "_fill_strand", watching)
     assert len(pack_parquet_profiles(pdir, tmp_path / "packed", workers=1)) == 50
     # The open file plus its batch reader; one per record would reach 50.
-    assert peak <= 3
+    assert 1 <= peak <= 3
 
 
 # --------------------------------------------------------------------------
@@ -514,7 +515,7 @@ def _add_recD(d):
     return ["recA", "recB", "recC", "recD"]
 
 
-@pytest.mark.parametrize("change", [_refold_recB, _delete_recC, _add_recD])
+@pytest.mark.parametrize("change", [_refold_recB, _add_recD])
 def test_ensure_repacks_when_the_parquet_dir_changes(pq_copy, warnings_seen, change):
     d, seqs = pq_copy
     ensure_accessibility_cache(d)
@@ -538,6 +539,21 @@ def test_mixed_generation_pair_is_repacked(pq_copy, warnings_seen):
     assert ensure_accessibility_cache(d) == sorted(seqs)
     assert any("does not match the Parquet profiles" in m for m in warnings_seen)
     assert ensure_accessibility_cache(d) == []
+
+
+def test_ensure_keeps_the_pack_when_a_parquet_is_deleted(pq_copy):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    hits = [("+", 10, 30), ("-", 10, 30)]
+    before = _annotate(acc.GenomeAccessibilityService(d), "recA", hits)
+    later = packed_paths(d, "+")[0].stat().st_mtime - 10
+    _delete_recC(d)
+    for f in d.glob("*.accessibility.parquet"):
+        os.utime(f, (later, later))
+    assert ensure_accessibility_cache(d) == []
+    assert _pack_names(d) == sorted(seqs)
+    after = _annotate(acc.GenomeAccessibilityService(d), "recA", hits)
+    np.testing.assert_array_equal(before, after)
 
 
 def test_service_packs_lazily(pq_copy):
@@ -564,8 +580,9 @@ def test_service_repacks_a_stale_pack_and_serves_the_new_one(pq_copy):
     service = acc.GenomeAccessibilityService(d)
     service.query_single("recB", 10, 20, "+")
     assert _pack_names(d) == ["recA", "recB"]
-    assert service._packed_strand("+") is not None
-    assert "recB" in service._packed_strand("+").names.tolist()
+    packed = service._packed_strand("+")
+    assert packed is not None
+    assert packed.record_ids(np.array(["recB", "recC"])).tolist() == [1, -1]
 
 
 def test_half_present_pair_is_corrupt(packed_and_reference, tmp_path):
@@ -960,3 +977,424 @@ def test_empty_pack_keeps_the_default(tmp_path: Path) -> None:
     )
     out = service.annotate_opening_energy_vectorized(hits)
     assert out["opening_energy"].to_list() == [10.0, 10.0, 10.0]
+
+
+# --------------------------------------------------------------------------
+# Review fixes: index memory, currency checks, corrupt indexes, staging.
+# --------------------------------------------------------------------------
+
+
+def _write_pack(directory: Path, names, n_u: int = 3) -> None:
+    """A hand-made pack whose record ``i`` is one row of code ``i``."""
+    directory.mkdir(parents=True, exist_ok=True)
+    n = len(names)
+    for strand in "+-":
+        npy, npz = packed_paths(directory, strand)
+        np.save(npy, np.repeat(np.arange(n, dtype=np.uint8)[:, None], n_u, axis=1))
+        np.savez(
+            npz,
+            names=np.array(names, dtype=str),
+            offsets=np.arange(n, dtype=np.int64),
+            lengths=np.ones(n, dtype=np.int64),
+            index=np.empty(0, np.int64),
+            value=np.empty(0, np.float32),
+        )
+
+
+def test_strands_share_one_compact_name_index(tmp_path):
+    _write_pack(tmp_path / "pack", ["recB", "recA"])
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=tmp_path / "pack")
+    plus, minus = svc._packed_strand("+"), svc._packed_strand("-")
+    assert plus is not None and minus is not None
+    # One copy of the names per process, one byte per ASCII character.
+    assert plus.names is minus.names
+    assert plus.names.dtype.kind == "S"
+
+
+def test_record_ids_when_name_order_differs_from_file_order(tmp_path):
+    # '-' sorts before '.', so file-name order puts "a-b" first; names sort "a"
+    # first. Non-ASCII IDs must round-trip too.
+    names = ["a-b", "a", "tx_é", "tx_z", "B"]
+    _write_pack(tmp_path / "pack", names)
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=tmp_path / "pack")
+    packed = svc._packed_strand("+")
+    assert packed is not None
+    queries = np.array(["a", "a-b", "tx_é", "tx_z", "B", "nope", "tx_", "b"])
+    assert packed.record_ids(queries).tolist() == [1, 0, 2, 3, 4, -1, -1, -1]
+    hits = pl.DataFrame(
+        {
+            "chrom": names,
+            "start": [1] * 5,
+            "end": [1] * 5,
+            "strand": ["+"] * 5,
+        }
+    )
+    got = svc.annotate_opening_energy_vectorized(hits)["opening_energy"].to_list()
+    assert got == pytest.approx([0.0, 0.1, 0.2, 0.3, 0.4])
+
+
+def test_off_targets_checks_the_pack_once(pq_copy, monkeypatch):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    calls: list[Path] = []
+    real = acc._pack_is_current
+
+    def counting(pack_dir, parquet_files):
+        calls.append(pack_dir)
+        return real(pack_dir, parquet_files)
+
+    monkeypatch.setattr(acc, "_pack_is_current", counting)
+    out = sioff.off_targets(predictions=_synthetic_hits(seqs), accessibility_dir=d)
+    assert (out["opening_energy"] != 10.0).any()
+    # The parent's ensure_accessibility_cache; the service trusts it.
+    assert len(calls) == 1
+
+
+def test_worker_service_trusts_the_parent_check(pq_copy, monkeypatch):
+    import pyarrow as pa
+
+    import sioff.core.off_targets as ot
+
+    d, _ = pq_copy
+    ensure_accessibility_cache(d)
+    monkeypatch.setattr(
+        acc,
+        "_pack_is_current",
+        lambda *a: pytest.fail("a worker re-ran the pack check"),
+    )
+    for name in (
+        "_WORKER_PROB_SERVICE",
+        "_WORKER_ON_TARGET_MAP",
+        "_WORKER_SELF_HYB_EMIN",
+    ):
+        monkeypatch.setattr(ot, name, getattr(ot, name))
+    monkeypatch.setattr(ot, "_WORKER_SUMMARY_ONLY", ot._WORKER_SUMMARY_ONLY)
+    monkeypatch.setenv("POLARS_MAX_THREADS", os.environ.get("POLARS_MAX_THREADS", "1"))
+    cpus = pa.cpu_count()
+    try:
+        ot._init_worker("", str(d), 1, {}, {}, 37.0, None, False)
+        service = ot._WORKER_PROB_SERVICE.accessibility_service
+        assert service._packed_dir() == d
+    finally:
+        pa.set_cpu_count(cpus)
+
+
+def test_newer_fold_beside_older_parquet_is_kept(parquet_records, tmp_path):
+    """Re-folding a Parquet directory with the npy default keeps the new fold."""
+    pdir, seqs = parquet_records
+    d = tmp_path / "acc"
+    shutil.copytree(pdir, d)  # the old W=80 Parquet
+    order = ["recB", "recA", "recC"]  # FASTA order, not file-name order
+    fa = _write_fasta(tmp_path / "multi.fa", [(n, seqs[n]) for n in order])
+    acc.GenomeAccessibilityService(d).compute_genome_accessibility(
+        fa, 40, 20, 30, output_format="npy", chunk_size=700
+    )
+    ref = tmp_path / "ref"
+    acc.GenomeAccessibilityService(ref).compute_genome_accessibility(
+        fa, 40, 20, 30, output_format="npy", chunk_size=700
+    )
+    older = packed_paths(d, "+")[0].stat().st_mtime - 100
+    for f in d.glob("*.accessibility.parquet"):
+        os.utime(f, (older, older))
+
+    assert ensure_accessibility_cache(d) == []
+    assert _pack_names(d) == order
+    hits = [("+", 100, 120), ("-", 100, 120), ("+", 500, 530)]
+    got = _annotate(acc.GenomeAccessibilityService(d), "recA", hits)
+    want = _annotate(acc.GenomeAccessibilityService(ref), "recA", hits)
+    np.testing.assert_array_equal(got, want)
+    assert (got != 10.0).all()
+
+
+def test_newer_fasta_pack_with_extra_records_is_kept(parquet_records, tmp_path):
+    """Records in the pack that have no Parquet do not make it stale."""
+    pdir, seqs = parquet_records
+    d = tmp_path / "acc"
+    d.mkdir()
+    for name in ("recA", "recB"):
+        shutil.copy(pdir / f"{name}.accessibility.parquet", d)
+    hour_ago = time.time() - 3600
+    for f in d.glob("*.accessibility.parquet"):
+        os.utime(f, (hour_ago, hour_ago))
+    order = ["recA", "recB", "recC"]
+    fa = _write_fasta(tmp_path / "multi.fa", [(n, seqs[n]) for n in order])
+    acc.GenomeAccessibilityService(d).compute_genome_accessibility(
+        fa, 40, 20, 30, output_format="npy", chunk_size=700
+    )
+    ref = tmp_path / "ref"
+    acc.GenomeAccessibilityService(ref).compute_genome_accessibility(
+        fa, 40, 20, 30, output_format="npy", chunk_size=700
+    )
+    assert ensure_accessibility_cache(d) == []
+    assert _pack_names(d) == order
+    hits = [("+", 100, 120), ("-", 100, 120)]
+    got = _annotate(acc.GenomeAccessibilityService(d), "recA", hits)
+    want = _annotate(acc.GenomeAccessibilityService(ref), "recA", hits)
+    np.testing.assert_array_equal(got, want)
+    assert (got != 10.0).all()
+
+
+def test_zero_byte_packed_npy_is_repacked(pq_copy):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    packed_paths(d, "+")[0].write_bytes(b"")
+    assert ensure_accessibility_cache(d) == sorted(seqs)
+    got = _annotate(acc.GenomeAccessibilityService(d), "recA", [("+", 10, 30)])
+    assert got[0] != 10.0
+
+
+def _truncate(path: Path) -> None:
+    path.write_bytes(path.read_bytes()[: path.stat().st_size // 2])
+
+
+def test_truncated_packed_index_is_reported_as_corrupt(packed_and_reference, tmp_path):
+    _, _, packed, _ = packed_and_reference
+    _truncate(packed_paths(packed, "-")[1])
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=packed)
+    with pytest.raises(AccessibilityError, match="Corrupt packed accessibility cache"):
+        _annotate(svc, "recA", [("-", 10, 30)])
+
+
+def test_truncated_per_record_sidecar_is_reported_as_corrupt(
+    packed_and_reference, tmp_path
+):
+    _, _, _, ref = packed_and_reference
+    _truncate(cache_paths(ref, "recA", "+")[1])
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=ref)
+    with pytest.raises(AccessibilityError, match="Corrupt accessibility cache"):
+        _annotate(svc, "recA", [("+", 10, 30)])
+
+
+def test_ensure_repacks_a_pack_with_a_truncated_index(pq_copy):
+    d, seqs = pq_copy
+    ensure_accessibility_cache(d)
+    _truncate(packed_paths(d, "-")[1])
+    assert ensure_accessibility_cache(d) == sorted(seqs)
+    got = _annotate(acc.GenomeAccessibilityService(d), "recA", [("-", 10, 30)])
+    assert got[0] != 10.0
+
+
+def test_annotate_packed_edge_hits(parquet_records, tmp_path, warnings_seen):
+    """Strand ".", an empty record, and both record ends, in a mixed pack."""
+    pdir, seqs = parquet_records
+    fa = tmp_path / "edge.fa"
+    fa.write_text(
+        f">recC\n{seqs['recC']}\n>empty\n>recA\n{seqs['recA']}\n>recB\n{seqs['recB']}\n"
+    )
+    packed = tmp_path / "packed"
+    acc.GenomeAccessibilityService(packed).compute_genome_accessibility(
+        fa, 80, 40, 30, output_format="npy", chunk_size=700
+    )
+    ref = _per_record_dir(pdir, seqs, tmp_path / "rec")
+    n_a = len(seqs["recA"])
+    hits = [
+        ("recA", "+", 0, 4),  # first cells of the record
+        ("recA", "+", n_a - 4, n_a),  # last cells of the record
+        ("recA", "-", 0, 4),
+        ("recA", "-", n_a - 4, n_a),
+        ("recB", "+", 100, 120),
+        ("recA", ".", 10, 30),  # no strand: keeps the default
+        ("empty", "+", 0, 4),  # zero-length record: keeps the default
+        ("onTarget", "+", 1, 20),
+        ("nope", "-", 5, 20),
+    ]
+    df = pl.DataFrame(
+        {
+            "chrom": [h[0] for h in hits],
+            "strand": [h[1] for h in hits],
+            "start": [h[2] for h in hits],
+            "end": [h[3] for h in hits],
+        },
+        schema={
+            "chrom": pl.Utf8,
+            "strand": pl.Utf8,
+            "start": pl.Int32,
+            "end": pl.Int32,
+        },
+    )
+
+    def run(cache_dir):
+        svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=cache_dir)
+        return svc.annotate_opening_energy_vectorized(df)["opening_energy"].to_numpy()
+
+    got, want = run(packed), run(ref)
+    np.testing.assert_array_equal(got[:5], want[:5])
+    # A site at the very start of a record can lie outside the folded windows,
+    # on the per-record path too; the other ends and records carry values.
+    assert got[3] != 10.0 and got[4] != 10.0
+    assert got[1] == want[1]  # a real zero at the far end, not the default
+    assert (got[5:] == 10.0).all()
+    assert any("has no" in m and "strand" in m for m in warnings_seen), warnings_seen
+
+
+def test_categorical_and_null_chroms_match_the_per_record_path(
+    packed_and_reference, tmp_path
+):
+    _, _, packed, ref = packed_and_reference
+    df = pl.DataFrame(
+        {
+            "chrom": ["recA", None, "onTarget", "recB", "recA", "nope", "recC"],
+            "start": [10, 10, 1, 40, 30, 5, 3],
+            "end": [30, 30, 20, 60, 45, 20, 12],
+            "strand": ["+", "+", "+", "-", ".", "+", "-"],
+        }
+    ).with_columns(pl.col("chrom").cast(pl.Categorical))
+
+    def run(cache_dir):
+        svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=cache_dir)
+        return svc.annotate_opening_energy_vectorized(df)["opening_energy"].to_numpy()
+
+    got, want = run(packed), run(ref)
+    np.testing.assert_array_equal(got, want)
+    assert got[0] != 10.0 and got[3] != 10.0
+
+
+def _parquet_writer(pdir, out):
+    return pack_parquet_profiles(pdir, out)
+
+
+def _fasta_writer(seqs, out, tmp_path, w):
+    fa = _write_fasta(tmp_path / f"w{w}.fa", seqs.items())
+    acc.GenomeAccessibilityService(out).compute_genome_accessibility(
+        fa, w, 20, 30, output_format="npy", chunk_size=700
+    )
+
+
+@pytest.mark.parametrize("writer", ["fasta", "parquet"])
+def test_failed_index_write_leaves_the_old_pack_intact(
+    parquet_records, tmp_path, monkeypatch, writer
+):
+    pdir, seqs = parquet_records
+    out = tmp_path / "out"
+    if writer == "fasta":
+        _fasta_writer(seqs, out, tmp_path, 80)
+    else:
+        pack_parquet_profiles(pdir, out)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    real = np.savez
+
+    def failing(file, *args, **kwargs):
+        if "minus" in str(file):
+            raise OSError("disk full")
+        return real(file, *args, **kwargs)
+
+    changed = tmp_path / "changed"  # different codes, so a replaced pair shows
+    shutil.copytree(pdir, changed)
+    _refold_recB(changed)
+    monkeypatch.setattr(acc.np, "savez", failing)
+    with pytest.raises(OSError, match="disk full"):
+        if writer == "fasta":
+            _fasta_writer(seqs, out, tmp_path, 40)
+        else:
+            pack_parquet_profiles(changed, out)
+    # Neither strand was replaced, and no temporary file is left.
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+
+
+def test_fold_removes_temp_files_left_by_a_killed_run(parquet_records, tmp_path):
+    _, seqs = parquet_records
+    out = tmp_path / "out"
+    out.mkdir()
+    for leftover in (
+        "accessibility.plus.packed.npy.99999.tmp.npy",
+        "accessibility.minus.packed.npz.99999.tmp.npz",
+    ):
+        (out / leftover).write_bytes(b"partial")
+    (out / "unrelated.tmp.npy").write_bytes(b"keep")
+    _fasta_writer(seqs, out, tmp_path, 80)
+    assert _listing(out) == sorted(PACKED_NAMES + ["unrelated.tmp.npy"])
+
+
+def test_fold_warns_when_the_disk_looks_too_small(
+    parquet_records, tmp_path, monkeypatch, warnings_seen
+):
+    _, seqs = parquet_records
+    real = acc.shutil.disk_usage
+
+    def tiny(path):
+        usage = real(path)
+        return usage._replace(free=1000)
+
+    monkeypatch.setattr(acc.shutil, "disk_usage", tiny)
+    _fasta_writer(seqs, tmp_path / "out", tmp_path, 80)
+    assert any("free" in m and "accessibility" in m for m in warnings_seen), (
+        warnings_seen
+    )
+
+
+def test_fold_pool_is_spawned_and_sized_by_the_batches(
+    parquet_records, tmp_path, monkeypatch
+):
+    _, seqs = parquet_records
+    seen: list[dict] = []
+    real = acc.ProcessPoolExecutor
+
+    class Recording(real):
+        def __init__(self, *args, **kwargs):
+            seen.append(kwargs)
+            super().__init__(*args, **kwargs)
+
+    monkeypatch.setattr(acc, "ProcessPoolExecutor", Recording)
+    monkeypatch.setattr(
+        acc, "_batch_records", lambda sizes, target=0: [[i] for i in range(len(sizes))]
+    )
+    fa = _write_fasta(tmp_path / "multi.fa", seqs.items())
+    acc.GenomeAccessibilityService(tmp_path / "out").compute_genome_accessibility(
+        fa, 80, 40, 30, workers=8, output_format="npy", chunk_size=700
+    )
+    assert len(seen) == 1
+    assert seen[0]["max_workers"] == 3
+    assert seen[0]["mp_context"].get_start_method() == "spawn"
+
+
+def test_packed_lookup_warns_about_unequal_strand_lengths(tmp_path, warnings_seen):
+    rng = np.random.default_rng(2)
+    n = 500
+    full = tmp_path / "full.accessibility.parquet"
+    _fold_full_chromosome(_random_seq(n, rng), "rec", 80, 40, 30, str(full), 700)
+    pdir = tmp_path / "pq"
+    pdir.mkdir()
+    df = pl.read_parquet(full)
+    df = df.filter(~((pl.col("strand") == "-") & (pl.col("position") == n)))
+    df.write_parquet(pdir / "rec.accessibility.parquet")
+    pack_parquet_profiles(pdir, tmp_path / "packed")
+    warnings_seen.clear()
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=tmp_path / "packed")
+    hits = [("+", 50, 60), ("-", 50, 60)]
+    _annotate(svc, "rec", hits)
+    _annotate(svc, "rec", hits)
+    covers = [m for m in warnings_seen if "'+' covers" in m]
+    assert len(covers) == 1, warnings_seen
+    assert "rec" in covers[0]
+
+
+def test_empty_hit_frame_on_a_pack(packed_and_reference, tmp_path):
+    """An siRNA without hits annotates an empty frame, and loads nothing."""
+    _, _, packed, _ = packed_and_reference
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=packed)
+    df = pl.DataFrame(
+        schema={
+            "chrom": pl.String,
+            "start": pl.Int32,
+            "end": pl.Int32,
+            "strand": pl.String,
+        }
+    )
+    out = svc.annotate_opening_energy_vectorized(df)
+    assert out.height == 0 and out.schema["opening_energy"] == pl.Float32
+    assert svc._packed_strands == {}
+
+
+def test_verify_pack_false_uses_the_pack_as_found(pq_copy):
+    """Only for callers that just ran ensure_accessibility_cache: no re-check.
+
+    The default service ignores (and later repacks) a pack older than its
+    Parquet; ``verify_pack=False`` trusts the caller's check and uses it.
+    """
+    d, _ = pq_copy
+    ensure_accessibility_cache(d)
+    later = packed_paths(d, "+")[0].stat().st_mtime + 10
+    for f in d.glob("*.accessibility.parquet"):
+        os.utime(f, (later, later))
+    assert acc.GenomeAccessibilityService(d)._packed_dir() is None
+    assert acc.GenomeAccessibilityService(d, verify_pack=False)._packed_dir() == d

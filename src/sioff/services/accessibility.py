@@ -1,7 +1,10 @@
+import glob
 import itertools
 import math
 import multiprocessing
 import os
+import shutil
+import zipfile
 from collections import Counter, OrderedDict, defaultdict
 from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -402,6 +405,10 @@ PACKED_SUFFIX = ".packed.npy"
 PACKED_INDEX_SUFFIX = ".packed.npz"
 _PACK_TASK_POSITIONS = 2_000_000
 
+# What reading a damaged cache file raises: ``np.load`` of a truncated
+# ``.npz`` fails in ``zipfile``, of a truncated ``.npy`` with ValueError.
+_CORRUPT_CACHE_ERRORS = (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile)
+
 
 def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     """Return ``(codes .npy, exceptions .npz)`` paths for one contig strand."""
@@ -529,13 +536,22 @@ def _strand_row_groups(pf: pq.ParquetFile, strand: str) -> tuple[list[int], int]
     return row_groups, max_pos
 
 
+def _tmp_path(target: Path) -> Path:
+    """This process's temporary name for ``target``, with the same suffix.
+
+    Keeping the suffix matters: ``np.savez`` appends ``.npz`` to a name
+    without it.
+    """
+    return target.with_name(f"{target.name}.{os.getpid()}.tmp{target.suffix}")
+
+
 def _write_atomically(target: Path, write) -> None:
     """``write(tmp_path)`` then rename, so readers never see a partial file.
 
     A concurrent builder of the same target writes its own temporary file and
     the last rename wins; both renames deliver a complete, identical file.
     """
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp{target.suffix}")
+    tmp = _tmp_path(target)
     try:
         write(tmp)
         os.replace(tmp, target)
@@ -750,6 +766,48 @@ def build_accessibility_cache(
     return built
 
 
+def _warn_if_disk_is_small(directory: Path, nbytes: int) -> None:
+    """Warn when ``directory`` has less free space than a pack about to be written.
+
+    The packed ``.npy`` is a sparse file filled through a memory map, so a
+    full disk surfaces as SIGBUS (the process dies, no error message) rather
+    than as an ``OSError``. Only a warning: a compressing filesystem stores
+    the codes in far less than their logical size.
+    """
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:
+        return
+    if free < nbytes:
+        logger.warning(
+            f"Writing the packed accessibility cache into {directory} needs "
+            f"{nbytes / 1e9:.1f} GB but only {free / 1e9:.1f} GB is free; the run "
+            "may die when the disk fills (a bus error, as the cache is written "
+            "through a memory map)."
+        )
+
+
+def _stage_index(
+    npz_path: Path,
+    names: list[str],
+    offsets: Union[np.ndarray, Sequence[int]],
+    lengths: Union[np.ndarray, Sequence[int]],
+    index: np.ndarray,
+    value: np.ndarray,
+) -> Path:
+    """Write a packed ``.npz`` index under this process's temporary name."""
+    tmp = _tmp_path(npz_path)
+    np.savez(
+        tmp,
+        names=np.array(names, dtype=str),
+        offsets=np.asarray(offsets, dtype=np.int64),
+        lengths=np.asarray(lengths, dtype=np.int64),
+        index=index,
+        value=value,
+    )
+    return tmp
+
+
 def _batch_records(
     sizes: Sequence[int], target: int = _PACK_TASK_POSITIONS
 ) -> list[list[int]]:
@@ -836,9 +894,11 @@ def pack_parquet_profiles(
     gets no pair, and an existing pair for it in ``cache_dir`` is deleted.
 
     The code matrix is filled through a memory map by up to
-    ``min(workers, 4)`` spawned processes, so it is never held in memory. The
-    ``.npz`` is renamed into place before the ``.npy``, and each ``.npy`` is
-    dated no earlier than the newest Parquet (read before packing).
+    ``min(workers, 4)`` spawned processes, so it is never held in memory.
+    Every strand's files are written under temporary names first and only
+    then renamed into place, each ``.npz`` before its ``.npy``, so a failure
+    leaves the previous pack whole. Each ``.npy`` is dated no earlier than
+    the newest Parquet (read before packing).
 
     Parameters
     ----------
@@ -899,13 +959,12 @@ def pack_parquet_profiles(
                 path.unlink(missing_ok=True)
     strands = [s for s in _STRAND_NAMES if totals[s]]
 
+    _warn_if_disk_is_small(cache_dir, sum(totals.values()) * n_u)
     tmp_paths: dict[str, Path] = {}
+    staged: list[tuple[Path, Path]] = []
     try:
         for strand in strands:
-            npy_path = packed_paths(cache_dir, strand)[0]
-            tmp = npy_path.with_name(
-                f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}"
-            )
+            tmp = _tmp_path(packed_paths(cache_dir, strand)[0])
             tmp_paths[strand] = tmp
             mm = np.lib.format.open_memmap(
                 tmp, mode="w+", dtype=np.uint8, shape=(totals[strand], n_u)
@@ -938,6 +997,7 @@ def pack_parquet_profiles(
                 results = list(pool.map(_pack_parquet_batch, *zip(*tasks)))
 
         label = "accessibility (packed)"
+        n_exceptions: dict[str, int] = {}
         for strand in strands:
             index, value = _sorted_exceptions(
                 label,
@@ -946,29 +1006,24 @@ def pack_parquet_profiles(
                 [r[strand][1] for r in results if strand in r],
                 totals[strand] * n_u,
             )
+            n_exceptions[strand] = len(index)
             npy_path, npz_path = packed_paths(cache_dir, strand)
-            _write_atomically(
-                npz_path,
-                lambda t, o=offsets[strand], n=lengths[strand], i=index, v=value: (
-                    np.savez(
-                        t,
-                        names=np.array(names, dtype=str),
-                        offsets=o,
-                        lengths=np.array(n, dtype=np.int64),
-                        index=i,
-                        value=v,
-                    )
-                ),
+            npz_tmp = _stage_index(
+                npz_path, names, offsets[strand], lengths[strand], index, value
             )
-            os.replace(tmp_paths[strand], npy_path)
+            staged += [(npz_tmp, npz_path), (tmp_paths[strand], npy_path)]
+        for tmp, final in staged:
+            os.replace(tmp, final)
+        for strand in strands:
+            npy_path = packed_paths(cache_dir, strand)[0]
             _date_no_earlier_than(npy_path, newest)
             logger.info(
                 f"Packed {len(names):,} records into {npy_path.name}: "
-                f"{totals[strand]:,} positions × {n_u}, {len(index):,} "
+                f"{totals[strand]:,} positions × {n_u}, {n_exceptions[strand]:,} "
                 "exact-value exceptions"
             )
     finally:
-        for tmp in tmp_paths.values():
+        for tmp in [*tmp_paths.values(), *(t for t, _ in staged)]:
             tmp.unlink(missing_ok=True)
     return names
 
@@ -1011,6 +1066,24 @@ def _fold_records_into_pack(
     return _concat_exceptions(found)
 
 
+def _remove_interrupted_fold_temps(cache_dir: Path) -> None:
+    """Delete packed temporary files a killed fold left in ``cache_dir``.
+
+    Temporary names carry the writer's pid, so a run killed by SIGKILL, a
+    batch-system time limit or SIGBUS (disk full) leaves files of the full
+    cache size that no later run would replace. One ``sioff accessibility``
+    run writes a directory at a time, so any such file is an orphan. The
+    Parquet packer does not do this: two off-target runs may pack one
+    directory concurrently.
+    """
+    for strand in _STRAND_NAMES:
+        for target in packed_paths(cache_dir, strand):
+            pattern = f"{glob.escape(target.name)}.*.tmp{target.suffix}"
+            for orphan in cache_dir.glob(pattern):
+                logger.info(f"Removing {orphan}, left by an interrupted run")
+                orphan.unlink(missing_ok=True)
+
+
 def _pack_fasta_records(
     records: Sequence[tuple[str, str]],
     cache_dir: Path,
@@ -1029,29 +1102,32 @@ def _pack_fasta_records(
     ``lengths`` (a reverse complement is as long as its record). Each written
     strand's ``.npy`` is preallocated under a temporary name and filled
     through memory maps by `_fold_records_into_pack`, on `_batch_records`
-    batches: inline for ``workers <= 1``, else in a pool of ``workers``
-    processes. Only exceptions come back to this process, and ``on_batch``
-    gets the record count of every finished batch. The ``.npz`` is renamed
-    into place before the ``.npy``; with ``strand="+"`` a minus pair left by
-    an earlier run is deleted afterwards. Temporary files never outlive the
-    call.
+    batches: inline when ``workers`` or the number of batches is 1, else in
+    a spawned pool of ``min(workers, batches)`` processes. Only exceptions
+    come back to this process, and ``on_batch`` gets the record count of
+    every finished batch. Both strands' files are written under temporary
+    names before any is renamed into place (each ``.npz`` before its
+    ``.npy``), so a failure leaves the previous pack whole; with
+    ``strand="+"`` a minus pair left by an earlier run is deleted afterwards.
+    Temporary files never outlive the call, and those of an earlier,
+    killed run are removed first.
 
     Returns the plus strand's ``.npy`` path.
     """
     cache_dir.mkdir(parents=True, exist_ok=True)
+    _remove_interrupted_fold_temps(cache_dir)
     names = [name for name, _ in records]
     lengths = np.array([len(seq) for _, seq in records], dtype=np.int64)
     offsets = (np.cumsum(lengths) - lengths).astype(np.int64)
     total = int(lengths.sum())
     strands = ["+"] if strand == "+" else ["+", "-"]
+    _warn_if_disk_is_small(cache_dir, total * unpaired_prob * len(strands))
 
     tmp_paths: dict[str, Path] = {}
+    staged: list[tuple[Path, Path]] = []
     try:
         for s in strands:
-            npy_path = packed_paths(cache_dir, s)[0]
-            tmp = npy_path.with_name(
-                f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}"
-            )
+            tmp = _tmp_path(packed_paths(cache_dir, s)[0])
             tmp_paths[s] = tmp
             mm = np.lib.format.open_memmap(
                 tmp, mode="w+", dtype=np.uint8, shape=(total, unpaired_prob)
@@ -1074,12 +1150,17 @@ def _pack_fasta_records(
             for batch in _batch_records(lengths.tolist())
         ]
         results: list[dict[str, tuple[np.ndarray, np.ndarray]]] = []
-        if workers <= 1:
+        n_workers = min(workers, len(tasks))
+        if n_workers <= 1:
             for task in tasks:
                 results.append(_fold_records_into_pack(*task))
                 on_batch(len(task[1]))
         else:
-            with ProcessPoolExecutor(max_workers=workers) as pool:
+            # spawn, as for the Parquet packer and the off-target workers: no
+            # fork of a parent whose polars/Rayon threads may be running.
+            with ProcessPoolExecutor(
+                max_workers=n_workers, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
                 futures = {
                     pool.submit(_fold_records_into_pack, *task): len(task[1])
                     for task in tasks
@@ -1093,6 +1174,7 @@ def _pack_fasta_records(
                     pool.shutdown(cancel_futures=True)
                     raise
 
+        n_exceptions: dict[str, int] = {}
         for s in strands:
             index, value = _sorted_exceptions(
                 "accessibility (packed)",
@@ -1101,23 +1183,17 @@ def _pack_fasta_records(
                 [r[s][1] for r in results],
                 total * unpaired_prob,
             )
+            n_exceptions[s] = len(index)
             npy_path, npz_path = packed_paths(cache_dir, s)
-            _write_atomically(
-                npz_path,
-                lambda t, i=index, v=value: np.savez(
-                    t,
-                    names=np.array(names, dtype=str),
-                    offsets=offsets,
-                    lengths=lengths,
-                    index=i,
-                    value=v,
-                ),
-            )
-            os.replace(tmp_paths[s], npy_path)
+            npz_tmp = _stage_index(npz_path, names, offsets, lengths, index, value)
+            staged += [(npz_tmp, npz_path), (tmp_paths[s], npy_path)]
+        for tmp, final in staged:
+            os.replace(tmp, final)
+        for s in strands:
             logger.info(
-                f"Folded {len(names):,} records into {npy_path.name}: "
-                f"{total:,} positions × {unpaired_prob}, {len(index):,} "
-                "exact-value exceptions"
+                f"Folded {len(names):,} records into "
+                f"{packed_paths(cache_dir, s)[0].name}: {total:,} positions × "
+                f"{unpaired_prob}, {n_exceptions[s]:,} exact-value exceptions"
             )
         if strand == "+":
             # A minus pair from an earlier --strand both run would otherwise
@@ -1125,7 +1201,7 @@ def _pack_fasta_records(
             for path in packed_paths(cache_dir, "-"):
                 path.unlink(missing_ok=True)
     finally:
-        for tmp in tmp_paths.values():
+        for tmp in [*tmp_paths.values(), *(t for t, _ in staged)]:
             tmp.unlink(missing_ok=True)
     return packed_paths(cache_dir, "+")[0]
 
@@ -1154,7 +1230,7 @@ def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
         return False
     try:
         arr = np.load(npy_path, mmap_mode="r")
-    except (OSError, ValueError):
+    except (OSError, ValueError, EOFError):
         return False
     return arr.ndim == 2 and arr.dtype == np.uint8
 
@@ -1190,16 +1266,20 @@ def _warn_stale(chrom: str, cache_dir: Path, parquet_path: Path) -> None:
 
 
 def _pack_is_current(pack_dir: Path, parquet_files: list[Path]) -> bool:
-    """Every packed pair in ``pack_dir`` was built from exactly these Parquet files.
+    """Every packed pair in ``pack_dir`` holds every record of these Parquet files.
 
     For each strand that has any packed file, all three must hold: both files
-    are present and pass the header checks, the ``.npz`` ``names`` equal the
-    records of ``parquet_files`` (in the order given, the packer's sorted
-    file-name order), and the ``.npy`` is no older than the newest Parquet. A
-    directory with no packed file is not current. Content is never read, only
-    the ``names`` list, so this stays cheap on a genome-sized pack.
+    are present and pass the header checks, the ``.npz`` ``names`` contain
+    every Parquet record (order is ignored: a pack folded from a FASTA keeps
+    FASTA order), and the ``.npy`` is no older than the newest Parquet. Names
+    without a Parquet (one deleted later, or a FASTA fold of more records)
+    are harmless. So a FASTA re-fold into a Parquet directory is kept while
+    the Parquet is older than it. A
+    directory with no packed file is not current; nor is one whose files
+    cannot be read. Content is never read, only the ``names`` list, so this
+    stays cheap on a genome-sized pack.
     """
-    want = [_chrom_of(f) for f in parquet_files]
+    want = {_chrom_of(f) for f in parquet_files}
     try:
         newest = max(f.stat().st_mtime_ns for f in parquet_files)
     except (OSError, ValueError):
@@ -1215,9 +1295,9 @@ def _pack_is_current(pack_dir: Path, parquet_files: list[Path]) -> bool:
         try:
             with np.load(npz_path) as side:
                 names = np.asarray(side["names"]).tolist()
-            if names != want or npy_path.stat().st_mtime_ns < newest:
+            if not want.issubset(names) or npy_path.stat().st_mtime_ns < newest:
                 return False
-        except (OSError, ValueError, KeyError):
+        except _CORRUPT_CACHE_ERRORS:
             return False
     return found
 
@@ -1235,17 +1315,18 @@ def ensure_accessibility_cache(
 
     1. A directory without Parquet (only caches) packs nothing.
     2. A packed pair in ``cache_dir`` or ``parquet_dir`` (searched in that
-       order, the first one holding any packed file) that was built from
-       exactly these Parquet files, and is no older than the newest of them,
-       is kept.
+       order, the first one holding any packed file) that holds every
+       record of these Parquet files, in any order, and is no older than the
+       newest of them, is kept: a pack of a later FASTA fold into the same
+       directory included.
     3. With no pack, and a valid, current per-record cache (the v0.2.0 layout
        of `build_accessibility_cache`) in ``cache_dir`` for every Parquet
        contig, that cache is reused and nothing is packed, so a genome-sized
        cache is never duplicated.
     4. Otherwise `pack_parquet_profiles` packs every Parquet, in sorted
        file-name order. A pack that existed but no longer matches its Parquet
-       (the directory was re-folded, or a record was added or removed) is
-       rebuilt with a warning.
+       (the directory was re-folded, a record was added or removed, or a
+       pack file cannot be read) is rebuilt with a warning.
 
     Parameters
     ----------
@@ -1390,6 +1471,20 @@ class _CachedProfile:
 _Profile = Union[_DenseProfile, _CachedProfile]
 
 
+def _name_keys(names: np.ndarray) -> np.ndarray:
+    """Record names as UTF-8 bytes (``S`` dtype), the packed reader's lookup keys.
+
+    numpy's ``str`` dtype takes four bytes per character of the longest name:
+    385k GENCODE IDs of up to 151 characters come to 233 MB per copy, a
+    quarter of that as bytes. UTF-8 orders like the code points, so sorting
+    and searching the bytes agrees with doing so on the strings.
+    """
+    names = np.asarray(names)
+    if names.dtype.kind == "S":
+        return names
+    return np.char.encode(names.astype(str), "utf-8")
+
+
 class _PackedStrand:
     """One strand of a packed cache: every record's code rows back to back.
 
@@ -1397,7 +1492,9 @@ class _PackedStrand:
     rows ``offsets[i] : offsets[i] + lengths[i]``. ``exc_index`` holds the exact
     exceptions as global flat indices (``row * n_u + col``). ``whole`` is a
     profile over the full matrix, so a gather at global rows needs no per-record
-    object.
+    object. ``names`` are UTF-8 bytes (see `_name_keys`); ``by_name`` orders
+    them, so lookups need no sorted copy. Both strands of a pack hold the same
+    names, and the service passes one strand's arrays to the other.
     """
 
     def __init__(
@@ -1408,27 +1505,28 @@ class _PackedStrand:
         lengths: np.ndarray,
         exc_index: np.ndarray,
         exc_value: np.ndarray,
+        by_name: Optional[np.ndarray] = None,
     ):
         self.codes = codes
-        self.names = names
+        self.names = _name_keys(names)
         self.offsets = offsets
         self.lengths = lengths
         self.exc_index = exc_index
         self.exc_value = exc_value
         self.whole = _CachedProfile(codes, exc_index, exc_value)
-        # Names are in file-name order, which need not be sorted by name.
-        self._by_name = np.argsort(names, kind="stable")
-        self._sorted_names = names[self._by_name]
+        # Names are in file-name or FASTA order, which need not be sorted.
+        self._by_name = (
+            np.argsort(self.names, kind="stable") if by_name is None else by_name
+        )
 
     def record_ids(self, chroms: np.ndarray) -> np.ndarray:
         """Record number of each name in ``chroms``; ``-1`` for an unknown one."""
-        chroms = np.asarray(chroms, dtype=str)
-        if self._sorted_names.size == 0:
-            return np.full(chroms.shape, -1, dtype=np.int64)
-        pos = np.searchsorted(self._sorted_names, chroms)
-        pos_c = np.minimum(pos, self._sorted_names.size - 1)
-        found = self._sorted_names[pos_c] == chroms
-        return np.where(found, self._by_name[pos_c], -1).astype(np.int64)
+        keys = _name_keys(np.asarray(chroms, dtype=str))
+        if self.names.size == 0:
+            return np.full(keys.shape, -1, dtype=np.int64)
+        pos = np.searchsorted(self.names, keys, sorter=self._by_name)
+        rid = self._by_name[np.minimum(pos, self.names.size - 1)]
+        return np.where(self.names[rid] == keys, rid, -1).astype(np.int64)
 
     def record(self, name: str) -> Optional[_CachedProfile]:
         """A view of one record's rows and exceptions; ``None`` if unknown."""
@@ -1445,8 +1543,14 @@ class _PackedStrand:
         )
 
 
-def _load_packed_strand(directory: Path, strand: str) -> _PackedStrand:
-    """Map one strand's packed cache; only the ``.npz`` index is read into memory."""
+def _load_packed_strand(
+    directory: Path, strand: str, share: Optional[_PackedStrand] = None
+) -> _PackedStrand:
+    """Map one strand's packed cache; only the ``.npz`` index is read into memory.
+
+    ``share`` is the other strand of the pack, if loaded: when its names are
+    the same, its name arrays are reused, so a process holds them once.
+    """
     npy_path, npz_path = packed_paths(directory, strand)
 
     def corrupt(why: str) -> AccessibilityError:
@@ -1463,20 +1567,27 @@ def _load_packed_strand(directory: Path, strand: str) -> _PackedStrand:
             lengths = np.ascontiguousarray(side["lengths"], dtype=np.int64)
             exc_index = np.ascontiguousarray(side["index"], dtype=np.int64)
             exc_value = np.ascontiguousarray(side["value"], dtype=np.float32)
-    except (OSError, ValueError, KeyError) as e:
+        keys = _name_keys(names)
+    except _CORRUPT_CACHE_ERRORS as e:
         raise corrupt(f"{type(e).__name__}: {e}") from e
+    del names
     if codes.ndim != 2 or codes.dtype != np.uint8:
         raise corrupt(
             f"codes are {codes.dtype} with shape {codes.shape}, not 2-D uint8"
         )
-    if not (names.shape == offsets.shape == lengths.shape) or names.ndim != 1:
+    if not (keys.shape == offsets.shape == lengths.shape) or keys.ndim != 1:
         raise corrupt("names, offsets and lengths differ in length")
-    if names.size and int(offsets[-1] + lengths[-1]) != codes.shape[0]:
+    if exc_index.shape != exc_value.shape:
+        raise corrupt("the exception index and values differ in length")
+    if keys.size and int(offsets[-1] + lengths[-1]) != codes.shape[0]:
         raise corrupt(
             f"records cover {int(offsets[-1] + lengths[-1])} rows but the matrix "
             f"has {codes.shape[0]}"
         )
-    return _PackedStrand(codes, names, offsets, lengths, exc_index, exc_value)
+    by_name = None
+    if share is not None and np.array_equal(share.names, keys):
+        keys, by_name = share.names, share._by_name
+    return _PackedStrand(codes, keys, offsets, lengths, exc_index, exc_value, by_name)
 
 
 class GenomeAccessibilityService:
@@ -1498,7 +1609,9 @@ class GenomeAccessibilityService:
     `ensure_accessibility_cache` so worker processes only map finished files);
     a directory holding the complete cache needs no Parquet at all. The LRU of
     ``max_cached`` slots bounds the number of per-record mappings loaded per
-    process.
+    process. ``verify_pack=False`` skips the pack-versus-Parquet check: pass it
+    only when `ensure_accessibility_cache` has just run on the same
+    directories, as the off-target pipeline does before building services.
 
     `from_frames()` builds a service over in-memory per-chromosome
     DataFrames instead (the ``dict[chrom -> DataFrame]`` that
@@ -1512,8 +1625,10 @@ class GenomeAccessibilityService:
         max_cached: int = 4,
         frames: Optional[Mapping[str, pl.DataFrame]] = None,
         cache_dir: Optional[Path] = None,
+        verify_pack: bool = True,
     ):
         self.data_dir = data_dir
+        self._verify_pack = verify_pack
         if self.data_dir is not None:
             self.data_dir.mkdir(parents=True, exist_ok=True)
         # Where the uint8 cache is built and first looked for; None only for a
@@ -1534,6 +1649,8 @@ class GenomeAccessibilityService:
         # then (resetting it to that re-resolves).
         self._packed_root: object = _UNRESOLVED
         self._packed_strands: dict[str, Optional[_PackedStrand]] = {}
+        # Records whose two packed strands differ in length; None until computed.
+        self._packed_mismatches: Optional[dict[str, tuple[int, int]]] = None
 
     def _reset_packed(self) -> None:
         """Forget the resolved pack directory and every loaded strand.
@@ -1543,14 +1660,15 @@ class GenomeAccessibilityService:
         """
         self._packed_root = _UNRESOLVED
         self._packed_strands = {}
+        self._packed_mismatches = None
 
     def _packed_dir(self) -> Optional[Path]:
         """The first searched directory holding packed files, or ``None``.
 
         When ``data_dir`` holds Parquet the pack must match it (see
-        `_pack_is_current`), checked once per process; one that does not is
-        ignored, so the next lookup goes through `_cached_from_disk`, which
-        repacks it.
+        `_pack_is_current`), checked once per process unless the service was
+        built with ``verify_pack=False``; one that does not is ignored, so the
+        next lookup goes through `_cached_from_disk`, which repacks it.
         """
         if self._packed_root is _UNRESOLVED:
             root: Optional[Path] = None
@@ -1562,7 +1680,7 @@ class GenomeAccessibilityService:
                 ):
                     root = directory
                     break
-            if root is not None and self.data_dir is not None:
+            if root is not None and self.data_dir is not None and self._verify_pack:
                 files = sorted(self.data_dir.glob(f"*{PARQUET_SUFFIX}"))
                 if files and not _pack_is_current(root, files):
                     logger.info(
@@ -1579,7 +1697,7 @@ class GenomeAccessibilityService:
         """The packed cache of one strand, loaded once; ``None`` if it has none.
 
         A pair with only one of its two files (an interrupted pack) is corrupt,
-        not missing.
+        not missing. The two strands share one copy of the record names.
         """
         if strand not in self._packed_strands:
             root = self._packed_dir()
@@ -1587,9 +1705,41 @@ class GenomeAccessibilityService:
             if root is not None and any(
                 p.is_file() for p in packed_paths(root, strand)
             ):
-                loaded = _load_packed_strand(root, strand)
+                other = next(
+                    (p for p in self._packed_strands.values() if p is not None), None
+                )
+                loaded = _load_packed_strand(root, strand, share=other)
             self._packed_strands[strand] = loaded
         return self._packed_strands[strand]
+
+    def _packed_length_mismatches(self) -> dict[str, tuple[int, int]]:
+        """``{record: (plus length, minus length)}`` for records whose strands differ.
+
+        Computed once per loaded pack. Records empty on either strand are left
+        out, as `check_strand_lengths` skips them.
+        """
+        if self._packed_mismatches is None:
+            plus, minus = self._packed_strand("+"), self._packed_strand("-")
+            found: dict[str, tuple[int, int]] = {}
+            if plus is not None and minus is not None:
+                rid = (
+                    np.arange(plus.names.size)
+                    if plus.names is minus.names
+                    else minus.record_ids(np.char.decode(plus.names, "utf-8"))
+                )
+                known = rid >= 0
+                minus_len = np.zeros_like(plus.lengths)
+                minus_len[known] = minus.lengths[rid[known]]
+                differ = (
+                    (plus.lengths != minus_len) & (plus.lengths > 0) & (minus_len > 0)
+                )
+                for i in np.flatnonzero(differ):
+                    found[plus.names[i].decode("utf-8")] = (
+                        int(plus.lengths[i]),
+                        int(minus_len[i]),
+                    )
+            self._packed_mismatches = found
+        return self._packed_mismatches
 
     def _require_dir(self) -> Path:
         """The Parquet directory; a frame-backed service has none."""
@@ -1854,7 +2004,7 @@ class GenomeAccessibilityService:
             with np.load(npz_path) as side:
                 exc_index = np.ascontiguousarray(side["index"], dtype=np.int64)
                 exc_value = np.ascontiguousarray(side["value"], dtype=np.float32)
-        except (OSError, ValueError, KeyError) as e:
+        except _CORRUPT_CACHE_ERRORS as e:
             raise AccessibilityError(
                 f"Corrupt accessibility cache for {chrom} {strand} "
                 f"({npy_path}, {npz_path}): {e}. Delete the files to rebuild them."
@@ -2105,21 +2255,45 @@ class GenomeAccessibilityService:
         return int(round(raw_val * 10.0)) / 10.0
 
     def annotate_opening_energy_vectorized(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Add `opening_energy` column by vectorized numpy gather per (chrom, strand) group."""
+        """Add `opening_energy` column by vectorized numpy gather per (chrom, strand) group.
+
+        Hits on an unknown contig, on ``onTarget``, on a strand other than
+        ``+``/``-`` or outside their contig keep 10.0; so do hits on a strand
+        the profile lacks, with a warning. A cache that cannot be read raises
+        `AccessibilityError`.
+        """
         n_rows = df.height
         opening_energies = np.full(n_rows, 10.0, dtype=np.float32)
 
-        chroms = df["chrom"].to_numpy()
         starts = df["start"].to_numpy().astype(np.int64)
         ends = df["end"].to_numpy().astype(np.int64)
         strands = df["strand"].to_numpy()
 
+        if n_rows == 0:
+            return df.with_columns(pl.Series("opening_energy", [], dtype=pl.Float32))
+
         if not self._frames and self._packed_dir() is not None:
-            self._annotate_packed(chroms, starts, ends, strands, opening_energies)
+            # Map each distinct contig once: a per-hit array of names costs
+            # the longest name's width for every hit. Nulls read as "None",
+            # as `str` makes them on the per-group path below.
+            chrom = df["chrom"].cast(pl.String).fill_null("None")
+            uniq = chrom.unique(maintain_order=True)
+            inv = chrom.replace_strict(
+                uniq, np.arange(uniq.len(), dtype=np.int64), return_dtype=pl.Int64
+            ).to_numpy()
+            self._annotate_packed(
+                np.asarray(uniq.to_list(), dtype=str),
+                inv,
+                starts,
+                ends,
+                strands,
+                opening_energies,
+            )
             return df.with_columns(
                 pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
             )
 
+        chroms = df["chrom"].to_numpy()
         groups: dict[tuple, list] = defaultdict(list)
         for i in range(n_rows):
             c = str(chroms[i])
@@ -2157,7 +2331,8 @@ class GenomeAccessibilityService:
 
     def _annotate_packed(
         self,
-        chroms: np.ndarray,
+        names: np.ndarray,
+        inv: np.ndarray,
         starts: np.ndarray,
         ends: np.ndarray,
         strands: np.ndarray,
@@ -2165,21 +2340,26 @@ class GenomeAccessibilityService:
     ) -> None:
         """Fill ``out`` with every hit's opening energy from the packed cache.
 
-        One vectorised pass per strand: hits are mapped to records by name,
+        Hit ``i`` is on contig ``names[inv[i]]``; each distinct name is looked
+        up once. One vectorised pass per strand: hits are mapped to records,
         turned into global rows (``record offset + site_cells`` row) and gathered
         in a single call. Unknown records, ``onTarget``, other strands and hits
-        outside their record keep the default already in ``out``.
+        outside their record keep the default already in ``out``. Records whose
+        strands differ in length are warned about once, as on the per-record
+        path.
         """
-        chroms = np.asarray(chroms, dtype=str)
+        on_target = names == "onTarget"
+        self._check_packed_lengths(names[~on_target])
         for strand in ("+", "-"):
-            sel = np.flatnonzero((strands == strand) & (chroms != "onTarget"))
+            sel = np.flatnonzero(strands == strand)
+            sel = sel[~on_target[inv[sel]]]
             if sel.size == 0:
                 continue
             packed = self._packed_strand(strand)
             if packed is None:
-                _warn_missing_strand(str(chroms[sel[0]]), strand)
+                _warn_missing_strand(str(names[inv[sel[0]]]), strand)
                 continue
-            rid = packed.record_ids(chroms[sel])
+            rid = packed.record_ids(names)[inv[sel]]
             known = rid >= 0
             lengths = (
                 np.where(known, packed.lengths[np.maximum(rid, 0)], 0)
@@ -2188,7 +2368,7 @@ class GenomeAccessibilityService:
             )
             empty = known & (lengths == 0)
             if empty.any():
-                _warn_missing_strand(str(chroms[sel[np.argmax(empty)]]), strand)
+                _warn_missing_strand(str(names[inv[sel[np.argmax(empty)]]]), strand)
             rows, cols, in_bounds = site_cells(
                 strand, starts[sel], ends[sel], lengths, packed.codes.shape[1]
             )
@@ -2198,3 +2378,26 @@ class GenomeAccessibilityService:
             global_rows = rows[ok] + packed.offsets[rid[ok]]
             vals = packed.whole.gather(global_rows, cols[ok])
             out[sel[ok]] = (np.round(vals * 10.0) / 10.0).astype(np.float32)
+
+    def _check_packed_lengths(self, names: np.ndarray) -> None:
+        """`check_strand_lengths` for the packed records in ``names``, once each.
+
+        Diagnostics only, like `_strand_lengths`: a strand that cannot be
+        loaded here is reported by the lookup itself, never by this check.
+        """
+        if names.size == 0:
+            return
+        try:
+            mismatched = self._packed_length_mismatches()
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            logger.debug(f"could not compare packed strand lengths: {exc}")
+            self._packed_mismatches = {}
+            return
+        if not mismatched:
+            return
+        root = cast(Path, self._packed_dir())
+        source = str(packed_paths(root, "+")[0])
+        for name in names.tolist():
+            if name in mismatched and name not in self._strands_checked:
+                self._strands_checked.add(name)
+                check_strand_lengths(name, *mismatched[name], source)
