@@ -459,6 +459,20 @@ def test_strand_absent_from_parquet_raises_like_eager(tmp_path: Path) -> None:
     assert ensure_accessibility_cache(d, d) == []
 
 
+@pytest.mark.parametrize("workers", [1, 2])
+def test_unreadable_parquet_is_reported_by_name(
+    parquet_dir: Path, workers: int
+) -> None:
+    """In-process and pooled builds wrap a failure the same way."""
+    (parquet_dir / "chrX.accessibility.parquet").write_bytes(b"not a parquet file")
+    with pytest.raises(
+        AccessibilityError,
+        match="Failed to build accessibility cache for chrX.accessibility.parquet",
+    ) as exc_info:
+        ensure_accessibility_cache(parquet_dir, parquet_dir, workers=workers)
+    assert exc_info.value.__cause__ is not None
+
+
 def test_build_is_atomic(parquet_dir: Path) -> None:
     ensure_accessibility_cache(parquet_dir, parquet_dir)
     leftovers = [f for f in os.listdir(parquet_dir) if ".tmp" in f]

@@ -774,6 +774,15 @@ def ensure_accessibility_cache(
     -------
     list[str]
         Names of the contigs that were (re)built, largest file first.
+
+    Raises
+    ------
+    AccessibilityError
+        When a contig's cache cannot be built, naming its Parquet; the
+        original exception (an ``OSError`` for an unwritable ``cache_dir``)
+        is its ``__cause__``.
+    OSError
+        When ``cache_dir`` cannot be created.
     """
     parquet_dir = Path(parquet_dir)
     cache_dir = Path(cache_dir) if cache_dir is not None else parquet_dir
@@ -803,7 +812,12 @@ def ensure_accessibility_cache(
     )
     if n_proc == 1:
         for f in missing:
-            build_accessibility_cache(f, cache_dir, batch_rows)
+            try:
+                build_accessibility_cache(f, cache_dir, batch_rows)
+            except Exception as e:
+                raise AccessibilityError(
+                    f"Failed to build accessibility cache for {f.name}: {e}"
+                ) from e
         return names
 
     # spawn: a fresh interpreter per worker avoids fork + Arrow thread-pool deadlocks.
