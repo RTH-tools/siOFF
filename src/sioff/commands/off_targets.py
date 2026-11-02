@@ -110,7 +110,7 @@ def run(
         typer.Option(
             "-a",
             "--accessibility-dir",
-            help="Accessibility profiles from 'sioff accessibility': the packed `accessibility.*.packed.npy` cache written by 'sioff accessibility', or per-chromosome Parquet files (packed on the first run).",
+            help="Accessibility profiles from 'sioff accessibility': its packed accessibility.{plus,minus}.packed.npy cache, or per-record Parquet files (packed on the first run).",
             exists=True,
             file_okay=False,
         ),

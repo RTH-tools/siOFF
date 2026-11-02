@@ -301,7 +301,7 @@ in-process when given `-s/--sirna-fasta sirnas.fa --target-fasta genome.fa`
 sioff accessibility -f genome.fa -o accessibility/ -j 8
 ```
 
-Writes RNAplfold opening energies per chromosome (window `-W 80`, span
+Writes RNAplfold opening energies for every FASTA record (window `-W 80`, span
 `-L 40`, unpaired length `-u 30` by default — change them consistently if
 your protocol differs). The default `--output-format npy` writes the uint8
 cache that `off-targets` memory-maps: `accessibility.{plus,minus}.packed.npy`
@@ -317,7 +317,9 @@ For a transcriptome FASTA, whose records are already in sense orientation,
 `--strand +` skips the reverse complement and halves the work; run
 `off-targets` with `--sense-only` on such profiles, or every antisense hit
 keeps the default opening energy (10 kcal/mol, with a warning).
-Chromosomes fold in parallel (`-j`, one worker per chromosome). This is the
+Records fold in parallel (`-j` processes; short records such as transcripts
+are grouped into batches of about 2 Mb, a long chromosome is a batch of its
+own). This is the
 most compute-intensive stage: budget hours and tens of GB of memory for a
 mammalian genome — run it on a cluster (see
 [Orchestrated runs](#orchestrated-multi-step-runs-local--slurm)) and reuse
@@ -355,8 +357,9 @@ to the Parquet or in `--accessibility-cache-dir` (for example node-local
 scratch, or when `-a` is read-only), and rebuilt (with a warning) when its
 Parquet changes, as after re-folding into the same directory. A complete
 v0.2.0 per-record cache (`{chrom}_{plus,minus}.access.npy`) next to the
-Parquet is still read, and so is such a directory used as `-a`. The cache takes one byte
-per position and `u` on each strand, about 186 GB for hg38 at `-u 30`; use
+Parquet is still read, and a directory of such files is still accepted as
+`-a`. The cache takes one byte per position and `u` on each strand, about
+186 GB for hg38 at `-u 30`; use
 `--accessibility-cache-dir` to put it on a disk with room. A cache directory
 that holds a complete cache needs no Parquet in `-a`. `off-targets` stops
 with an error when neither `-a` nor `--accessibility-cache-dir` holds any
@@ -439,7 +442,7 @@ Available on `sioff` itself, before any subcommand.
 | `-u / --unpaired` | Unpaired probability length u (default: 30) |
 | `-T / --temperature` | Folding temperature °C (default: 37.0) |
 | `-z / --matrix` | Energy parameter set (`t04`, `slh04`, `s95-rna-dna`, `s95-dna-rna` or a DSM TSV path) for in-process searches and the self-hybridisation E_min of `-s`; use the set the predictions were searched with (default: `t04`) |
-| `-j / --workers` | Parallel workers, one per chromosome (default: 1) |
+| `-j / --workers` | Parallel folding processes; records are folded in batches of about 2 Mb (default: 1) |
 
 ### `index`
 

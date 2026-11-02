@@ -47,7 +47,7 @@ slurm:
 
 
 # =============================================================================
-# Step: accessibility  (pre-compute per-chromosome accessibility profiles)
+# Step: accessibility  (pre-compute accessibility profiles for every record)
 # =============================================================================
 accessibility:
   fasta: ../examples/data/genome.fa
