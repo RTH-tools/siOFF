@@ -75,6 +75,10 @@ off_targets:
   expression_metric: RPKM
   # accessibility_dir populated by the accessibility step above
   accessibility_dir: ./sioff_example_out/accessibility/
+  # Where the .access.npy cache is read from and built (default:
+  # accessibility_dir). Set it when accessibility_dir is read-only or to stage
+  # the cache on node-local disk.
+  # accessibility_cache_dir: ./sioff_example_out/accessibility_cache/
   output: ./sioff_example_out/off_targets.tsv
   type: gw
   alpha: "1.0"

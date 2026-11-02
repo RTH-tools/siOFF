@@ -184,6 +184,7 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("target_index", "--target-index"),
         ("transcriptome", "--transcriptome"),
         ("accessibility_dir", "--accessibility-dir"),
+        ("accessibility_cache_dir", "--accessibility-cache-dir"),
         ("output", "--output"),
         ("fasta", "--fasta"),
         ("on_target", "--on-target"),
