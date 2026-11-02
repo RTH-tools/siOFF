@@ -6,11 +6,15 @@ the packer is the per-record cache of `build_accessibility_cache`, built here
 into ``tmp_path`` from the same Parquet files.
 """
 
+import os
+from pathlib import Path
+
 import numpy as np
 import polars as pl
 import pytest
 from loguru import logger
 
+import sioff.services.accessibility as acc
 from sioff.services.accessibility import (
     AccessibilityError,
     _batch_records,
@@ -33,13 +37,10 @@ def parquet_records(tmp_path_factory):
     """Three folded records: one with exceptions, one plain, one shorter than W."""
     rng = np.random.default_rng(5)
     seqs = {
-        "recA": _random_seq(700, rng)
-        + HAIRPIN
-        + _random_seq(1600 - 700 - len(HAIRPIN), rng),
-        "recB": _random_seq(600, rng),
+        "recA": _random_seq(1600, rng),
+        "recB": _random_seq(300, rng) + HAIRPIN + _random_seq(300, rng),
         "recC": _random_seq(25, rng),
     }
-    assert len(seqs["recA"]) == 1600
     pdir = tmp_path_factory.mktemp("packed_parquets")
     for name, seq in seqs.items():
         _fold_full_chromosome(
@@ -49,10 +50,21 @@ def parquet_records(tmp_path_factory):
 
 
 @pytest.mark.parametrize("workers", [1, 2])
-def test_pack_from_parquet_equals_per_record_caches(parquet_records, tmp_path, workers):
+def test_pack_from_parquet_equals_per_record_caches(
+    parquet_records, tmp_path, workers, monkeypatch
+):
     pdir, seqs = parquet_records
+    calls: list[int] = []
+    if workers > 1:
+        # One batch per record, so the spawned process pool really runs.
+        def one_each(sizes, target=0):
+            calls.append(len(sizes))
+            return [[i] for i in range(len(sizes))]
+
+        monkeypatch.setattr(acc, "_batch_records", one_each)
     names = pack_parquet_profiles(pdir, tmp_path / "packed", workers=workers)
     assert names == sorted(seqs)
+    assert bool(calls) == (workers > 1)
     assert sorted(p.name for p in (tmp_path / "packed").iterdir()) == sorted(
         p.name for s in "+-" for p in packed_paths(tmp_path / "packed", s)
     )
@@ -75,7 +87,12 @@ def test_pack_from_parquet_equals_per_record_caches(parquet_records, tmp_path, w
                         side["index"][lo:hi] - off * n_u, rec["index"]
                     )
                     np.testing.assert_array_equal(side["value"][lo:hi], rec["value"])
-            assert side["index"].size > 0  # recA's hairpins
+            assert side["index"].size > 0  # recB's hairpins
+            i_b = names.index("recB")
+            off, n = int(side["offsets"][i_b]), int(side["lengths"][i_b])
+            assert off > 0
+            lo, hi = np.searchsorted(side["index"], [off * n_u, (off + n) * n_u])
+            assert hi > lo, strand
 
 
 def test_strand_absent_from_every_parquet_gets_no_pair(tmp_path):
@@ -162,3 +179,41 @@ def test_mismatched_u_columns_are_refused(tmp_path):
 def test_packed_paths_rejects_unknown_strand(tmp_path):
     with pytest.raises(AccessibilityError):
         packed_paths(tmp_path, "x")
+
+
+def test_packing_closes_each_parquet_before_the_next(tmp_path, monkeypatch):
+    """A batch of many records must not hold one open descriptor per record."""
+    fd_dir = Path("/proc/self/fd")
+    if not fd_dir.is_dir():
+        pytest.skip("needs /proc")
+    rng = np.random.default_rng(4)
+    pdir = tmp_path / "pq"
+    pdir.mkdir()
+    for i in range(50):
+        _fold_full_chromosome(
+            _random_seq(100, rng),
+            f"r{i:02d}",
+            40,
+            20,
+            10,
+            str(pdir / f"r{i:02d}.accessibility.parquet"),
+            700,
+        )
+    peak = 0
+    real = acc._fill_strand
+
+    def watching(*args, **kwargs):
+        nonlocal peak
+        held = 0
+        for fd in fd_dir.iterdir():
+            try:
+                held += os.readlink(fd).endswith(".accessibility.parquet")
+            except OSError:
+                pass
+        peak = max(peak, held)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(acc, "_fill_strand", watching)
+    assert len(pack_parquet_profiles(pdir, tmp_path / "packed", workers=1)) == 50
+    # The open file plus its batch reader; one per record would reach 50.
+    assert peak <= 3

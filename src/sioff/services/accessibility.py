@@ -1,3 +1,4 @@
+import itertools
 import math
 import multiprocessing
 import os
@@ -763,14 +764,16 @@ def _pack_parquet_batch(
     found: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {
         s: ([], []) for s in maps
     }
-    pfs: dict[str, pq.ParquetFile] = {}
-    for path, strand, off, n in jobs:
-        view = maps[strand][off : off + n]
-        view[:] = _SENTINEL_CODE
-        pf = pfs.get(path) or pfs.setdefault(path, pq.ParquetFile(path))
-        idx, val, _ = _fill_strand(pf, strand, u_cols, view, batch_rows)
-        found[strand][0].extend(i + off * n_u for i in idx)
-        found[strand][1].extend(val)
+    # One open ParquetFile at a time: a batch can hold thousands of records,
+    # and a descriptor per record would exhaust the open-file limit.
+    for path, group in itertools.groupby(jobs, key=lambda j: j[0]):
+        with pq.ParquetFile(path) as pf:
+            for _, strand, off, n in group:
+                view = maps[strand][off : off + n]
+                view[:] = _SENTINEL_CODE
+                idx, val, _ = _fill_strand(pf, strand, u_cols, view, batch_rows)
+                found[strand][0].extend(i + off * n_u for i in idx)
+                found[strand][1].extend(val)
     for mm in maps.values():
         mm.flush()
     return {
