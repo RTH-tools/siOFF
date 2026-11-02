@@ -217,3 +217,224 @@ def test_packing_closes_each_parquet_before_the_next(tmp_path, monkeypatch):
     assert len(pack_parquet_profiles(pdir, tmp_path / "packed", workers=1)) == 50
     # The open file plus its batch reader; one per record would reach 50.
     assert peak <= 3
+
+
+# --------------------------------------------------------------------------
+# Reading the packed cache
+# --------------------------------------------------------------------------
+
+
+def _per_record_dir(pdir, names, target):
+    for name in names:
+        build_accessibility_cache(pdir / f"{name}.accessibility.parquet", target)
+    return target
+
+
+def _frame(chrom, hits):
+    return pl.DataFrame(
+        {
+            "chrom": [chrom] * len(hits),
+            "start": [h[1] for h in hits],
+            "end": [h[2] for h in hits],
+            "strand": [h[0] for h in hits],
+        },
+        schema={
+            "chrom": pl.Utf8,
+            "start": pl.Int32,
+            "end": pl.Int32,
+            "strand": pl.Utf8,
+        },
+    )
+
+
+def _annotate(service, chrom, hits):
+    out = service.annotate_opening_energy_vectorized(_frame(chrom, hits))
+    return out["opening_energy"].to_numpy()
+
+
+@pytest.fixture
+def packed_and_reference(parquet_records, tmp_path):
+    pdir, seqs = parquet_records
+    packed = tmp_path / "packed"
+    pack_parquet_profiles(pdir, packed)
+    ref = _per_record_dir(pdir, seqs, tmp_path / "rec")
+    return pdir, seqs, packed, ref
+
+
+def test_packed_lookup_equals_per_record_lookup(packed_and_reference, tmp_path):
+    pdir, seqs, packed, ref = packed_and_reference
+    empty = tmp_path / "empty"
+    svc_p = acc.GenomeAccessibilityService(empty, cache_dir=packed)
+    svc_r = acc.GenomeAccessibilityService(empty, cache_dir=ref)
+    rng = np.random.default_rng(9)
+    for name, seq in seqs.items():
+        n = len(seq)
+        hits = []
+        for strand in "+-":
+            for _ in range(200):
+                length = int(rng.integers(1, 41))
+                if length > n:
+                    length = n
+                s = int(rng.integers(1, n - length + 2))
+                hits.append((strand, s, s + length - 1))
+            hits += [
+                (strand, 1, 1),
+                (strand, n, n),
+                (strand, 1, min(n, 40)),
+                (strand, max(1, n - 39), n),
+                (strand, 0, 5),
+                (strand, n - 2, n + 3),
+            ]
+        got = _annotate(svc_p, name, hits)
+        want = _annotate(svc_r, name, hits)
+        np.testing.assert_array_equal(got, want)
+        if n > 40:
+            assert (got != 10.0).any()
+        single = np.array(
+            [svc_p.query_single(name, s, e, st) for st, s, e in hits], dtype=np.float32
+        )
+        single_ref = np.array(
+            [svc_r.query_single(name, s, e, st) for st, s, e in hits],
+            dtype=np.float32,
+        )
+        np.testing.assert_array_equal(single, single_ref)
+        for strand in "+-":
+            np.testing.assert_array_equal(
+                svc_p.query(name, 0, n, strand), svc_r.query(name, 0, n, strand)
+            )
+
+
+def test_hit_past_a_record_end_does_not_read_the_next_record(
+    packed_and_reference, tmp_path
+):
+    pdir, seqs, packed, ref = packed_and_reference
+    empty = tmp_path / "empty"
+    svc_p = acc.GenomeAccessibilityService(empty, cache_dir=packed)
+    svc_r = acc.GenomeAccessibilityService(empty, cache_dir=ref)
+    n_a = len(seqs["recA"])
+    hits = [("+", n_a - 4, n_a), ("+", n_a - 3, n_a + 1), ("-", 1, 5)]
+    got = _annotate(svc_p, "recA", hits)
+    want = _annotate(svc_r, "recA", hits)
+    assert got[0] == want[0] != 10.0
+    assert got[1] == 10.0
+    assert got[2] == want[2] != 10.0
+
+
+def test_unknown_chrom_keeps_default_and_logs_nothing(
+    packed_and_reference, tmp_path, warnings_seen
+):
+    _, _, packed, _ = packed_and_reference
+    svc = acc.GenomeAccessibilityService(tmp_path / "empty", cache_dir=packed)
+    got = _annotate(svc, "nope", [("+", 5, 20), ("-", 5, 20)])
+    assert (got == 10.0).all()
+    assert not warnings_seen
+
+
+@pytest.fixture
+def warnings_seen(monkeypatch):
+    monkeypatch.setattr(acc, "_WARNED_MISSING_STRANDS", set())
+    seen: list[str] = []
+    handler = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    yield seen
+    logger.remove(handler)
+
+
+def test_missing_minus_pair_warns_once_and_keeps_default(
+    parquet_records, tmp_path, warnings_seen
+):
+    pdir, seqs = parquet_records
+    plus_dir = tmp_path / "plus_parquet"
+    plus_dir.mkdir()
+    for name, seq in seqs.items():
+        _fold_full_chromosome(
+            seq,
+            name,
+            80,
+            40,
+            30,
+            str(plus_dir / f"{name}.accessibility.parquet"),
+            700,
+            strand="+",
+        )
+    packed = tmp_path / "packed"
+    pack_parquet_profiles(plus_dir, packed)
+    assert not packed_paths(packed, "-")[0].exists()
+    svc = acc.GenomeAccessibilityService(tmp_path / "empty", cache_dir=packed)
+    hits = [("+", 50, 60), ("-", 50, 60)]
+    got = _annotate(svc, "recA", hits)
+    assert got[0] != 10.0 and got[1] == 10.0
+    _annotate(svc, "recA", hits)
+    missing = [m for m in warnings_seen if "no '-' strand" in m]
+    assert len(missing) == 1, warnings_seen
+
+
+def test_packed_cache_wins_over_per_record_files_in_the_same_dir(
+    packed_and_reference, tmp_path
+):
+    pdir, seqs, packed, ref = packed_and_reference
+    both = tmp_path / "both"
+    pack_parquet_profiles(pdir, both)
+    for name in seqs:
+        for strand in "+-":
+            npy, _ = cache_paths(ref, name, strand)
+            codes = np.load(npy)
+            np.save(cache_paths(both, name, strand)[0], np.zeros_like(codes))
+            (cache_paths(both, name, strand)[1]).write_bytes(
+                cache_paths(ref, name, strand)[1].read_bytes()
+            )
+    hits = [("+", 100, 120), ("-", 100, 120), ("+", 300, 340)]
+    want = _annotate(
+        acc.GenomeAccessibilityService(tmp_path / "e1", cache_dir=packed), "recA", hits
+    )
+    got = _annotate(
+        acc.GenomeAccessibilityService(tmp_path / "e2", cache_dir=both), "recA", hits
+    )
+    np.testing.assert_array_equal(got, want)
+    assert (got != 10.0).any() and (got != 0.0).any()
+
+
+def test_cache_dir_pack_is_read_before_profile_dir_pack(parquet_records, tmp_path):
+    pdir, seqs = parquet_records
+    right = tmp_path / "right"
+    pack_parquet_profiles(pdir, right)
+    other_src = tmp_path / "other_parquet"
+    other_src.mkdir()
+    _fold_full_chromosome(
+        _random_seq(400, np.random.default_rng(77)),
+        "recA",
+        80,
+        40,
+        30,
+        str(other_src / "recA.accessibility.parquet"),
+        700,
+    )
+    wrong = tmp_path / "wrong"
+    pack_parquet_profiles(other_src, wrong)
+    hits = [("+", 100, 120), ("-", 100, 120)]
+    got = _annotate(
+        acc.GenomeAccessibilityService(wrong, cache_dir=right), "recA", hits
+    )
+    want = _annotate(
+        acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=right), "recA", hits
+    )
+    other = _annotate(
+        acc.GenomeAccessibilityService(tmp_path / "e2", cache_dir=wrong), "recA", hits
+    )
+    np.testing.assert_array_equal(got, want)
+    assert not np.array_equal(got, other)
+
+
+def test_corrupt_packed_index_is_reported(packed_and_reference, tmp_path):
+    pdir, seqs, packed, ref = packed_and_reference
+    np.savez(packed_paths(packed, "+")[1], names=np.array(["x"]))
+    svc = acc.GenomeAccessibilityService(tmp_path / "empty", cache_dir=packed)
+    with pytest.raises(AccessibilityError, match="Corrupt packed accessibility cache"):
+        svc.query("recA", 0, 5, "+")
+
+
+def test_site_cells_accepts_per_hit_lengths():
+    rows, cols, ok = acc.site_cells("-", [1, 1], [5, 5], np.array([10, 20]), 30)
+    assert rows.tolist() == [9, 19]
+    for i, n in enumerate((10, 20)):
+        r1, c1, o1 = acc.site_cells("-", [1], [5], n, 30)
+        assert (rows[i], cols[i], ok[i]) == (r1[0], c1[0], o1[0])

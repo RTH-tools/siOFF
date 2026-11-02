@@ -38,7 +38,7 @@ def site_cells(
     strand: str,
     starts: np.ndarray,
     ends: np.ndarray,
-    seq_len: int,
+    seq_len: int | np.ndarray,
     n_u: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Map RIsearch hits to cells of one strand's opening-energy profile.
@@ -63,6 +63,9 @@ def site_cells(
     Returns ``(rows, cols, in_bounds)`` as int64/int64/bool arrays. Rows of
     out-of-bounds hits (``s < 1`` or ``e > N``) are clipped into range so the
     gather stays valid; callers must use ``in_bounds`` to discard them.
+
+    ``seq_len`` is one length for every hit, or one length per hit (the packed
+    cache looks hits of many records up in one call).
     """
     s = np.asarray(starts, dtype=np.int64)
     e = np.asarray(ends, dtype=np.int64)
@@ -74,7 +77,7 @@ def site_cells(
         rows = seq_len - s
     else:
         raise AccessibilityError(f"strand must be '+' or '-', got {strand!r}")
-    rows = np.clip(rows, 0, max(seq_len - 1, 0))
+    rows = np.clip(rows, 0, np.maximum(seq_len - 1, 0))
     return rows, cols, in_bounds
 
 
@@ -1094,6 +1097,9 @@ def ensure_accessibility_cache(
     return names
 
 
+_UNRESOLVED = object()
+
+
 class _DenseProfile:
     """One strand as a dense float32 ``[n_pos, n_u]`` array (in-memory frames)."""
 
@@ -1171,6 +1177,95 @@ class _CachedProfile:
 _Profile = Union[_DenseProfile, _CachedProfile]
 
 
+class _PackedStrand:
+    """One strand of a packed cache: every record's code rows back to back.
+
+    ``codes`` is the memory-mapped ``[total, n_u]`` matrix; record ``i`` owns
+    rows ``offsets[i] : offsets[i] + lengths[i]``. ``exc_index`` holds the exact
+    exceptions as global flat indices (``row * n_u + col``). ``whole`` is a
+    profile over the full matrix, so a gather at global rows needs no per-record
+    object.
+    """
+
+    def __init__(
+        self,
+        codes: np.ndarray,
+        names: np.ndarray,
+        offsets: np.ndarray,
+        lengths: np.ndarray,
+        exc_index: np.ndarray,
+        exc_value: np.ndarray,
+    ):
+        self.codes = codes
+        self.names = names
+        self.offsets = offsets
+        self.lengths = lengths
+        self.exc_index = exc_index
+        self.exc_value = exc_value
+        self.whole = _CachedProfile(codes, exc_index, exc_value)
+        # Names are in file-name order, which need not be sorted by name.
+        self._by_name = np.argsort(names, kind="stable")
+        self._sorted_names = names[self._by_name]
+
+    def record_ids(self, chroms: np.ndarray) -> np.ndarray:
+        """Record number of each name in ``chroms``; ``-1`` for an unknown one."""
+        chroms = np.asarray(chroms, dtype=str)
+        if self._sorted_names.size == 0:
+            return np.full(chroms.shape, -1, dtype=np.int64)
+        pos = np.searchsorted(self._sorted_names, chroms)
+        pos_c = np.minimum(pos, self._sorted_names.size - 1)
+        found = self._sorted_names[pos_c] == chroms
+        return np.where(found, self._by_name[pos_c], -1).astype(np.int64)
+
+    def record(self, name: str) -> Optional[_CachedProfile]:
+        """A view of one record's rows and exceptions; ``None`` if unknown."""
+        rid = int(self.record_ids(np.array([name]))[0])
+        if rid < 0:
+            return None
+        off, n = int(self.offsets[rid]), int(self.lengths[rid])
+        n_u = self.codes.shape[1]
+        lo, hi = np.searchsorted(self.exc_index, [off * n_u, (off + n) * n_u])
+        return _CachedProfile(
+            self.codes[off : off + n],
+            self.exc_index[lo:hi] - off * n_u,
+            self.exc_value[lo:hi],
+        )
+
+
+def _load_packed_strand(directory: Path, strand: str) -> _PackedStrand:
+    """Map one strand's packed cache; only the ``.npz`` index is read into memory."""
+    npy_path, npz_path = packed_paths(directory, strand)
+
+    def corrupt(why: str) -> AccessibilityError:
+        return AccessibilityError(
+            f"Corrupt packed accessibility cache for strand {strand!r} "
+            f"({npy_path}, {npz_path}): {why}. Delete the files to rebuild them."
+        )
+
+    try:
+        codes = np.load(npy_path, mmap_mode="r")
+        with np.load(npz_path) as side:
+            names = np.asarray(side["names"])
+            offsets = np.ascontiguousarray(side["offsets"], dtype=np.int64)
+            lengths = np.ascontiguousarray(side["lengths"], dtype=np.int64)
+            exc_index = np.ascontiguousarray(side["index"], dtype=np.int64)
+            exc_value = np.ascontiguousarray(side["value"], dtype=np.float32)
+    except (OSError, ValueError, KeyError) as e:
+        raise corrupt(f"{type(e).__name__}: {e}") from e
+    if codes.ndim != 2 or codes.dtype != np.uint8:
+        raise corrupt(
+            f"codes are {codes.dtype} with shape {codes.shape}, not 2-D uint8"
+        )
+    if not (names.shape == offsets.shape == lengths.shape) or names.ndim != 1:
+        raise corrupt("names, offsets and lengths differ in length")
+    if names.size and int(offsets[-1] + lengths[-1]) != codes.shape[0]:
+        raise corrupt(
+            f"records cover {int(offsets[-1] + lengths[-1])} rows but the matrix "
+            f"has {codes.shape[0]}"
+        )
+    return _PackedStrand(codes, names, offsets, lengths, exc_index, exc_value)
+
+
 class GenomeAccessibilityService:
     """
     Service to pre-compute and query genomic accessibility profiles.
@@ -1218,6 +1313,35 @@ class GenomeAccessibilityService:
         # Contigs whose cache was found no older than their Parquet, or was
         # (re)built here; `_cached_from_disk` does not compare mtimes again.
         self._current: set[str] = set()
+        # Directory holding the packed cache, resolved once; `_UNRESOLVED` until
+        # then (resetting it to that re-resolves).
+        self._packed_root: object = _UNRESOLVED
+        self._packed_strands: dict[str, Optional[_PackedStrand]] = {}
+
+    def _packed_dir(self) -> Optional[Path]:
+        """The first searched directory holding a packed cache pair, or ``None``."""
+        if self._packed_root is _UNRESOLVED:
+            root: Optional[Path] = None
+            for directory in self._cache_dirs():
+                if any(packed_paths(directory, s)[0].is_file() for s in "+-"):
+                    root = directory
+                    break
+            if root is not None:
+                logger.info(f"Using the packed accessibility cache in {root}")
+            self._packed_root = root
+        return cast(Optional[Path], self._packed_root)
+
+    def _packed_strand(self, strand: str) -> Optional[_PackedStrand]:
+        """The packed cache of one strand, loaded once; ``None`` if it has none."""
+        if strand not in self._packed_strands:
+            root = self._packed_dir()
+            loaded = None
+            if root is not None and all(
+                p.is_file() for p in packed_paths(root, strand)
+            ):
+                loaded = _load_packed_strand(root, strand)
+            self._packed_strands[strand] = loaded
+        return self._packed_strands[strand]
 
     def _require_dir(self) -> Path:
         """The Parquet directory; a frame-backed service has none."""
@@ -1510,6 +1634,25 @@ class GenomeAccessibilityService:
             raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
         return profile
 
+    def _packed_profile(
+        self, chrom: str, strand: str, root: Path
+    ) -> tuple[_CachedProfile, str]:
+        """One record's view of the packed cache, and the ``.npy`` it comes from."""
+        packed = self._packed_strand(strand)
+        if packed is None:
+            raise MissingStrandError(
+                f"No data for strand {strand!r} in the packed cache {root}"
+            )
+        npy = str(packed_paths(root, strand)[0])
+        profile = packed.record(chrom)
+        if profile is None:
+            raise AccessibilityError(
+                f"Profile for {chrom} not found in the packed cache {npy}"
+            )
+        if profile.n_pos == 0:
+            raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
+        return profile, npy
+
     def _ensure_profile(self, chrom: str, strand: str) -> str:
         """
         Ensure the profile for (chrom, strand) is loaded, applying LRU eviction.
@@ -1539,8 +1682,12 @@ class GenomeAccessibilityService:
                     f"Profile for {chrom} not found among the in-memory "
                     f"accessibility frames ({', '.join(sorted(self._frames)) or 'none'})."
                 )
-            profile = self._cached_from_disk(chrom, strand)
-            source = str(self._npy_path(chrom, strand))
+            packed_root = None if chrom in self._frames else self._packed_dir()
+            if packed_root is not None:
+                profile, source = self._packed_profile(chrom, strand, packed_root)
+            else:
+                profile = self._cached_from_disk(chrom, strand)
+                source = str(self._npy_path(chrom, strand))
 
         self._profiles[profile_key] = profile
         logger.info(f"Loaded accessibility profile for {chrom} {strand} from {source}")
@@ -1569,6 +1716,19 @@ class GenomeAccessibilityService:
                 )
                 lens = dict(zip(agg["strand"].to_list(), agg["position"].to_list()))
                 return lens.get("+"), lens.get("-")
+            if self._packed_dir() is not None:
+                packed_lens: list[Optional[int]] = []
+                for strand in ("+", "-"):
+                    packed = self._packed_strand(strand)
+                    rid = (
+                        -1
+                        if packed is None
+                        else int(packed.record_ids(np.array([chrom]))[0])
+                    )
+                    packed_lens.append(
+                        None if packed is None or rid < 0 else int(packed.lengths[rid])
+                    )
+                return packed_lens[0], packed_lens[1]
             out: list[Optional[int]] = []
             for strand in ("+", "-"):
                 npy = self._npy_path(chrom, strand)
@@ -1645,6 +1805,12 @@ class GenomeAccessibilityService:
         ends = df["end"].to_numpy().astype(np.int64)
         strands = df["strand"].to_numpy()
 
+        if not self._frames and self._packed_dir() is not None:
+            self._annotate_packed(chroms, starts, ends, strands, opening_energies)
+            return df.with_columns(
+                pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
+            )
+
         groups: dict[tuple, list] = defaultdict(list)
         for i in range(n_rows):
             c = str(chroms[i])
@@ -1677,3 +1843,43 @@ class GenomeAccessibilityService:
         return df.with_columns(
             pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
         )
+
+    def _annotate_packed(
+        self,
+        chroms: np.ndarray,
+        starts: np.ndarray,
+        ends: np.ndarray,
+        strands: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        """Fill ``out`` with every hit's opening energy from the packed cache.
+
+        One vectorised pass per strand: hits are mapped to records by name,
+        turned into global rows (``record offset + site_cells`` row) and gathered
+        in a single call. Unknown records, ``onTarget``, other strands and hits
+        outside their record keep the default already in ``out``.
+        """
+        chroms = np.asarray(chroms, dtype=str)
+        for strand in ("+", "-"):
+            sel = np.flatnonzero((strands == strand) & (chroms != "onTarget"))
+            if sel.size == 0:
+                continue
+            packed = self._packed_strand(strand)
+            if packed is None:
+                _warn_missing_strand(str(chroms[sel[0]]), strand)
+                continue
+            rid = packed.record_ids(chroms[sel])
+            known = rid >= 0
+            lengths = np.where(known, packed.lengths[np.maximum(rid, 0)], 0)
+            empty = known & (lengths == 0)
+            if empty.any():
+                _warn_missing_strand(str(chroms[sel[np.argmax(empty)]]), strand)
+            rows, cols, in_bounds = site_cells(
+                strand, starts[sel], ends[sel], lengths, packed.codes.shape[1]
+            )
+            ok = known & in_bounds & (lengths > 0)
+            if not ok.any():
+                continue
+            global_rows = rows[ok] + packed.offsets[rid[ok]]
+            vals = packed.whole.gather(global_rows, cols[ok])
+            out[sel[ok]] = (np.round(vals * 10.0) / 10.0).astype(np.float32)

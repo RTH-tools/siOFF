@@ -36,6 +36,7 @@ import pytest
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
     _fold_full_chromosome,
+    pack_parquet_profiles,
 )
 
 CHROM = "chrT"
@@ -85,10 +86,16 @@ def _path_query_single(pdir, ppath, cdir, hits):
     )
 
 
+def _path_packed(pdir, ppath, cdir, hits):
+    pack_parquet_profiles(pdir, cdir / "packed")
+    return _annotate(GenomeAccessibilityService(pdir, cache_dir=cdir / "packed"), hits)
+
+
 PATHS = {
     "from_frames": _path_frames,
     "memmap": _path_memmap,
     "query_single": _path_query_single,
+    "packed": _path_packed,
 }
 
 
