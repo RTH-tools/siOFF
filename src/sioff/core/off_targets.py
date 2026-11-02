@@ -42,8 +42,10 @@ from loguru import logger
 
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
 from sioff.services.accessibility import (
+    AccessibilityError,
     GenomeAccessibilityService,
     ensure_accessibility_cache,
+    has_profiles,
 )
 from sioff.services.annotation_parser import AnnotationParser
 from sioff.services.intersection_service import (
@@ -70,6 +72,75 @@ _WORKER_SELF_HYB_EMIN: dict = {}
 # --summary-only: score per siRNA with ProbabilityService(aggregate_only=True)
 # and return only the metadata, no per-site table.
 _WORKER_SUMMARY_ONLY: bool = False
+
+
+def _prepare_accessibility_cache(
+    accessibility_dir: Path, accessibility_cache_dir: Optional[Path], workers: int
+) -> Path:
+    """Check the profile source and build the uint8 cache before any scoring.
+
+    Parameters
+    ----------
+    accessibility_dir : pathlib.Path
+        Directory with the npy cache or per-chromosome Parquet profiles.
+    accessibility_cache_dir : pathlib.Path, optional
+        Where the cache lives; defaults to ``accessibility_dir``.
+    workers : int
+        Processes used to build missing contigs.
+
+    Returns
+    -------
+    pathlib.Path
+        The cache directory the service should read.
+
+    Raises
+    ------
+    AccessibilityError
+        When neither directory holds any profile, when a profile cannot be
+        read, or when the cache directory is not writable.
+    """
+    cache_dir = (
+        Path(accessibility_cache_dir)
+        if accessibility_cache_dir is not None
+        else Path(accessibility_dir)
+    )
+    if not has_profiles(accessibility_dir) and not has_profiles(cache_dir):
+        where = (
+            str(accessibility_dir)
+            if cache_dir == Path(accessibility_dir)
+            else f"{accessibility_dir} or {cache_dir}"
+        )
+        raise AccessibilityError(
+            f"No accessibility profiles in {where}. Pass the directory written by "
+            "'sioff accessibility' (-a/--accessibility-dir)."
+        )
+    t0 = time.perf_counter()
+    built: list[str] = []
+    write_error: Optional[OSError] = None
+    try:
+        built = ensure_accessibility_cache(
+            Path(accessibility_dir), cache_dir, workers=workers
+        )
+    except AccessibilityError as e:
+        # The build pool wraps a worker's OSError; any other failure stands.
+        if not isinstance(e.__cause__, OSError):
+            raise
+        write_error = e.__cause__
+    except OSError as e:
+        write_error = e
+    if write_error is not None:
+        raise AccessibilityError(
+            f"Cannot write the accessibility cache to {cache_dir}: {write_error}. "
+            "Pass a writable cache directory (--accessibility-cache-dir)."
+        ) from write_error
+    if built:
+        logger.info(
+            f"[accessibility] built accessibility cache for {len(built)} contig(s) "
+            f"in {cache_dir} in {time.perf_counter() - t0:.1f}s"
+        )
+    else:
+        logger.info(f"[accessibility] cache in {cache_dir} is complete")
+    return cache_dir
 
 
 def _drop_unexpressed(df_trans: pl.DataFrame) -> pl.DataFrame:
@@ -702,6 +773,9 @@ def compute_off_targets_single(
 
     Raises
     ------
+    AccessibilityError
+        When ``accessibility_dir`` (and ``accessibility_cache_dir``) holds no
+        profile, or the cache cannot be written.
     ValueError
         When both ``predictions`` and ``risearch_file`` are given; when both
         ``accessibility`` and ``accessibility_dir`` are given; when none of
@@ -897,10 +971,8 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
-        cache_dir = (
-            Path(accessibility_cache_dir)
-            if accessibility_cache_dir is not None
-            else Path(accessibility_dir)
+        cache_dir = _prepare_accessibility_cache(
+            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
         acc_service = GenomeAccessibilityService(
             Path(accessibility_dir), max_cached=4, cache_dir=cache_dir
@@ -1073,7 +1145,7 @@ def compute_off_targets_directory(
         After the last successful siRNA, when any worker task failed.
     AccessibilityError
         When the accessibility cache cannot be built (unreadable Parquet,
-        unwritable cache directory).
+        unwritable cache directory) or ``accessibility_dir`` holds no profile.
 
     See Also
     --------
@@ -1140,17 +1212,9 @@ def compute_off_targets_directory(
     # map finished files (and never each decode a whole chromosome).
     if cache_dir is not None:
         assert accessibility_dir is not None
-        _t0 = time.perf_counter()
-        built = ensure_accessibility_cache(
-            Path(accessibility_dir), cache_dir, workers=n_workers
+        _prepare_accessibility_cache(
+            Path(accessibility_dir), accessibility_cache_dir, n_workers
         )
-        if built:
-            logger.info(
-                f"[accessibility] built accessibility cache for {len(built)} contig(s) "
-                f"in {cache_dir} in {time.perf_counter() - _t0:.1f}s"
-            )
-        else:
-            logger.info(f"[accessibility] cache in {cache_dir} is complete")
 
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
     theta_vals = _parse_theta(theta)

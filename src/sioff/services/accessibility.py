@@ -394,6 +394,27 @@ def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     )
 
 
+def has_profiles(directory: Union[str, Path]) -> bool:
+    """Report whether a directory holds any accessibility profile.
+
+    Parameters
+    ----------
+    directory : str or pathlib.Path
+        Directory to inspect.
+
+    Returns
+    -------
+    bool
+        True when it holds a ``*.access.npy`` cache file or a
+        ``*.accessibility.parquet`` file; False otherwise, including when the
+        directory does not exist.
+    """
+    d = Path(directory)
+    if not d.is_dir():
+        return False
+    return any(d.glob(f"*{CACHE_SUFFIX}")) or any(d.glob(f"*{PARQUET_SUFFIX}"))
+
+
 def _chrom_of(parquet_path: Path) -> str:
     name = parquet_path.name
     if not name.endswith(PARQUET_SUFFIX):

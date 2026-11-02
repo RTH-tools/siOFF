@@ -351,7 +351,8 @@ so every worker shares one page-cache copy. `sioff accessibility` writes the
 cache by default. A Parquet `-a` gets it built on the first run, next to the
 Parquet or in `--accessibility-cache-dir` (for example node-local scratch, or
 when `-a` is read-only). A cache directory that holds a complete cache needs
-no Parquet in `-a`.
+no Parquet in `-a`. `off-targets` stops with an error when neither `-a` nor
+`--accessibility-cache-dir` holds any profile, and when it cannot write the cache.
 A failed worker never passes silently: the successful siRNAs are written, then
 `off-targets` reports `N/M siRNAs failed ...; first error: ...` and exits 1.
 

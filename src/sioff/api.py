@@ -312,8 +312,9 @@ def off_targets(
         fails, including when the ``risearch`` package is not installed.
     AccessibilityError
         `sioff.services.accessibility.AccessibilityError`, when folding
-        ``genome_file`` fails or an accessibility profile is missing or
-        malformed.
+        ``genome_file`` fails, an accessibility profile is missing or
+        malformed, ``accessibility_dir`` holds no profile, or the cache
+        cannot be written.
 
     See Also
     --------

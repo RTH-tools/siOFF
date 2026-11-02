@@ -31,6 +31,7 @@ from sioff.services.accessibility import (
     ensure_accessibility_cache,
 )
 
+PREDICTIONS = Path(__file__).parent / "data" / "risearch_genome_example.out"
 N_U = 30
 CONTIGS = {"chrA": 700, "chrB": 300}
 
@@ -400,3 +401,91 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     assert isinstance(default, pl.DataFrame)
     assert default.sort(default.columns).equals(from_frames.sort(from_frames.columns))
     assert cache_paths(acc_dir, "chr1", "+")[0].exists()
+
+
+# --- off_targets prepares the cache before scoring ---
+
+
+def _parquet_dir(tmp_path, profiles, extra_contig=None):
+    d = tmp_path / "acc"
+    d.mkdir()
+    for chrom, frame in profiles.items():
+        frame.write_parquet(d / f"{chrom}.accessibility.parquet")
+    if extra_contig:  # a contig no prediction hits
+        next(iter(profiles.values())).write_parquet(
+            d / f"{extra_contig}.accessibility.parquet"
+        )
+    return d
+
+
+def _in_dir(tmp_path, predictions):
+    d = tmp_path / "in"
+    d.mkdir()
+    (d / predictions.name).write_bytes(predictions.read_bytes())
+    return d
+
+
+@pytest.mark.parametrize("form", ["single", "directory"])
+def test_off_targets_refuses_a_directory_without_profiles(tmp_path, form):
+    import sioff
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    source = PREDICTIONS if form == "single" else _in_dir(tmp_path, PREDICTIONS)
+    with pytest.raises(AccessibilityError, match="No accessibility profiles in"):
+        out = sioff.off_targets(
+            risearch_file=source,
+            accessibility_dir=empty,
+            accessibility_cache_dir=tmp_path / "cache",
+            n_workers=1,
+        )
+        if not isinstance(out, pl.DataFrame):
+            list(out)
+
+
+def test_single_file_with_empty_dir_reads_a_complete_cache_dir(tmp_path):
+    import sioff
+
+    profiles = _rounded_profiles()
+    acc = _parquet_dir(tmp_path, profiles)
+    cache = tmp_path / "cache"
+    ensure_accessibility_cache(acc, cache)
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    got = sioff.off_targets(
+        risearch_file=PREDICTIONS,
+        accessibility_dir=empty,
+        accessibility_cache_dir=cache,
+    )
+    ref = sioff.off_targets(risearch_file=PREDICTIONS, accessibility=profiles)
+    assert got.sort(got.columns).equals(ref.sort(ref.columns))
+    assert not any(empty.iterdir())
+
+
+def test_single_file_mode_builds_every_contig_up_front(tmp_path):
+    """Not lazily per hit contig: a contig without hits is cached too."""
+    import sioff
+
+    acc = _parquet_dir(tmp_path, _rounded_profiles(), extra_contig="chrNoHits")
+    sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=acc)
+    for strand in "+-":
+        assert cache_paths(acc, "chrNoHits", strand)[0].exists()
+
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores directory permissions")
+@pytest.mark.parametrize("form", ["single", "directory"])
+def test_read_only_parquet_dir_without_cache_dir_is_reported(tmp_path, form):
+    import sioff
+
+    acc = _parquet_dir(tmp_path, _rounded_profiles())
+    source = PREDICTIONS if form == "single" else _in_dir(tmp_path, PREDICTIONS)
+    acc.chmod(0o555)
+    try:
+        with pytest.raises(AccessibilityError, match="--accessibility-cache-dir"):
+            out = sioff.off_targets(
+                risearch_file=source, accessibility_dir=acc, n_workers=1
+            )
+            if not isinstance(out, pl.DataFrame):
+                list(out)
+    finally:
+        acc.chmod(0o755)
