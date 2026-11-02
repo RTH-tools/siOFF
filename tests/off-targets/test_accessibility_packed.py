@@ -207,7 +207,7 @@ def test_packing_closes_each_parquet_before_the_next(tmp_path, monkeypatch):
         held = 0
         for fd in fd_dir.iterdir():
             try:
-                held += os.readlink(fd).endswith(".accessibility.parquet")
+                held += os.readlink(fd).startswith(str(pdir) + os.sep)
             except OSError:
                 pass
         peak = max(peak, held)
