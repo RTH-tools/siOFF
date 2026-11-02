@@ -110,7 +110,7 @@ def run(
         typer.Option(
             "-a",
             "--accessibility-dir",
-            help="Accessibility profiles from 'sioff accessibility': the .access.npy cache, or per-chromosome Parquet files (the cache is built from them on the first run).",
+            help="Accessibility profiles from 'sioff accessibility': the packed `accessibility.*.packed.npy` cache written by 'sioff accessibility', or per-chromosome Parquet files (packed on the first run).",
             exists=True,
             file_okay=False,
         ),
@@ -120,7 +120,7 @@ def run(
         typer.Option(
             "--accessibility-cache-dir",
             help=(
-                "Where the .access.npy cache is read from and built "
+                "Where the packed accessibility cache is read from and built "
                 "(default: the accessibility dir itself). Use it when the "
                 "accessibility dir is read-only or to stage the cache on local "
                 "disk; it may also hold a complete cache without any Parquet."

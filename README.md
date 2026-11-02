@@ -198,7 +198,7 @@ This example rebuilds both from the raw example FASTA files — the same three
 stages you will run on your own data.
 
 ```bash
-# 1 · Fold: accessibility profiles, a memory-mappable .npy cache per chromosome
+# 1 · Fold: accessibility profiles, one packed memory-mappable .npy cache per strand
 # run with --verbose to see the steps involved
 sioff accessibility \
   -f examples/data/genome.fa \
@@ -304,11 +304,13 @@ sioff accessibility -f genome.fa -o accessibility/ -j 8
 Writes RNAplfold opening energies per chromosome (window `-W 80`, span
 `-L 40`, unpaired length `-u 30` by default — change them consistently if
 your protocol differs). The default `--output-format npy` writes the uint8
-cache that `off-targets` memory-maps: `{chrom}_{plus,minus}.access.npy`
-(value × 10 per position and `u`) plus an `.access.exceptions.npz` sidecar
-holding exactly the few values a byte cannot (above 25.5 kcal/mol), so
-`off-targets -a` reads it with no conversion step. `--output-format parquet`
-writes one `{chrom}.accessibility.parquet` per chromosome instead (columns
+cache that `off-targets` memory-maps: `accessibility.{plus,minus}.packed.npy`
+(value × 10 per position and `u`, all records back to back) plus an
+`accessibility.{plus,minus}.packed.npz` index holding the record offsets and
+exactly the few values a byte cannot (above 25.5 kcal/mol). That is four files
+whatever the number of FASTA records, or two with `--strand +`, and
+`off-targets -a` reads them with no conversion step. `--output-format parquet`
+still writes one `{chrom}.accessibility.parquet` per record (columns
 `position`, `strand`, `u1..u{u}`), for other tools.
 Each sequence is folded as given (`+`) and as its reverse complement (`-`).
 For a transcriptome FASTA, whose records are already in sense orientation,
@@ -346,12 +348,14 @@ documents every option; run it with `sioff -c my-config.yaml`.
 
 #### Accessibility cache
 
-`off-targets` memory-maps the uint8 `{chrom}_{plus,minus}.access.npy` cache,
-so every worker shares one page-cache copy. `sioff accessibility` writes the
-cache by default. A Parquet `-a` gets it built on the first run, next to the
-Parquet or in `--accessibility-cache-dir` (for example node-local scratch, or
-when `-a` is read-only), and rebuilt (with a warning) once the Parquet is newer
-than it, as after re-folding into the same directory. The cache takes one byte
+`off-targets` memory-maps the uint8 `accessibility.{plus,minus}.packed.npy`
+cache, so every worker shares one page-cache copy. `sioff accessibility`
+writes it by default. A Parquet `-a` is packed into it on the first run, next
+to the Parquet or in `--accessibility-cache-dir` (for example node-local
+scratch, or when `-a` is read-only), and rebuilt (with a warning) when its
+Parquet changes, as after re-folding into the same directory. A complete
+v0.2.0 per-record cache (`{chrom}_{plus,minus}.access.npy`) next to the
+Parquet is still read, and so is such a directory used as `-a`. The cache takes one byte
 per position and `u` on each strand, about 186 GB for hg38 at `-u 30`; use
 `--accessibility-cache-dir` to put it on a disk with room. A cache directory
 that holds a complete cache needs no Parquet in `-a`. `off-targets` stops
@@ -412,8 +416,8 @@ Available on `sioff` itself, before any subcommand.
 | `--target-fasta / --genome` | Target FASTA for in-process RIsearch |
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
-| `-a / --accessibility-dir` | Directory of per-chromosome accessibility profiles from the `accessibility` command: the `.access.npy` cache (its default) or Parquet files |
-| `--accessibility-cache-dir` | Where the `.access.npy` cache is read from / built (default: the accessibility dir) |
+| `-a / --accessibility-dir` | Directory of accessibility profiles from the `accessibility` command: the packed `accessibility.*.packed.npy` cache (its default) or per-chromosome Parquet files, packed on the first run |
+| `--accessibility-cache-dir` | Where the packed cache is read from / built (default: the accessibility dir) |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
 | `--sense-only` | Keep only `+`-strand predictions (use it with profiles from `accessibility --strand +`) |
@@ -427,7 +431,7 @@ Available on `sioff` itself, before any subcommand.
 | Flag | Description |
 |------|-------------|
 | `-f / --fasta` | Genome or transcriptome FASTA |
-| `-o / --output` | Output directory (per chromosome: `{chrom}_{plus,minus}.access.npy` + `.access.exceptions.npz`, or one `{chrom}.accessibility.parquet`) |
+| `-o / --output` | Output directory (`accessibility.{plus,minus}.packed.npy` + `.packed.npz` per strand, or one `{chrom}.accessibility.parquet` per record with `--output-format parquet`) |
 | `--output-format` | `npy` (default; the cache `off-targets` memory-maps) or `parquet` |
 | `--strand` | `both` (default) or `+`: fold the sequences as given only (transcriptome FASTA; pair with `off-targets --sense-only`) |
 | `-W / --window` | RNAplfold window size W (default: 80) |
@@ -507,7 +511,7 @@ df = sioff.off_targets(
 **Notes**
 
 - `sioff.off_targets` takes its predictions from one of `predictions=` (a `polars.DataFrame` in the `sioff.search` schema: `sirna_id, chrom, start, end, strand, energy`), `risearch_file=` (a RIsearch output file) or `sirna_fasta=` + `target_fasta=` (run RIsearch in-process), and returns a `polars.DataFrame`. With a **directory** of per-siRNA files in `risearch_file=` it returns a **generator** yielding one `polars.DataFrame` per siRNA; iterate it to consume the results. No form writes files — the API layer returns results in memory, and writing output is the CLI's job.
-- `sioff.accessibility` likewise writes nothing: it returns `dict[chrom -> polars.DataFrame]`, which `sioff.off_targets(accessibility=...)` takes directly (single-frame forms only; the directory form needs `accessibility_dir=`). Use the `accessibility` CLI command (or `sioff -c <config>`) if you want profiles on disk (the `.access.npy` cache, or `{chrom}.accessibility.parquet` with `--output-format parquet`).
+- `sioff.accessibility` likewise writes nothing: it returns `dict[chrom -> polars.DataFrame]`, which `sioff.off_targets(accessibility=...)` takes directly (single-frame forms only; the directory form needs `accessibility_dir=`). Use the `accessibility` CLI command (or `sioff -c <config>`) if you want profiles on disk (the packed `accessibility.*.packed.npy` cache, or one `{chrom}.accessibility.parquet` per record with `--output-format parquet`).
 - On bad input the API functions raise ordinary Python exceptions — `FileNotFoundError` or `ValueError` — not `typer.Exit`. `typer.Exit` is raised only by the CLI layer for its own argument validation.
 - `sioff.index` / `sioff.search` call the `risearch` bindings in-process — the same dependency the CLI's `index`/`search` commands use.
 
