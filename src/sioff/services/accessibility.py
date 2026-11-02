@@ -2,7 +2,7 @@ import math
 import multiprocessing
 import os
 from collections import OrderedDict, defaultdict
-from collections.abc import Iterable
+from collections.abc import Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Union, cast
@@ -382,6 +382,17 @@ _SCALE = np.float32(10.0)
 _SENTINEL_CODE = 255
 _DEFAULT_BATCH_ROWS = 1_000_000
 
+# Packed layout: every record of a strand in one pair of files,
+# ``accessibility.<plus|minus>.packed.npy`` (uint8 ``[total_positions, n_u]``,
+# the records' code rows back to back, same encoding as the per-record cache)
+# and ``accessibility.<plus|minus>.packed.npz`` (``names``, ``offsets``,
+# ``lengths``, ``index``, ``value``; ``index`` is the global flat index
+# ``row * n_u + col`` of the exact-value exceptions, sorted).
+PACKED_STEM = "accessibility"
+PACKED_SUFFIX = ".packed.npy"
+PACKED_INDEX_SUFFIX = ".packed.npz"
+_PACK_TASK_POSITIONS = 2_000_000
+
 
 def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     """Return ``(codes .npy, exceptions .npz)`` paths for one contig strand."""
@@ -391,6 +402,17 @@ def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     return (
         Path(cache_dir) / f"{stem}{CACHE_SUFFIX}",
         Path(cache_dir) / f"{stem}{EXCEPTIONS_SUFFIX}",
+    )
+
+
+def packed_paths(cache_dir: Path, strand: str) -> tuple[Path, Path]:
+    """Return ``(codes .npy, index .npz)`` paths of one strand's packed cache."""
+    if strand not in _STRAND_NAMES:
+        raise AccessibilityError(f"Unknown strand {strand!r} (expected '+' or '-')")
+    stem = f"{PACKED_STEM}.{_STRAND_NAMES[strand]}"
+    return (
+        Path(cache_dir) / f"{stem}{PACKED_SUFFIX}",
+        Path(cache_dir) / f"{stem}{PACKED_INDEX_SUFFIX}",
     )
 
 
@@ -510,18 +532,21 @@ def _write_atomically(target: Path, write) -> None:
             tmp.unlink()
 
 
-def _build_strand(
+def _fill_strand(
     pf: pq.ParquetFile,
-    chrom: str,
     strand: str,
     u_cols: list[str],
-    cache_dir: Path,
+    codes: np.ndarray,
     batch_rows: int,
-) -> Path:
-    """Build one strand's cache files; the code matrix is freed on return."""
+) -> tuple[list[np.ndarray], list[np.ndarray], int]:
+    """Stream one strand's rows of ``pf`` into ``codes``.
+
+    ``codes`` is a 2-D view prefilled with 255 whose row 0 is position 1.
+    Returns ``(exc_index, exc_value, n_rows)``: the exact-value exceptions
+    (flat indices local to ``codes``) and the number of rows written.
+    """
     n_u = len(u_cols)
-    row_groups, max_pos = _strand_row_groups(pf, strand)
-    codes = np.full((max_pos, n_u), _SENTINEL_CODE, dtype=np.uint8)
+    row_groups, _ = _strand_row_groups(pf, strand)
     exc_index: list[np.ndarray] = []
     exc_value: list[np.ndarray] = []
     n_rows = 0
@@ -548,7 +573,22 @@ def _build_strand(
                 r, c = np.nonzero(~exact)
                 exc_index.append(pos0[r] * n_u + c)
                 exc_value.append(values[r, c])
+    return exc_index, exc_value, n_rows
 
+
+def _build_strand(
+    pf: pq.ParquetFile,
+    chrom: str,
+    strand: str,
+    u_cols: list[str],
+    cache_dir: Path,
+    batch_rows: int,
+) -> Path:
+    """Build one strand's cache files; the code matrix is freed on return."""
+    n_u = len(u_cols)
+    _, max_pos = _strand_row_groups(pf, strand)
+    codes = np.full((max_pos, n_u), _SENTINEL_CODE, dtype=np.uint8)
+    exc_index, exc_value, n_rows = _fill_strand(pf, strand, u_cols, codes, batch_rows)
     index, value = _sorted_exceptions(chrom, strand, exc_index, exc_value, n_rows * n_u)
     npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
     _write_atomically(npz_path, lambda tmp: np.savez(tmp, index=index, value=value))
@@ -677,6 +717,220 @@ def build_accessibility_cache(
     for npy_path in built.values():
         _date_no_earlier_than(npy_path, folded)
     return built
+
+
+def _batch_records(
+    sizes: Sequence[int], target: int = _PACK_TASK_POSITIONS
+) -> list[list[int]]:
+    """Group record indices into batches of roughly ``target`` positions.
+
+    Records are taken longest first and added to the current batch while its
+    total stays within ``target``; a record of ``target`` positions or more
+    is a batch of its own. Every index appears exactly once.
+    """
+    batches: list[list[int]] = []
+    current: list[int] = []
+    total = 0
+    for i in sorted(range(len(sizes)), key=lambda k: -sizes[k]):
+        size = sizes[i]
+        if size >= target:
+            batches.append([i])
+            continue
+        if current and total + size > target:
+            batches.append(current)
+            current, total = [], 0
+        current.append(i)
+        total += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _pack_parquet_batch(
+    jobs: list[tuple[str, str, int, int]],
+    u_cols: list[str],
+    tmp_paths: dict[str, str],
+    batch_rows: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Fill the records of one batch into the packed temp ``.npy`` files.
+
+    Each job is ``(parquet path, strand, row offset, length)``. Returns, per
+    strand, only the exceptions as ``(global flat index int64, value float32)``.
+    Top-level so spawned workers can pickle it.
+    """
+    n_u = len(u_cols)
+    maps = {s: np.load(p, mmap_mode="r+") for s, p in tmp_paths.items()}
+    found: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {
+        s: ([], []) for s in maps
+    }
+    pfs: dict[str, pq.ParquetFile] = {}
+    for path, strand, off, n in jobs:
+        view = maps[strand][off : off + n]
+        view[:] = _SENTINEL_CODE
+        pf = pfs.get(path) or pfs.setdefault(path, pq.ParquetFile(path))
+        idx, val, _ = _fill_strand(pf, strand, u_cols, view, batch_rows)
+        found[strand][0].extend(i + off * n_u for i in idx)
+        found[strand][1].extend(val)
+    for mm in maps.values():
+        mm.flush()
+    return {
+        s: (
+            np.concatenate(i).astype(np.int64) if i else np.empty(0, np.int64),
+            np.concatenate(v).astype(np.float32) if v else np.empty(0, np.float32),
+        )
+        for s, (i, v) in found.items()
+    }
+
+
+def pack_parquet_profiles(
+    parquet_dir: Path,
+    cache_dir: Path,
+    workers: int = 1,
+    batch_rows: int = _DEFAULT_BATCH_ROWS,
+) -> list[str]:
+    """Pack every ``*.accessibility.parquet`` of a directory into one pair per strand.
+
+    Records are laid out in sorted file-name order. Each strand's index uses
+    that strand's own maximum position per record, so ``lengths`` may differ
+    between the plus and minus ``.npz``. A strand with no rows in any Parquet
+    gets no pair, and an existing pair for it in ``cache_dir`` is deleted.
+
+    The code matrix is filled through a memory map by up to
+    ``min(workers, 4)`` spawned processes, so it is never held in memory. The
+    ``.npz`` is renamed into place before the ``.npy``, and each ``.npy`` is
+    dated no earlier than the newest Parquet (read before packing).
+
+    Parameters
+    ----------
+    parquet_dir : pathlib.Path
+        Directory of ``<record>.accessibility.parquet`` files.
+    cache_dir : pathlib.Path
+        Output directory, created if missing.
+    workers : int
+        Number of worker processes (capped at 4 and at the number of batches).
+    batch_rows : int
+        Maximum Parquet rows in flight per worker.
+
+    Returns
+    -------
+    list[str]
+        The record names, in packed order.
+
+    Raises
+    ------
+    AccessibilityError
+        If there is no Parquet, a file has no ``u`` columns, or the files'
+        ``u`` columns differ.
+    """
+    parquet_dir, cache_dir = Path(parquet_dir), Path(cache_dir)
+    files = sorted(parquet_dir.glob(f"*{PARQUET_SUFFIX}"), key=lambda p: p.name)
+    if not files:
+        raise AccessibilityError(f"No *{PARQUET_SUFFIX} files in {parquet_dir}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Taken before reading: a Parquet rewritten mid-pack stays newer.
+    newest = max(f.stat().st_mtime_ns for f in files)
+    names = [_chrom_of(f) for f in files]
+    u_cols: list[str] = []
+    lengths: dict[str, list[int]] = {s: [] for s in _STRAND_NAMES}
+    for f, name in zip(files, names):
+        pf = pq.ParquetFile(f)
+        cols = _u_columns(pf.schema_arrow.names)
+        if not cols:
+            raise AccessibilityError(f"{f} has no u1..uN columns")
+        if u_cols and cols != u_cols:
+            raise AccessibilityError(
+                f"{f.name} has {len(cols)} u columns, but {files[0].name} has "
+                f"{len(u_cols)}; pack Parquet files folded with the same -u"
+            )
+        u_cols = cols
+        for strand in _STRAND_NAMES:
+            lengths[strand].append(_strand_row_groups(pf, strand)[1])
+        check_strand_lengths(name, lengths["+"][-1], lengths["-"][-1], str(f))
+    n_u = len(u_cols)
+
+    offsets = {
+        s: np.concatenate([[0], np.cumsum(n, dtype=np.int64)[:-1]]).astype(np.int64)
+        for s, n in lengths.items()
+    }
+    totals = {s: int(sum(n)) for s, n in lengths.items()}
+    for strand in _STRAND_NAMES:
+        if not totals[strand]:
+            for path in packed_paths(cache_dir, strand):
+                path.unlink(missing_ok=True)
+    strands = [s for s in _STRAND_NAMES if totals[s]]
+
+    tmp_paths: dict[str, Path] = {}
+    try:
+        for strand in strands:
+            npy_path = packed_paths(cache_dir, strand)[0]
+            tmp = npy_path.with_name(
+                f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}"
+            )
+            tmp_paths[strand] = tmp
+            mm = np.lib.format.open_memmap(
+                tmp, mode="w+", dtype=np.uint8, shape=(totals[strand], n_u)
+            )
+            mm.flush()
+            del mm
+
+        sizes = [lengths["+"][i] + lengths["-"][i] for i in range(len(files))]
+        batches = _batch_records(sizes)
+        tasks = [
+            (
+                [
+                    (str(files[i]), s, int(offsets[s][i]), lengths[s][i])
+                    for i in batch
+                    for s in strands
+                    if lengths[s][i]
+                ],
+                u_cols,
+                {s: str(p) for s, p in tmp_paths.items()},
+                batch_rows,
+            )
+            for batch in batches
+        ]
+        n_workers = min(workers, 4, len(tasks))
+        if n_workers <= 1:
+            results = [_pack_parquet_batch(*t) for t in tasks]
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+                results = list(pool.map(_pack_parquet_batch, *zip(*tasks)))
+
+        label = "accessibility (packed)"
+        for strand in strands:
+            index, value = _sorted_exceptions(
+                label,
+                strand,
+                [r[strand][0] for r in results if strand in r],
+                [r[strand][1] for r in results if strand in r],
+                totals[strand] * n_u,
+            )
+            npy_path, npz_path = packed_paths(cache_dir, strand)
+            _write_atomically(
+                npz_path,
+                lambda t, o=offsets[strand], n=lengths[strand], i=index, v=value: (
+                    np.savez(
+                        t,
+                        names=np.array(names, dtype=str),
+                        offsets=o,
+                        lengths=np.array(n, dtype=np.int64),
+                        index=i,
+                        value=v,
+                    )
+                ),
+            )
+            os.replace(tmp_paths[strand], npy_path)
+            _date_no_earlier_than(npy_path, newest)
+            logger.info(
+                f"Packed {len(names):,} records into {npy_path.name}: "
+                f"{totals[strand]:,} positions × {n_u}, {len(index):,} "
+                "exact-value exceptions"
+            )
+    finally:
+        for tmp in tmp_paths.values():
+            tmp.unlink(missing_ok=True)
+    return names
 
 
 def _date_no_earlier_than(npy_path: Path, mtime_ns: int) -> None:
