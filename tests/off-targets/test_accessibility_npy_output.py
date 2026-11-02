@@ -126,7 +126,9 @@ def test_npy_and_parquet_directories_give_the_same_results(
     npy_dir, parquet_dir, _ = dirs
     before = sorted(f.name for f in npy_dir.iterdir())
     reference = sioff.off_targets(
-        risearch_file=PREDICTIONS, accessibility_dir=parquet_dir
+        risearch_file=PREDICTIONS,
+        accessibility_dir=parquet_dir,
+        accessibility_cache_dir=tmp_path / "cache",
     )
     single = sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=npy_dir)
     assert isinstance(reference, pl.DataFrame) and isinstance(single, pl.DataFrame)
