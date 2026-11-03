@@ -1359,6 +1359,9 @@ def test_packed_lookup_warns_about_unequal_strand_lengths(tmp_path, warnings_see
     pack_parquet_profiles(pdir, tmp_path / "packed")
     warnings_seen.clear()
     svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=tmp_path / "packed")
+    # '+' lookups do not depend on the minus length: '+' hits alone stay silent.
+    _annotate(svc, "rec", [("+", 50, 60)])
+    assert not [m for m in warnings_seen if "'+' covers" in m], warnings_seen
     hits = [("+", 50, 60), ("-", 50, 60)]
     _annotate(svc, "rec", hits)
     _annotate(svc, "rec", hits)

@@ -2359,9 +2359,10 @@ class GenomeAccessibilityService:
         up once. One vectorised pass per strand: hits are mapped to records,
         turned into global rows (``record offset + site_cells`` row) and gathered
         in a single call. Unknown records, ``onTarget``, other strands and hits
-        outside their record keep the default already in ``out``. Records whose
-        strands differ in length are warned about once, as on the per-record
-        path.
+        outside their record keep the default already in ``out``. Records with
+        '-' hits whose strands differ in length are warned about once; '+'
+        lookups do not depend on the minus length, so '+' hits alone stay
+        silent.
         """
         on_target = names == "onTarget"
         # Unequal strand lengths only shift '-' lookups (`site_cells` takes the
