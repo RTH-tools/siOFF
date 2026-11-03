@@ -1188,9 +1188,9 @@ def test_annotate_packed_edge_hits(parquet_records, tmp_path, warnings_seen):
     ref = _per_record_dir(pdir, seqs, tmp_path / "rec")
     n_a = len(seqs["recA"])
     hits = [
-        ("recA", "+", 0, 4),  # first cells of the record
+        ("recA", "+", 1, 4),  # first cells of the record
         ("recA", "+", n_a - 4, n_a),  # last cells of the record
-        ("recA", "-", 0, 4),
+        ("recA", "-", 1, 4),
         ("recA", "-", n_a - 4, n_a),
         ("recB", "+", 100, 120),
         ("recA", ".", 10, 30),  # no strand: keeps the default
@@ -1219,9 +1219,8 @@ def test_annotate_packed_edge_hits(parquet_records, tmp_path, warnings_seen):
 
     got, want = run(packed), run(ref)
     np.testing.assert_array_equal(got[:5], want[:5])
-    # A site at the very start of a record can lie outside the folded windows,
-    # on the per-record path too; the other ends and records carry values.
-    assert got[3] != 10.0 and got[4] != 10.0
+    # Both ends of the record, on both strands, carry looked-up values.
+    assert (got[[0, 2, 3, 4]] != 10.0).all(), got
     assert got[1] == want[1]  # a real zero at the far end, not the default
     assert (got[5:] == 10.0).all()
     assert any("has no" in m and "strand" in m for m in warnings_seen), warnings_seen
@@ -1398,3 +1397,77 @@ def test_verify_pack_false_uses_the_pack_as_found(pq_copy):
         os.utime(f, (later, later))
     assert acc.GenomeAccessibilityService(d)._packed_dir() is None
     assert acc.GenomeAccessibilityService(d, verify_pack=False)._packed_dir() == d
+
+
+@pytest.mark.parametrize("writer", ["fasta", "parquet"])
+def test_partial_index_write_leaves_no_temp_file(
+    parquet_records, tmp_path, monkeypatch, writer
+):
+    """A disk filling up mid-``savez`` must not leave the partial ``.npz`` behind."""
+    pdir, seqs = parquet_records
+    out = tmp_path / "out"
+    real = np.savez
+
+    def partial(file, *args, **kwargs):
+        if "minus" in str(file):
+            Path(file).write_bytes(b"PK\x03\x04 partial")
+            raise OSError(28, "No space left on device")
+        return real(file, *args, **kwargs)
+
+    monkeypatch.setattr(acc.np, "savez", partial)
+    with pytest.raises(OSError, match="No space left"):
+        if writer == "fasta":
+            _fasta_writer(seqs, out, tmp_path, 80)
+        else:
+            pack_parquet_profiles(pdir, out)
+    assert not [p.name for p in out.iterdir() if ".tmp" in p.name]
+
+
+def test_failed_repack_keeps_the_pair_of_a_vanished_strand(
+    parquet_records, tmp_path, monkeypatch
+):
+    """Re-packing plus-only Parquet over a two-strand pack fails: both pairs stay."""
+    pdir, seqs = parquet_records
+    out = tmp_path / "out"
+    pack_parquet_profiles(pdir, out)
+    before = {p.name: p.read_bytes() for p in out.iterdir()}
+    plus_only = tmp_path / "plus_only"
+    plus_only.mkdir()
+    for name, seq in seqs.items():
+        _fold_full_chromosome(
+            seq,
+            name,
+            80,
+            40,
+            30,
+            str(plus_only / f"{name}.accessibility.parquet"),
+            700,
+            strand="+",
+        )
+
+    def failing(file, *args, **kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(acc.np, "savez", failing)
+    with pytest.raises(OSError, match="disk full"):
+        pack_parquet_profiles(plus_only, out)
+    assert {p.name: p.read_bytes() for p in out.iterdir()} == before
+
+
+def test_plus_only_hits_do_not_load_the_minus_index(
+    packed_and_reference, tmp_path, monkeypatch
+):
+    """``--sense-only`` runs look up '+' hits only; the '-' index stays unloaded."""
+    _, _, packed, _ = packed_and_reference
+    loaded: list[str] = []
+    real = acc._load_packed_strand
+
+    def spy(directory, strand, *args, **kwargs):
+        loaded.append(strand)
+        return real(directory, strand, *args, **kwargs)
+
+    monkeypatch.setattr(acc, "_load_packed_strand", spy)
+    svc = acc.GenomeAccessibilityService(tmp_path / "e", cache_dir=packed)
+    energies = _annotate(svc, "recA", [("+", 50, 60), ("+", 100, 121)])
+    assert (energies != 10.0).any()
+    assert loaded == ["+"]
