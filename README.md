@@ -317,9 +317,10 @@ For a transcriptome FASTA, whose records are already in sense orientation,
 `--strand +` skips the reverse complement and halves the work; run
 `off-targets` with `--sense-only` on such profiles, or every antisense hit
 keeps the default opening energy (10 kcal/mol, with a warning).
-Records fold in parallel (`-j` processes; short records such as transcripts
-are grouped into batches of about 2 Mb, a long chromosome is a batch of its
-own). This is the
+Records fold in parallel (`-j` processes). With the default npy output,
+short records such as transcripts are grouped into batches of about 2 Mb and
+a long chromosome is a batch of its own; `--output-format parquet` folds one
+record per task. This is the
 most compute-intensive stage: budget hours and tens of GB of memory for a
 mammalian genome — run it on a cluster (see
 [Orchestrated runs](#orchestrated-multi-step-runs-local--slurm)) and reuse
@@ -419,7 +420,7 @@ Available on `sioff` itself, before any subcommand.
 | `--target-fasta / --genome` | Target FASTA for in-process RIsearch |
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
-| `-a / --accessibility-dir` | Directory of accessibility profiles from the `accessibility` command: the packed `accessibility.*.packed.npy` cache (its default) or per-chromosome Parquet files, packed on the first run |
+| `-a / --accessibility-dir` | Directory of accessibility profiles from the `accessibility` command: the packed `accessibility.*.packed.npy` cache (its default) or per-record Parquet files, packed on the first run |
 | `--accessibility-cache-dir` | Where the packed cache is read from / built (default: the accessibility dir) |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
@@ -442,7 +443,7 @@ Available on `sioff` itself, before any subcommand.
 | `-u / --unpaired` | Unpaired probability length u (default: 30) |
 | `-T / --temperature` | Folding temperature °C (default: 37.0) |
 | `-z / --matrix` | Energy parameter set (`t04`, `slh04`, `s95-rna-dna`, `s95-dna-rna` or a DSM TSV path) for in-process searches and the self-hybridisation E_min of `-s`; use the set the predictions were searched with (default: `t04`) |
-| `-j / --workers` | Parallel folding processes; records are folded in batches of about 2 Mb (default: 1) |
+| `-j / --workers` | Parallel folding processes; with the npy output, records are folded in batches of about 2 Mb (default: 1) |
 
 ### `index`
 
@@ -493,7 +494,7 @@ print(
     .head()
 )
 
-# Pre-compute per-chromosome accessibility profiles → dict[chrom -> polars.DataFrame]
+# Pre-compute accessibility profiles, one per FASTA record → dict[chrom -> polars.DataFrame]
 profiles = sioff.accessibility(genome=data / "genome.fa")
 
 # Build a RIsearch index → Path (risearch bindings, in-process)

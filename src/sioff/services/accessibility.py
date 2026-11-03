@@ -795,16 +795,24 @@ def _stage_index(
     index: np.ndarray,
     value: np.ndarray,
 ) -> Path:
-    """Write a packed ``.npz`` index under this process's temporary name."""
+    """Write a packed ``.npz`` index under this process's temporary name.
+
+    A write that fails part-way (a full disk) removes its partial file: the
+    caller only learns the temporary name once the index is complete.
+    """
     tmp = _tmp_path(npz_path)
-    np.savez(
-        tmp,
-        names=np.array(names, dtype=str),
-        offsets=np.asarray(offsets, dtype=np.int64),
-        lengths=np.asarray(lengths, dtype=np.int64),
-        index=index,
-        value=value,
-    )
+    try:
+        np.savez(
+            tmp,
+            names=np.array(names, dtype=str),
+            offsets=np.asarray(offsets, dtype=np.int64),
+            lengths=np.asarray(lengths, dtype=np.int64),
+            index=index,
+            value=value,
+        )
+    except BaseException:
+        tmp.unlink(missing_ok=True)
+        raise
     return tmp
 
 
@@ -953,10 +961,6 @@ def pack_parquet_profiles(
         for s, n in lengths.items()
     }
     totals = {s: int(sum(n)) for s, n in lengths.items()}
-    for strand in _STRAND_NAMES:
-        if not totals[strand]:
-            for path in packed_paths(cache_dir, strand):
-                path.unlink(missing_ok=True)
     strands = [s for s in _STRAND_NAMES if totals[s]]
 
     _warn_if_disk_is_small(cache_dir, sum(totals.values()) * n_u)
@@ -1014,6 +1018,12 @@ def pack_parquet_profiles(
             staged += [(npz_tmp, npz_path), (tmp_paths[strand], npy_path)]
         for tmp, final in staged:
             os.replace(tmp, final)
+        # A strand no Parquet has any more loses its old pair only now, once
+        # the new pack is in place: a failure above leaves the old pack whole.
+        for strand in _STRAND_NAMES:
+            if not totals[strand]:
+                for path in packed_paths(cache_dir, strand):
+                    path.unlink(missing_ok=True)
         for strand in strands:
             npy_path = packed_paths(cache_dir, strand)[0]
             _date_no_earlier_than(npy_path, newest)
@@ -1325,7 +1335,7 @@ def ensure_accessibility_cache(
        cache is never duplicated.
     4. Otherwise `pack_parquet_profiles` packs every Parquet, in sorted
        file-name order. A pack that existed but no longer matches its Parquet
-       (the directory was re-folded, a record was added or removed, or a
+       (the directory was re-folded, a record was added, or a
        pack file cannot be read) is rebuilt with a warning.
 
     Parameters
@@ -1603,7 +1613,7 @@ class GenomeAccessibilityService:
     written by v0.2.0, the per-record files of `build_accessibility_cache`. It
     is looked up in ``cache_dir`` (default: ``data_dir``), then in ``data_dir``,
     and a pack is preferred over per-record files. A pack that does not match
-    the Parquet in ``data_dir`` (a different set of records, or a Parquet newer
+    the Parquet in ``data_dir`` (a Parquet record missing from it, or a Parquet newer
     than the pack) is rebuilt on first use, as is a contig whose per-record
     cache is missing or older than its Parquet (batch runs pack up front with
     `ensure_accessibility_cache` so worker processes only map finished files);
@@ -2259,8 +2269,13 @@ class GenomeAccessibilityService:
 
         Hits on an unknown contig, on ``onTarget``, on a strand other than
         ``+``/``-`` or outside their contig keep 10.0; so do hits on a strand
-        the profile lacks, with a warning. A cache that cannot be read raises
-        `AccessibilityError`.
+        the profile lacks, with a warning.
+
+        Raises
+        ------
+        AccessibilityError
+            When a cache cannot be read (corrupt or truncated files), or a
+            missing one cannot be built or written.
         """
         n_rows = df.height
         opening_energies = np.full(n_rows, 10.0, dtype=np.float32)
@@ -2344,12 +2359,18 @@ class GenomeAccessibilityService:
         up once. One vectorised pass per strand: hits are mapped to records,
         turned into global rows (``record offset + site_cells`` row) and gathered
         in a single call. Unknown records, ``onTarget``, other strands and hits
-        outside their record keep the default already in ``out``. Records whose
-        strands differ in length are warned about once, as on the per-record
-        path.
+        outside their record keep the default already in ``out``. Records with
+        '-' hits whose strands differ in length are warned about once; '+'
+        lookups do not depend on the minus length, so '+' hits alone stay
+        silent.
         """
         on_target = names == "onTarget"
-        self._check_packed_lengths(names[~on_target])
+        # Unequal strand lengths only shift '-' lookups (`site_cells` takes the
+        # contig length from the minus profile), so only records with '-' hits
+        # are checked, and a '+'-only run never loads the minus index.
+        minus_hit = np.zeros(names.size, dtype=bool)
+        minus_hit[inv[strands == "-"]] = True
+        self._check_packed_lengths(names[minus_hit & ~on_target])
         for strand in ("+", "-"):
             sel = np.flatnonzero(strands == strand)
             sel = sel[~on_target[inv[sel]]]
