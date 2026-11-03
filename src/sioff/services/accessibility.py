@@ -1,8 +1,12 @@
+import glob
+import itertools
 import math
 import multiprocessing
 import os
-from collections import OrderedDict, defaultdict
-from collections.abc import Iterable
+import shutil
+import zipfile
+from collections import Counter, OrderedDict, defaultdict
+from collections.abc import Callable, Iterable, Sequence
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Dict, Mapping, Optional, Union, cast
@@ -25,6 +29,10 @@ class MissingStrandError(AccessibilityError):
     """The contig's profile has no rows for the strand looked up."""
 
 
+class ProfileNotFoundError(AccessibilityError):
+    """No accessibility profile exists for the contig looked up."""
+
+
 _COMPLEMENT_TABLE = str.maketrans("ACGTacgt", "TGCAtgca")
 _GAS_CONSTANT = 0.001987  # kcal / (mol·K)
 
@@ -37,7 +45,7 @@ def site_cells(
     strand: str,
     starts: np.ndarray,
     ends: np.ndarray,
-    seq_len: int,
+    seq_len: int | np.ndarray,
     n_u: int,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Map RIsearch hits to cells of one strand's opening-energy profile.
@@ -62,6 +70,9 @@ def site_cells(
     Returns ``(rows, cols, in_bounds)`` as int64/int64/bool arrays. Rows of
     out-of-bounds hits (``s < 1`` or ``e > N``) are clipped into range so the
     gather stays valid; callers must use ``in_bounds`` to discard them.
+
+    ``seq_len`` is one length for every hit, or one length per hit (the packed
+    cache looks hits of many records up in one call).
     """
     s = np.asarray(starts, dtype=np.int64)
     e = np.asarray(ends, dtype=np.int64)
@@ -73,7 +84,7 @@ def site_cells(
         rows = seq_len - s
     else:
         raise AccessibilityError(f"strand must be '+' or '-', got {strand!r}")
-    rows = np.clip(rows, 0, max(seq_len - 1, 0))
+    rows = np.clip(rows, 0, np.maximum(seq_len - 1, 0))
     return rows, cols, in_bounds
 
 
@@ -352,8 +363,9 @@ def _fold_full_chromosome(
 # ---------------------------------------------------------------------------
 # Memory-mapped per-(contig, strand) cache
 #
-# `_fold_full_chromosome` writes one Parquet file per contig, or (npy, the
-# CLI default) this cache directly through `_write_strand_cache`. Reading a whole
+# `_fold_full_chromosome` writes one Parquet file per contig, or (npy) this
+# cache directly through `_write_strand_cache`; the CLI default, npy, folds a
+# FASTA into the packed layout below (`_pack_fasta_records`). Reading a whole
 # chromosome back into a dense float32 array costs 30 GB per strand on chr1,
 # and off-target batch runs do that once per worker process. The cache below
 # re-encodes each strand as a position-major uint8 matrix that every worker
@@ -382,6 +394,21 @@ _SCALE = np.float32(10.0)
 _SENTINEL_CODE = 255
 _DEFAULT_BATCH_ROWS = 1_000_000
 
+# Packed layout: every record of a strand in one pair of files,
+# ``accessibility.<plus|minus>.packed.npy`` (uint8 ``[total_positions, n_u]``,
+# the records' code rows back to back, same encoding as the per-record cache)
+# and ``accessibility.<plus|minus>.packed.npz`` (``names``, ``offsets``,
+# ``lengths``, ``index``, ``value``; ``index`` is the global flat index
+# ``row * n_u + col`` of the exact-value exceptions, sorted).
+PACKED_STEM = "accessibility"
+PACKED_SUFFIX = ".packed.npy"
+PACKED_INDEX_SUFFIX = ".packed.npz"
+_PACK_TASK_POSITIONS = 2_000_000
+
+# What reading a damaged cache file raises: ``np.load`` of a truncated
+# ``.npz`` fails in ``zipfile``, of a truncated ``.npy`` with ValueError.
+_CORRUPT_CACHE_ERRORS = (OSError, ValueError, KeyError, EOFError, zipfile.BadZipFile)
+
 
 def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     """Return ``(codes .npy, exceptions .npz)`` paths for one contig strand."""
@@ -391,6 +418,17 @@ def cache_paths(cache_dir: Path, chrom: str, strand: str) -> tuple[Path, Path]:
     return (
         Path(cache_dir) / f"{stem}{CACHE_SUFFIX}",
         Path(cache_dir) / f"{stem}{EXCEPTIONS_SUFFIX}",
+    )
+
+
+def packed_paths(cache_dir: Path, strand: str) -> tuple[Path, Path]:
+    """Return ``(codes .npy, index .npz)`` paths of one strand's packed cache."""
+    if strand not in _STRAND_NAMES:
+        raise AccessibilityError(f"Unknown strand {strand!r} (expected '+' or '-')")
+    stem = f"{PACKED_STEM}.{_STRAND_NAMES[strand]}"
+    return (
+        Path(cache_dir) / f"{stem}{PACKED_SUFFIX}",
+        Path(cache_dir) / f"{stem}{PACKED_INDEX_SUFFIX}",
     )
 
 
@@ -405,14 +443,17 @@ def has_profiles(directory: Union[str, Path]) -> bool:
     Returns
     -------
     bool
-        True when it holds a ``*.access.npy`` cache file or a
-        ``*.accessibility.parquet`` file; False otherwise, including when the
+        True when it holds a ``*.packed.npy`` or ``*.access.npy`` cache file or
+        a ``*.accessibility.parquet`` file; False otherwise, including when the
         directory does not exist.
     """
     d = Path(directory)
     if not d.is_dir():
         return False
-    return any(d.glob(f"*{CACHE_SUFFIX}")) or any(d.glob(f"*{PARQUET_SUFFIX}"))
+    return any(
+        any(d.glob(f"*{suffix}"))
+        for suffix in (PACKED_SUFFIX, CACHE_SUFFIX, PARQUET_SUFFIX)
+    )
 
 
 def _chrom_of(parquet_path: Path) -> str:
@@ -495,13 +536,22 @@ def _strand_row_groups(pf: pq.ParquetFile, strand: str) -> tuple[list[int], int]
     return row_groups, max_pos
 
 
+def _tmp_path(target: Path) -> Path:
+    """This process's temporary name for ``target``, with the same suffix.
+
+    Keeping the suffix matters: ``np.savez`` appends ``.npz`` to a name
+    without it.
+    """
+    return target.with_name(f"{target.name}.{os.getpid()}.tmp{target.suffix}")
+
+
 def _write_atomically(target: Path, write) -> None:
     """``write(tmp_path)`` then rename, so readers never see a partial file.
 
     A concurrent builder of the same target writes its own temporary file and
     the last rename wins; both renames deliver a complete, identical file.
     """
-    tmp = target.with_name(f"{target.name}.{os.getpid()}.tmp{target.suffix}")
+    tmp = _tmp_path(target)
     try:
         write(tmp)
         os.replace(tmp, target)
@@ -510,18 +560,21 @@ def _write_atomically(target: Path, write) -> None:
             tmp.unlink()
 
 
-def _build_strand(
+def _fill_strand(
     pf: pq.ParquetFile,
-    chrom: str,
     strand: str,
     u_cols: list[str],
-    cache_dir: Path,
+    codes: np.ndarray,
     batch_rows: int,
-) -> Path:
-    """Build one strand's cache files; the code matrix is freed on return."""
+) -> tuple[list[np.ndarray], list[np.ndarray], int]:
+    """Stream one strand's rows of ``pf`` into ``codes``.
+
+    ``codes`` is a 2-D view prefilled with 255 whose row 0 is position 1.
+    Returns ``(exc_index, exc_value, n_rows)``: the exact-value exceptions
+    (flat indices local to ``codes``) and the number of rows written.
+    """
     n_u = len(u_cols)
-    row_groups, max_pos = _strand_row_groups(pf, strand)
-    codes = np.full((max_pos, n_u), _SENTINEL_CODE, dtype=np.uint8)
+    row_groups, _ = _strand_row_groups(pf, strand)
     exc_index: list[np.ndarray] = []
     exc_value: list[np.ndarray] = []
     n_rows = 0
@@ -548,7 +601,22 @@ def _build_strand(
                 r, c = np.nonzero(~exact)
                 exc_index.append(pos0[r] * n_u + c)
                 exc_value.append(values[r, c])
+    return exc_index, exc_value, n_rows
 
+
+def _build_strand(
+    pf: pq.ParquetFile,
+    chrom: str,
+    strand: str,
+    u_cols: list[str],
+    cache_dir: Path,
+    batch_rows: int,
+) -> Path:
+    """Build one strand's cache files; the code matrix is freed on return."""
+    n_u = len(u_cols)
+    _, max_pos = _strand_row_groups(pf, strand)
+    codes = np.full((max_pos, n_u), _SENTINEL_CODE, dtype=np.uint8)
+    exc_index, exc_value, n_rows = _fill_strand(pf, strand, u_cols, codes, batch_rows)
     index, value = _sorted_exceptions(chrom, strand, exc_index, exc_value, n_rows * n_u)
     npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
     _write_atomically(npz_path, lambda tmp: np.savez(tmp, index=index, value=value))
@@ -582,6 +650,29 @@ def _sorted_exceptions(
     return index, value
 
 
+def _encode_chunks(
+    codes: np.ndarray, chunks: Iterable[tuple[int, np.ndarray]], row0: int = 0
+) -> tuple[list[np.ndarray], list[np.ndarray]]:
+    """Encode folded ``(pos0, float32 block)`` chunks into ``codes`` from row ``row0``.
+
+    Chunk ``pos0`` lands at row ``row0 + pos0``. Returns the entries a code
+    cannot hold exactly, one array per chunk that has any: their flat indices
+    in ``codes`` (``row * n_u + col``, int64) and their float32 values.
+    """
+    n_u = codes.shape[1]
+    exc_index: list[np.ndarray] = []
+    exc_value: list[np.ndarray] = []
+    for pos0, values in chunks:
+        start = row0 + pos0
+        block, exact = _encode(values)
+        codes[start : start + len(values)] = block
+        if not exact.all():
+            r, c = np.nonzero(~exact)
+            exc_index.append((start + r).astype(np.int64) * n_u + c)
+            exc_value.append(values[r, c])
+    return exc_index, exc_value
+
+
 def _write_strand_cache(
     cache_dir: Path,
     chrom: str,
@@ -599,19 +690,11 @@ def _write_strand_cache(
     """
     npy_path, npz_path = cache_paths(cache_dir, chrom, strand)
     tmp = npy_path.with_name(f"{npy_path.name}.{os.getpid()}.tmp{npy_path.suffix}")
-    exc_index: list[np.ndarray] = []
-    exc_value: list[np.ndarray] = []
     try:
         codes = np.lib.format.open_memmap(
             tmp, mode="w+", dtype=np.uint8, shape=(n_pos, n_u)
         )
-        for pos0, values in chunks:
-            block, exact = _encode(values)
-            codes[pos0 : pos0 + len(values)] = block
-            if not exact.all():
-                r, c = np.nonzero(~exact)
-                exc_index.append((pos0 + r).astype(np.int64) * n_u + c)
-                exc_value.append(values[r, c])
+        exc_index, exc_value = _encode_chunks(codes, chunks)
         codes.flush()
         del codes
         index, value = _sorted_exceptions(
@@ -635,6 +718,10 @@ def build_accessibility_cache(
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> dict[str, Path]:
     """Re-encode one contig's Parquet into the per-strand uint8 cache files.
+
+    This is the v0.2.0 per-record layout, kept as the reference the packed
+    cache (`pack_parquet_profiles`) is tested against; the pipeline itself
+    packs a Parquet directory with `ensure_accessibility_cache`.
 
     Streams the Parquet by row group (never more than ``batch_rows`` rows in
     flight) into a preallocated ``uint8[max_position, n_u]`` per strand, so
@@ -679,6 +766,446 @@ def build_accessibility_cache(
     return built
 
 
+def _warn_if_disk_is_small(directory: Path, nbytes: int) -> None:
+    """Warn when ``directory`` has less free space than a pack about to be written.
+
+    The packed ``.npy`` is a sparse file filled through a memory map, so a
+    full disk surfaces as SIGBUS (the process dies, no error message) rather
+    than as an ``OSError``. Only a warning: a compressing filesystem stores
+    the codes in far less than their logical size.
+    """
+    try:
+        free = shutil.disk_usage(directory).free
+    except OSError:
+        return
+    if free < nbytes:
+        logger.warning(
+            f"Writing the packed accessibility cache into {directory} needs "
+            f"{nbytes / 1e9:.1f} GB but only {free / 1e9:.1f} GB is free; the run "
+            "may die when the disk fills (a bus error, as the cache is written "
+            "through a memory map)."
+        )
+
+
+def _stage_index(
+    npz_path: Path,
+    names: list[str],
+    offsets: Union[np.ndarray, Sequence[int]],
+    lengths: Union[np.ndarray, Sequence[int]],
+    index: np.ndarray,
+    value: np.ndarray,
+) -> Path:
+    """Write a packed ``.npz`` index under this process's temporary name."""
+    tmp = _tmp_path(npz_path)
+    np.savez(
+        tmp,
+        names=np.array(names, dtype=str),
+        offsets=np.asarray(offsets, dtype=np.int64),
+        lengths=np.asarray(lengths, dtype=np.int64),
+        index=index,
+        value=value,
+    )
+    return tmp
+
+
+def _batch_records(
+    sizes: Sequence[int], target: int = _PACK_TASK_POSITIONS
+) -> list[list[int]]:
+    """Group record indices into batches of roughly ``target`` positions.
+
+    Records are taken longest first and added to the current batch while its
+    total stays within ``target``; a record of ``target`` positions or more
+    is a batch of its own. Every index appears exactly once.
+    """
+    batches: list[list[int]] = []
+    current: list[int] = []
+    total = 0
+    for i in sorted(range(len(sizes)), key=lambda k: -sizes[k]):
+        size = sizes[i]
+        if size >= target:
+            batches.append([i])
+            continue
+        if current and total + size > target:
+            batches.append(current)
+            current, total = [], 0
+        current.append(i)
+        total += size
+    if current:
+        batches.append(current)
+    return batches
+
+
+def _pack_parquet_batch(
+    jobs: list[tuple[str, str, int, int]],
+    u_cols: list[str],
+    tmp_paths: dict[str, str],
+    batch_rows: int,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Fill the records of one batch into the packed temp ``.npy`` files.
+
+    Each job is ``(parquet path, strand, row offset, length)``. Returns, per
+    strand, only the exceptions as ``(global flat index int64, value float32)``.
+    Top-level so spawned workers can pickle it.
+    """
+    n_u = len(u_cols)
+    maps = {s: np.load(p, mmap_mode="r+") for s, p in tmp_paths.items()}
+    found: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {
+        s: ([], []) for s in maps
+    }
+    # One open ParquetFile at a time: a batch can hold thousands of records,
+    # and a descriptor per record would exhaust the open-file limit.
+    for path, group in itertools.groupby(jobs, key=lambda j: j[0]):
+        with pq.ParquetFile(path) as pf:
+            for _, strand, off, n in group:
+                view = maps[strand][off : off + n]
+                view[:] = _SENTINEL_CODE
+                idx, val, _ = _fill_strand(pf, strand, u_cols, view, batch_rows)
+                found[strand][0].extend(i + off * n_u for i in idx)
+                found[strand][1].extend(val)
+    for mm in maps.values():
+        mm.flush()
+    return _concat_exceptions(found)
+
+
+def _concat_exceptions(
+    found: Mapping[str, tuple[list[np.ndarray], list[np.ndarray]]],
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Per strand, a worker's exception chunks as one (int64, float32) pair."""
+    return {
+        s: (
+            np.concatenate(i).astype(np.int64) if i else np.empty(0, np.int64),
+            np.concatenate(v).astype(np.float32) if v else np.empty(0, np.float32),
+        )
+        for s, (i, v) in found.items()
+    }
+
+
+def pack_parquet_profiles(
+    parquet_dir: Path,
+    cache_dir: Path,
+    workers: int = 1,
+    batch_rows: int = _DEFAULT_BATCH_ROWS,
+) -> list[str]:
+    """Pack every ``*.accessibility.parquet`` of a directory into one pair per strand.
+
+    Records are laid out in sorted file-name order. Each strand's index uses
+    that strand's own maximum position per record, so ``lengths`` may differ
+    between the plus and minus ``.npz``. A strand with no rows in any Parquet
+    gets no pair, and an existing pair for it in ``cache_dir`` is deleted.
+
+    The code matrix is filled through a memory map by up to
+    ``min(workers, 4)`` spawned processes, so it is never held in memory.
+    Every strand's files are written under temporary names first and only
+    then renamed into place, each ``.npz`` before its ``.npy``, so a failure
+    leaves the previous pack whole. Each ``.npy`` is dated no earlier than
+    the newest Parquet (read before packing).
+
+    Parameters
+    ----------
+    parquet_dir : pathlib.Path
+        Directory of ``<record>.accessibility.parquet`` files.
+    cache_dir : pathlib.Path
+        Output directory, created if missing.
+    workers : int
+        Number of worker processes (capped at 4 and at the number of batches).
+    batch_rows : int
+        Maximum Parquet rows in flight per worker.
+
+    Returns
+    -------
+    list[str]
+        The record names, in packed order.
+
+    Raises
+    ------
+    AccessibilityError
+        If there is no Parquet, a file has no ``u`` columns, or the files'
+        ``u`` columns differ.
+    """
+    parquet_dir, cache_dir = Path(parquet_dir), Path(cache_dir)
+    files = sorted(parquet_dir.glob(f"*{PARQUET_SUFFIX}"), key=lambda p: p.name)
+    if not files:
+        raise AccessibilityError(f"No *{PARQUET_SUFFIX} files in {parquet_dir}")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    # Taken before reading: a Parquet rewritten mid-pack stays newer.
+    newest = max(f.stat().st_mtime_ns for f in files)
+    names = [_chrom_of(f) for f in files]
+    u_cols: list[str] = []
+    lengths: dict[str, list[int]] = {s: [] for s in _STRAND_NAMES}
+    for f, name in zip(files, names):
+        pf = pq.ParquetFile(f)
+        cols = _u_columns(pf.schema_arrow.names)
+        if not cols:
+            raise AccessibilityError(f"{f} has no u1..uN columns")
+        if u_cols and cols != u_cols:
+            raise AccessibilityError(
+                f"{f.name} has {len(cols)} u columns, but {files[0].name} has "
+                f"{len(u_cols)}; pack Parquet files folded with the same -u"
+            )
+        u_cols = cols
+        for strand in _STRAND_NAMES:
+            lengths[strand].append(_strand_row_groups(pf, strand)[1])
+        check_strand_lengths(name, lengths["+"][-1], lengths["-"][-1], str(f))
+    n_u = len(u_cols)
+
+    offsets = {
+        s: np.concatenate([[0], np.cumsum(n, dtype=np.int64)[:-1]]).astype(np.int64)
+        for s, n in lengths.items()
+    }
+    totals = {s: int(sum(n)) for s, n in lengths.items()}
+    for strand in _STRAND_NAMES:
+        if not totals[strand]:
+            for path in packed_paths(cache_dir, strand):
+                path.unlink(missing_ok=True)
+    strands = [s for s in _STRAND_NAMES if totals[s]]
+
+    _warn_if_disk_is_small(cache_dir, sum(totals.values()) * n_u)
+    tmp_paths: dict[str, Path] = {}
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for strand in strands:
+            tmp = _tmp_path(packed_paths(cache_dir, strand)[0])
+            tmp_paths[strand] = tmp
+            mm = np.lib.format.open_memmap(
+                tmp, mode="w+", dtype=np.uint8, shape=(totals[strand], n_u)
+            )
+            mm.flush()
+            del mm
+
+        sizes = [lengths["+"][i] + lengths["-"][i] for i in range(len(files))]
+        batches = _batch_records(sizes)
+        tasks = [
+            (
+                [
+                    (str(files[i]), s, int(offsets[s][i]), lengths[s][i])
+                    for i in batch
+                    for s in strands
+                    if lengths[s][i]
+                ],
+                u_cols,
+                {s: str(p) for s, p in tmp_paths.items()},
+                batch_rows,
+            )
+            for batch in batches
+        ]
+        n_workers = min(workers, 4, len(tasks))
+        if n_workers <= 1:
+            results = [_pack_parquet_batch(*t) for t in tasks]
+        else:
+            ctx = multiprocessing.get_context("spawn")
+            with ProcessPoolExecutor(max_workers=n_workers, mp_context=ctx) as pool:
+                results = list(pool.map(_pack_parquet_batch, *zip(*tasks)))
+
+        label = "accessibility (packed)"
+        n_exceptions: dict[str, int] = {}
+        for strand in strands:
+            index, value = _sorted_exceptions(
+                label,
+                strand,
+                [r[strand][0] for r in results if strand in r],
+                [r[strand][1] for r in results if strand in r],
+                totals[strand] * n_u,
+            )
+            n_exceptions[strand] = len(index)
+            npy_path, npz_path = packed_paths(cache_dir, strand)
+            npz_tmp = _stage_index(
+                npz_path, names, offsets[strand], lengths[strand], index, value
+            )
+            staged += [(npz_tmp, npz_path), (tmp_paths[strand], npy_path)]
+        for tmp, final in staged:
+            os.replace(tmp, final)
+        for strand in strands:
+            npy_path = packed_paths(cache_dir, strand)[0]
+            _date_no_earlier_than(npy_path, newest)
+            logger.info(
+                f"Packed {len(names):,} records into {npy_path.name}: "
+                f"{totals[strand]:,} positions × {n_u}, {n_exceptions[strand]:,} "
+                "exact-value exceptions"
+            )
+    finally:
+        for tmp in [*tmp_paths.values(), *(t for t, _ in staged)]:
+            tmp.unlink(missing_ok=True)
+    return names
+
+
+def _fold_records_into_pack(
+    tmp_npy: dict[str, str],
+    records: list[tuple[str, str, int]],
+    window_size: int,
+    max_span: int,
+    unpaired_prob: int,
+    chunk_size: int,
+    temperature: float,
+    strand: str,
+) -> dict[str, tuple[np.ndarray, np.ndarray]]:
+    """Fold one batch of FASTA records into the packed temp ``.npy`` files.
+
+    Each record is ``(name, sequence, row offset)``. Its strands are folded in
+    chunks as `_fold_full_chromosome` folds them, and each chunk's codes land
+    at row ``offset + pos0`` of that strand's map, ``tmp_npy[strand]``, opened
+    ``r+``. A zero-length record has no rows and is skipped. Returns, per
+    strand, only the exceptions as ``(global flat index int64, value
+    float32)``. Top-level so worker processes can pickle it.
+    """
+    maps = {s: np.load(p, mmap_mode="r+") for s, p in tmp_npy.items()}
+    found: dict[str, tuple[list[np.ndarray], list[np.ndarray]]] = {
+        s: ([], []) for s in maps
+    }
+    for _, sequence, offset in records:
+        if not sequence:
+            continue
+        for s, seq in _strands_to_fold(sequence, strand):
+            chunks = _fold_strand_chunks(
+                seq, window_size, max_span, unpaired_prob, chunk_size, temperature
+            )
+            index, value = _encode_chunks(maps[s], chunks, offset)
+            found[s][0].extend(index)
+            found[s][1].extend(value)
+    for mm in maps.values():
+        mm.flush()
+    return _concat_exceptions(found)
+
+
+def _remove_interrupted_fold_temps(cache_dir: Path) -> None:
+    """Delete packed temporary files a killed fold left in ``cache_dir``.
+
+    Temporary names carry the writer's pid, so a run killed by SIGKILL, a
+    batch-system time limit or SIGBUS (disk full) leaves files of the full
+    cache size that no later run would replace. One ``sioff accessibility``
+    run writes a directory at a time, so any such file is an orphan. The
+    Parquet packer does not do this: two off-target runs may pack one
+    directory concurrently.
+    """
+    for strand in _STRAND_NAMES:
+        for target in packed_paths(cache_dir, strand):
+            pattern = f"{glob.escape(target.name)}.*.tmp{target.suffix}"
+            for orphan in cache_dir.glob(pattern):
+                logger.info(f"Removing {orphan}, left by an interrupted run")
+                orphan.unlink(missing_ok=True)
+
+
+def _pack_fasta_records(
+    records: Sequence[tuple[str, str]],
+    cache_dir: Path,
+    window_size: int,
+    max_span: int,
+    unpaired_prob: int,
+    chunk_size: int,
+    temperature: float,
+    strand: str,
+    workers: int,
+    on_batch: Callable[[int], None],
+) -> Path:
+    """Fold FASTA ``(name, sequence)`` records into one packed pair per strand.
+
+    Records keep their FASTA order, and both strands share ``offsets`` and
+    ``lengths`` (a reverse complement is as long as its record). Each written
+    strand's ``.npy`` is preallocated under a temporary name and filled
+    through memory maps by `_fold_records_into_pack`, on `_batch_records`
+    batches: inline when ``workers`` or the number of batches is 1, else in
+    a spawned pool of ``min(workers, batches)`` processes. Only exceptions
+    come back to this process, and ``on_batch`` gets the record count of
+    every finished batch. Both strands' files are written under temporary
+    names before any is renamed into place (each ``.npz`` before its
+    ``.npy``), so a failure leaves the previous pack whole; with
+    ``strand="+"`` a minus pair left by an earlier run is deleted afterwards.
+    Temporary files never outlive the call, and those of an earlier,
+    killed run are removed first.
+
+    Returns the plus strand's ``.npy`` path.
+    """
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    _remove_interrupted_fold_temps(cache_dir)
+    names = [name for name, _ in records]
+    lengths = np.array([len(seq) for _, seq in records], dtype=np.int64)
+    offsets = (np.cumsum(lengths) - lengths).astype(np.int64)
+    total = int(lengths.sum())
+    strands = ["+"] if strand == "+" else ["+", "-"]
+    _warn_if_disk_is_small(cache_dir, total * unpaired_prob * len(strands))
+
+    tmp_paths: dict[str, Path] = {}
+    staged: list[tuple[Path, Path]] = []
+    try:
+        for s in strands:
+            tmp = _tmp_path(packed_paths(cache_dir, s)[0])
+            tmp_paths[s] = tmp
+            mm = np.lib.format.open_memmap(
+                tmp, mode="w+", dtype=np.uint8, shape=(total, unpaired_prob)
+            )
+            mm.flush()
+            del mm
+
+        tmp_npy = {s: str(p) for s, p in tmp_paths.items()}
+        tasks = [
+            (
+                tmp_npy,
+                [(names[i], records[i][1], int(offsets[i])) for i in batch],
+                window_size,
+                max_span,
+                unpaired_prob,
+                chunk_size,
+                temperature,
+                strand,
+            )
+            for batch in _batch_records(lengths.tolist())
+        ]
+        results: list[dict[str, tuple[np.ndarray, np.ndarray]]] = []
+        n_workers = min(workers, len(tasks))
+        if n_workers <= 1:
+            for task in tasks:
+                results.append(_fold_records_into_pack(*task))
+                on_batch(len(task[1]))
+        else:
+            # spawn, as for the Parquet packer and the off-target workers: no
+            # fork of a parent whose polars/Rayon threads may be running.
+            with ProcessPoolExecutor(
+                max_workers=n_workers, mp_context=multiprocessing.get_context("spawn")
+            ) as pool:
+                futures = {
+                    pool.submit(_fold_records_into_pack, *task): len(task[1])
+                    for task in tasks
+                }
+                try:
+                    for fut in as_completed(futures):
+                        results.append(fut.result())
+                        on_batch(futures[fut])
+                except BaseException:
+                    # A failed run must not go on folding the rest of the FASTA.
+                    pool.shutdown(cancel_futures=True)
+                    raise
+
+        n_exceptions: dict[str, int] = {}
+        for s in strands:
+            index, value = _sorted_exceptions(
+                "accessibility (packed)",
+                s,
+                [r[s][0] for r in results],
+                [r[s][1] for r in results],
+                total * unpaired_prob,
+            )
+            n_exceptions[s] = len(index)
+            npy_path, npz_path = packed_paths(cache_dir, s)
+            npz_tmp = _stage_index(npz_path, names, offsets, lengths, index, value)
+            staged += [(npz_tmp, npz_path), (tmp_paths[s], npy_path)]
+        for tmp, final in staged:
+            os.replace(tmp, final)
+        for s in strands:
+            logger.info(
+                f"Folded {len(names):,} records into "
+                f"{packed_paths(cache_dir, s)[0].name}: {total:,} positions × "
+                f"{unpaired_prob}, {n_exceptions[s]:,} exact-value exceptions"
+            )
+        if strand == "+":
+            # A minus pair from an earlier --strand both run would otherwise
+            # keep answering for records this run did not fold.
+            for path in packed_paths(cache_dir, "-"):
+                path.unlink(missing_ok=True)
+    finally:
+        for tmp in [*tmp_paths.values(), *(t for t, _ in staged)]:
+            tmp.unlink(missing_ok=True)
+    return packed_paths(cache_dir, "+")[0]
+
+
 def _date_no_earlier_than(npy_path: Path, mtime_ns: int) -> None:
     """Move a fresh cache file's mtime up to ``mtime_ns`` if it is earlier.
 
@@ -703,7 +1230,7 @@ def _cache_is_valid(npy_path: Path, npz_path: Path) -> bool:
         return False
     try:
         arr = np.load(npy_path, mmap_mode="r")
-    except (OSError, ValueError):
+    except (OSError, ValueError, EOFError):
         return False
     return arr.ndim == 2 and arr.dtype == np.uint8
 
@@ -738,103 +1265,133 @@ def _warn_stale(chrom: str, cache_dir: Path, parquet_path: Path) -> None:
     )
 
 
+def _pack_is_current(pack_dir: Path, parquet_files: list[Path]) -> bool:
+    """Every packed pair in ``pack_dir`` holds every record of these Parquet files.
+
+    For each strand that has any packed file, all three must hold: both files
+    are present and pass the header checks, the ``.npz`` ``names`` contain
+    every Parquet record (order is ignored: a pack folded from a FASTA keeps
+    FASTA order), and the ``.npy`` is no older than the newest Parquet. Names
+    without a Parquet (one deleted later, or a FASTA fold of more records)
+    are harmless. So a FASTA re-fold into a Parquet directory is kept while
+    the Parquet is older than it. A
+    directory with no packed file is not current; nor is one whose files
+    cannot be read. Content is never read, only the ``names`` list, so this
+    stays cheap on a genome-sized pack.
+    """
+    want = {_chrom_of(f) for f in parquet_files}
+    try:
+        newest = max(f.stat().st_mtime_ns for f in parquet_files)
+    except (OSError, ValueError):
+        return False
+    found = False
+    for strand in _STRAND_NAMES:
+        npy_path, npz_path = packed_paths(pack_dir, strand)
+        if not (npy_path.exists() or npz_path.exists()):
+            continue
+        found = True
+        if not _cache_is_valid(npy_path, npz_path):
+            return False
+        try:
+            with np.load(npz_path) as side:
+                names = np.asarray(side["names"]).tolist()
+            if not want.issubset(names) or npy_path.stat().st_mtime_ns < newest:
+                return False
+        except _CORRUPT_CACHE_ERRORS:
+            return False
+    return found
+
+
 def ensure_accessibility_cache(
     parquet_dir: Union[str, Path],
     cache_dir: Optional[Union[str, Path]] = None,
-    contigs: Optional[Iterable[str]] = None,
     workers: int = 1,
     batch_rows: int = _DEFAULT_BATCH_ROWS,
 ) -> list[str]:
-    """Build the uint8 cache for every Parquet contig that lacks a current one.
+    """Pack a directory of Parquet profiles into the memory-mapped cache.
 
     Meant to run once in the parent process before an off-target worker pool
-    starts, so workers only ever memory-map finished files. A contig is
-    skipped when both strand caches in ``cache_dir`` pass `_cache_is_valid`
-    and neither ``.npy`` is older than its Parquet, which makes repeated calls
-    cheap. A cache older than its Parquet (the directory was re-folded) is
-    rebuilt with a warning. A directory without any Parquet (only ``.npy``
-    caches) builds nothing.
+    starts, so workers only ever memory-map finished files. In order:
+
+    1. A directory without Parquet (only caches) packs nothing.
+    2. A packed pair in ``cache_dir`` or ``parquet_dir`` (searched in that
+       order, the first one holding any packed file) that holds every
+       record of these Parquet files, in any order, and is no older than the
+       newest of them, is kept: a pack of a later FASTA fold into the same
+       directory included.
+    3. With no pack, and a valid, current per-record cache (the v0.2.0 layout
+       of `build_accessibility_cache`) in ``cache_dir`` for every Parquet
+       contig, that cache is reused and nothing is packed, so a genome-sized
+       cache is never duplicated.
+    4. Otherwise `pack_parquet_profiles` packs every Parquet, in sorted
+       file-name order. A pack that existed but no longer matches its Parquet
+       (the directory was re-folded, a record was added or removed, or a
+       pack file cannot be read) is rebuilt with a warning.
 
     Parameters
     ----------
     parquet_dir : str or pathlib.Path
         Directory of ``<chrom>.accessibility.parquet`` files.
     cache_dir : str or pathlib.Path, optional
-        Where the ``.npy``/``.npz`` files go; created if missing. Defaults to
+        Where the packed files go; created if missing. Defaults to
         ``parquet_dir``.
-    contigs : iterable of str, optional
-        Restrict the build to these contig names; default all Parquet present.
     workers : int, default 1
-        Contigs built in parallel: ``min(workers, 4)`` spawned processes, each
-        holding one strand's cache (chr1: 7.5 GB) at its peak.
+        Processes filling the packed matrix: ``min(workers, 4)``.
     batch_rows : int, default 1_000_000
         Rows decoded per Parquet batch while streaming.
 
     Returns
     -------
     list[str]
-        Names of the contigs that were (re)built, largest file first.
+        Names of the records that were packed, in pack order; empty when
+        nothing had to be built.
 
     Raises
     ------
     AccessibilityError
-        When a contig's cache cannot be built, naming its Parquet; the
-        original exception (an ``OSError`` for an unwritable ``cache_dir``)
-        is its ``__cause__``.
+        When the profiles cannot be packed; the original exception (an
+        ``OSError`` for an unwritable ``cache_dir``) is its ``__cause__``.
     OSError
         When ``cache_dir`` cannot be created.
     """
     parquet_dir = Path(parquet_dir)
     cache_dir = Path(cache_dir) if cache_dir is not None else parquet_dir
+    files = sorted(parquet_dir.glob(f"*{PARQUET_SUFFIX}"))
+    if not files:
+        return []
     cache_dir.mkdir(parents=True, exist_ok=True)
 
-    files = sorted(parquet_dir.glob(f"*{PARQUET_SUFFIX}"))
-    if contigs is not None:
-        wanted = set(contigs)
-        files = [f for f in files if _chrom_of(f) in wanted]
-    missing: list[Path] = []
-    for f in files:
-        chrom = _chrom_of(f)
-        if not all(_cache_is_valid(*cache_paths(cache_dir, chrom, s)) for s in "+-"):
-            missing.append(f)
-        elif _cache_is_stale(cache_dir, chrom, f):
-            _warn_stale(chrom, cache_dir, f)
-            missing.append(f)
-    if not missing:
+    stale_in: Optional[Path] = None
+    for directory in dict.fromkeys((cache_dir, parquet_dir)):
+        if any(p.exists() for s in _STRAND_NAMES for p in packed_paths(directory, s)):
+            if _pack_is_current(directory, files):
+                return []
+            stale_in = directory
+            break
+    if stale_in is None and all(
+        all(_cache_is_valid(*cache_paths(cache_dir, _chrom_of(f), s)) for s in "+-")
+        and not _cache_is_stale(cache_dir, _chrom_of(f), f)
+        for f in files
+    ):
         return []
-    missing.sort(key=lambda f: f.stat().st_size, reverse=True)
-    names = [_chrom_of(f) for f in missing]
-
-    n_proc = max(1, min(workers, 4, len(missing)))
+    if stale_in is not None:
+        logger.warning(
+            f"Packed accessibility cache in {stale_in} does not match the "
+            f"Parquet profiles in {parquet_dir}; rebuilding it"
+        )
     logger.info(
-        f"Building accessibility cache for {len(missing)} contig(s) in {cache_dir} "
-        f"with {n_proc} process(es)"
+        f"Packing {len(files)} accessibility profile(s) into {cache_dir} "
+        f"with {max(1, min(workers, 4))} process(es)"
     )
-    if n_proc == 1:
-        for f in missing:
-            try:
-                build_accessibility_cache(f, cache_dir, batch_rows)
-            except Exception as e:
-                raise AccessibilityError(
-                    f"Failed to build accessibility cache for {f.name}: {e}"
-                ) from e
-        return names
+    try:
+        return pack_parquet_profiles(parquet_dir, cache_dir, workers, batch_rows)
+    except Exception as e:
+        raise AccessibilityError(
+            f"Failed to pack accessibility profiles from {parquet_dir}: {e}"
+        ) from e
 
-    # spawn: a fresh interpreter per worker avoids fork + Arrow thread-pool deadlocks.
-    ctx = multiprocessing.get_context("spawn")
-    with ProcessPoolExecutor(max_workers=n_proc, mp_context=ctx) as pool:
-        futures = {
-            pool.submit(build_accessibility_cache, f, cache_dir, batch_rows): f
-            for f in missing
-        }
-        for fut in as_completed(futures):
-            try:
-                fut.result()
-            except Exception as e:
-                raise AccessibilityError(
-                    f"Failed to build accessibility cache for {futures[fut].name}: {e}"
-                ) from e
-    return names
+
+_UNRESOLVED = object()
 
 
 class _DenseProfile:
@@ -914,22 +1471,147 @@ class _CachedProfile:
 _Profile = Union[_DenseProfile, _CachedProfile]
 
 
+def _name_keys(names: np.ndarray) -> np.ndarray:
+    """Record names as UTF-8 bytes (``S`` dtype), the packed reader's lookup keys.
+
+    numpy's ``str`` dtype takes four bytes per character of the longest name:
+    385k GENCODE IDs of up to 151 characters come to 233 MB per copy, a
+    quarter of that as bytes. UTF-8 orders like the code points, so sorting
+    and searching the bytes agrees with doing so on the strings.
+    """
+    names = np.asarray(names)
+    if names.dtype.kind == "S":
+        return names
+    return np.char.encode(names.astype(str), "utf-8")
+
+
+class _PackedStrand:
+    """One strand of a packed cache: every record's code rows back to back.
+
+    ``codes`` is the memory-mapped ``[total, n_u]`` matrix; record ``i`` owns
+    rows ``offsets[i] : offsets[i] + lengths[i]``. ``exc_index`` holds the exact
+    exceptions as global flat indices (``row * n_u + col``). ``whole`` is a
+    profile over the full matrix, so a gather at global rows needs no per-record
+    object. ``names`` are UTF-8 bytes (see `_name_keys`); ``by_name`` orders
+    them, so lookups need no sorted copy. Both strands of a pack hold the same
+    names, and the service passes one strand's arrays to the other.
+    """
+
+    def __init__(
+        self,
+        codes: np.ndarray,
+        names: np.ndarray,
+        offsets: np.ndarray,
+        lengths: np.ndarray,
+        exc_index: np.ndarray,
+        exc_value: np.ndarray,
+        by_name: Optional[np.ndarray] = None,
+    ):
+        self.codes = codes
+        self.names = _name_keys(names)
+        self.offsets = offsets
+        self.lengths = lengths
+        self.exc_index = exc_index
+        self.exc_value = exc_value
+        self.whole = _CachedProfile(codes, exc_index, exc_value)
+        # Names are in file-name or FASTA order, which need not be sorted.
+        self._by_name = (
+            np.argsort(self.names, kind="stable") if by_name is None else by_name
+        )
+
+    def record_ids(self, chroms: np.ndarray) -> np.ndarray:
+        """Record number of each name in ``chroms``; ``-1`` for an unknown one."""
+        keys = _name_keys(np.asarray(chroms, dtype=str))
+        if self.names.size == 0:
+            return np.full(keys.shape, -1, dtype=np.int64)
+        pos = np.searchsorted(self.names, keys, sorter=self._by_name)
+        rid = self._by_name[np.minimum(pos, self.names.size - 1)]
+        return np.where(self.names[rid] == keys, rid, -1).astype(np.int64)
+
+    def record(self, name: str) -> Optional[_CachedProfile]:
+        """A view of one record's rows and exceptions; ``None`` if unknown."""
+        rid = int(self.record_ids(np.array([name]))[0])
+        if rid < 0:
+            return None
+        off, n = int(self.offsets[rid]), int(self.lengths[rid])
+        n_u = self.codes.shape[1]
+        lo, hi = np.searchsorted(self.exc_index, [off * n_u, (off + n) * n_u])
+        return _CachedProfile(
+            self.codes[off : off + n],
+            self.exc_index[lo:hi] - off * n_u,
+            self.exc_value[lo:hi],
+        )
+
+
+def _load_packed_strand(
+    directory: Path, strand: str, share: Optional[_PackedStrand] = None
+) -> _PackedStrand:
+    """Map one strand's packed cache; only the ``.npz`` index is read into memory.
+
+    ``share`` is the other strand of the pack, if loaded: when its names are
+    the same, its name arrays are reused, so a process holds them once.
+    """
+    npy_path, npz_path = packed_paths(directory, strand)
+
+    def corrupt(why: str) -> AccessibilityError:
+        return AccessibilityError(
+            f"Corrupt packed accessibility cache for strand {strand!r} "
+            f"({npy_path}, {npz_path}): {why}. Delete the files to rebuild them."
+        )
+
+    try:
+        codes = np.load(npy_path, mmap_mode="r")
+        with np.load(npz_path) as side:
+            names = np.asarray(side["names"])
+            offsets = np.ascontiguousarray(side["offsets"], dtype=np.int64)
+            lengths = np.ascontiguousarray(side["lengths"], dtype=np.int64)
+            exc_index = np.ascontiguousarray(side["index"], dtype=np.int64)
+            exc_value = np.ascontiguousarray(side["value"], dtype=np.float32)
+        keys = _name_keys(names)
+    except _CORRUPT_CACHE_ERRORS as e:
+        raise corrupt(f"{type(e).__name__}: {e}") from e
+    del names
+    if codes.ndim != 2 or codes.dtype != np.uint8:
+        raise corrupt(
+            f"codes are {codes.dtype} with shape {codes.shape}, not 2-D uint8"
+        )
+    if not (keys.shape == offsets.shape == lengths.shape) or keys.ndim != 1:
+        raise corrupt("names, offsets and lengths differ in length")
+    if exc_index.shape != exc_value.shape:
+        raise corrupt("the exception index and values differ in length")
+    if keys.size and int(offsets[-1] + lengths[-1]) != codes.shape[0]:
+        raise corrupt(
+            f"records cover {int(offsets[-1] + lengths[-1])} rows but the matrix "
+            f"has {codes.shape[0]}"
+        )
+    by_name = None
+    if share is not None and np.array_equal(share.names, keys):
+        keys, by_name = share.names, share._by_name
+    return _PackedStrand(codes, keys, offsets, lengths, exc_index, exc_value, by_name)
+
+
 class GenomeAccessibilityService:
     """
     Service to pre-compute and query genomic accessibility profiles.
 
     Profiles are stored as per-chromosome Parquet files produced by
-    compute_genome_accessibility() in ``data_dir`` and served from the uint8
-    cache described at `build_accessibility_cache`: one
-    ``<chrom>_<plus|minus>.access.npy`` per strand plus an exceptions sidecar,
-    ``np.load(mmap_mode="r")``-ed so every process shares one page-cache copy
-    and resident memory is only the pages it touches. The cache is looked up in
-    ``cache_dir`` (default: ``data_dir``), then in ``data_dir``. A contig whose
-    cache is missing, or older than its Parquet, is built from the Parquet
-    into ``cache_dir`` on first use (batch runs build it up front with
+    compute_genome_accessibility() in ``data_dir`` and served from a uint8
+    cache, ``np.load(mmap_mode="r")``-ed so every process shares one page-cache
+    copy and resident memory is only the pages it touches. The cache is the
+    packed pair of `pack_parquet_profiles` (one ``.packed.npy`` plus index
+    ``.packed.npz`` per strand, every record in it), or, for a directory
+    written by v0.2.0, the per-record files of `build_accessibility_cache`. It
+    is looked up in ``cache_dir`` (default: ``data_dir``), then in ``data_dir``,
+    and a pack is preferred over per-record files. A pack that does not match
+    the Parquet in ``data_dir`` (a different set of records, or a Parquet newer
+    than the pack) is rebuilt on first use, as is a contig whose per-record
+    cache is missing or older than its Parquet (batch runs pack up front with
     `ensure_accessibility_cache` so worker processes only map finished files);
     a directory holding the complete cache needs no Parquet at all. The LRU of
-    ``max_cached`` slots bounds the number of mappings loaded per process.
+    ``max_cached`` slots bounds the number of per-record mappings loaded per
+    process. ``verify_pack=False`` skips the pack-versus-Parquet check: pass it
+    only when `ensure_accessibility_cache` has just run on the same
+    directories, as the off-target pipeline does before building services.
 
     `from_frames()` builds a service over in-memory per-chromosome
     DataFrames instead (the ``dict[chrom -> DataFrame]`` that
@@ -943,8 +1625,10 @@ class GenomeAccessibilityService:
         max_cached: int = 4,
         frames: Optional[Mapping[str, pl.DataFrame]] = None,
         cache_dir: Optional[Path] = None,
+        verify_pack: bool = True,
     ):
         self.data_dir = data_dir
+        self._verify_pack = verify_pack
         if self.data_dir is not None:
             self.data_dir.mkdir(parents=True, exist_ok=True)
         # Where the uint8 cache is built and first looked for; None only for a
@@ -961,6 +1645,101 @@ class GenomeAccessibilityService:
         # Contigs whose cache was found no older than their Parquet, or was
         # (re)built here; `_cached_from_disk` does not compare mtimes again.
         self._current: set[str] = set()
+        # Directory holding the packed cache, resolved once; `_UNRESOLVED` until
+        # then (resetting it to that re-resolves).
+        self._packed_root: object = _UNRESOLVED
+        self._packed_strands: dict[str, Optional[_PackedStrand]] = {}
+        # Records whose two packed strands differ in length; None until computed.
+        self._packed_mismatches: Optional[dict[str, tuple[int, int]]] = None
+
+    def _reset_packed(self) -> None:
+        """Forget the resolved pack directory and every loaded strand.
+
+        Called after a lazy (re)pack: keeping a cached ``None`` strand or a
+        memory map of the replaced file would go on serving the old answer.
+        """
+        self._packed_root = _UNRESOLVED
+        self._packed_strands = {}
+        self._packed_mismatches = None
+
+    def _packed_dir(self) -> Optional[Path]:
+        """The first searched directory holding packed files, or ``None``.
+
+        When ``data_dir`` holds Parquet the pack must match it (see
+        `_pack_is_current`), checked once per process unless the service was
+        built with ``verify_pack=False``; one that does not is ignored, so the
+        next lookup goes through `_cached_from_disk`, which repacks it.
+        """
+        if self._packed_root is _UNRESOLVED:
+            root: Optional[Path] = None
+            for directory in self._cache_dirs():
+                if any(
+                    p.is_file()
+                    for s in _STRAND_NAMES
+                    for p in packed_paths(directory, s)
+                ):
+                    root = directory
+                    break
+            if root is not None and self.data_dir is not None and self._verify_pack:
+                files = sorted(self.data_dir.glob(f"*{PARQUET_SUFFIX}"))
+                if files and not _pack_is_current(root, files):
+                    logger.info(
+                        f"Packed accessibility cache in {root} does not match the "
+                        f"Parquet profiles in {self.data_dir}; not using it"
+                    )
+                    root = None
+            if root is not None:
+                logger.info(f"Using the packed accessibility cache in {root}")
+            self._packed_root = root
+        return cast(Optional[Path], self._packed_root)
+
+    def _packed_strand(self, strand: str) -> Optional[_PackedStrand]:
+        """The packed cache of one strand, loaded once; ``None`` if it has none.
+
+        A pair with only one of its two files (an interrupted pack) is corrupt,
+        not missing. The two strands share one copy of the record names.
+        """
+        if strand not in self._packed_strands:
+            root = self._packed_dir()
+            loaded = None
+            if root is not None and any(
+                p.is_file() for p in packed_paths(root, strand)
+            ):
+                other = next(
+                    (p for p in self._packed_strands.values() if p is not None), None
+                )
+                loaded = _load_packed_strand(root, strand, share=other)
+            self._packed_strands[strand] = loaded
+        return self._packed_strands[strand]
+
+    def _packed_length_mismatches(self) -> dict[str, tuple[int, int]]:
+        """``{record: (plus length, minus length)}`` for records whose strands differ.
+
+        Computed once per loaded pack. Records empty on either strand are left
+        out, as `check_strand_lengths` skips them.
+        """
+        if self._packed_mismatches is None:
+            plus, minus = self._packed_strand("+"), self._packed_strand("-")
+            found: dict[str, tuple[int, int]] = {}
+            if plus is not None and minus is not None:
+                rid = (
+                    np.arange(plus.names.size)
+                    if plus.names is minus.names
+                    else minus.record_ids(np.char.decode(plus.names, "utf-8"))
+                )
+                known = rid >= 0
+                minus_len = np.zeros_like(plus.lengths)
+                minus_len[known] = minus.lengths[rid[known]]
+                differ = (
+                    (plus.lengths != minus_len) & (plus.lengths > 0) & (minus_len > 0)
+                )
+                for i in np.flatnonzero(differ):
+                    found[plus.names[i].decode("utf-8")] = (
+                        int(plus.lengths[i]),
+                        int(minus_len[i]),
+                    )
+            self._packed_mismatches = found
+        return self._packed_mismatches
 
     def _require_dir(self) -> Path:
         """The Parquet directory; a frame-backed service has none."""
@@ -994,55 +1773,105 @@ class GenomeAccessibilityService:
         temperature: float = 37.0,
         output_format: str = "parquet",
         strand: str = "both",
+        chunk_size: int = 1_000_000,
     ) -> Dict[str, Path]:
         """
         Compute accessibility for all sequences in the genome FASTA.
 
-        Dispatches one task per chromosome to a ProcessPoolExecutor for
-        parallel folding. With ``output_format="parquet"`` saves one Parquet
-        file per chromosome containing columns [position, strand, u1, u2, ...,
-        u{unpaired_prob}]; with ``"npy"`` writes the uint8 memory-map cache
-        (``{chrom}_{plus,minus}.access.npy`` plus ``.access.exceptions.npz``
-        sidecars, see `build_accessibility_cache`) instead, which
-        ``off-targets`` reads with no conversion step.
-        ``strand="+"`` folds each sequence as given only (see
-        `_fold_full_chromosome`).
+        Record IDs (the first word of each header) must be unique; duplicates
+        raise before anything is written. With ``output_format="parquet"``
+        one task per record goes to a ProcessPoolExecutor, and each saves a
+        ``{record}.accessibility.parquet`` with columns [position, strand, u1,
+        u2, ..., u{unpaired_prob}]. With ``"npy"`` the records are folded, in
+        batches, straight into the packed uint8 memory-map cache in the data
+        directory, ``accessibility.{plus,minus}.packed.npy`` plus a
+        ``.packed.npz`` index each, records in FASTA order (see
+        `_pack_fasta_records`), which ``off-targets`` reads with no
+        conversion step; a re-run replaces the pair, and a FASTA without
+        records is refused. ``strand="+"`` folds each sequence as given only
+        (see `_fold_full_chromosome`); the npy output then has no minus pair,
+        and one from an earlier run is deleted.
 
         Args:
             genome_path: Path to genome FASTA file.
             window_size: -W parameter (default 80).
             max_span: -L parameter (default 40).
             unpaired_prob: -u parameter (default 30).
-            workers: Number of parallel folding workers.
+            workers: Number of parallel folding processes.
             progress: Rich Progress instance (optional).
             progress_callback: Simple callback(advance, description) (optional).
+                For "npy" it is called once per finished batch, with
+                ``advance`` the batch's record count.
             temperature: Folding temperature in °C (default 37.0).
             output_format: "parquet" (default) or "npy".
             strand: "both" (default) or "+" to skip the reverse complement.
+            chunk_size: Positions folded per RNAplfold call on long records
+                (default 1,000,000).
 
         Returns:
-            Dictionary mapping 'chrom' to the output Parquet path, or to the
-            plus-strand ``.access.npy`` path for "npy".
+            Dictionary mapping each record to its Parquet path, or, for
+            "npy", every record to the plus strand's ``.packed.npy`` path.
         """
         if output_format not in OUTPUT_FORMATS:
             raise AccessibilityError(
                 f"output_format must be one of {OUTPUT_FORMATS}, got {output_format!r}"
             )
         _check_fold_strand(strand)
-        from concurrent.futures import ProcessPoolExecutor, as_completed
         from sioff.services.helpers import read_fasta
 
-        # Read all chromosomes; longest-job-first to minimise tail latency.
-        chromosomes = sorted(
-            list(read_fasta(genome_path)),
-            key=lambda cs: len(cs[1]),
-            reverse=True,
-        )
+        records = list(read_fasta(genome_path))
+        dups = [n for n, k in Counter(n for n, _ in records).items() if k > 1]
+        if dups:
+            more = "…" if len(dups) > 10 else ""
+            raise AccessibilityError(
+                f"Duplicate record IDs in {genome_path}: {', '.join(dups[:10])}{more}"
+            )
+        out_dir = self._require_dir()
 
         logger.info(
-            f"Computing full-genome accessibility for {len(chromosomes)} "
-            f"chromosome(s) using {workers} worker(s)"
+            f"Computing full-genome accessibility for {len(records)} "
+            f"record(s) using {workers} worker(s)"
         )
+
+        if output_format == "npy":
+            n = len(records)
+            if not n:
+                # A pack of no records is of no use, and `_annotate_packed`
+                # cannot index an empty one.
+                raise AccessibilityError(f"No records in {genome_path}")
+            prog_task = None
+            if progress is not None:
+                prog_task = progress.add_task("Folding records...", total=n)
+            done = 0
+
+            def on_batch(advance: int) -> None:
+                nonlocal done
+                done += advance
+                description = f"Folded {done}/{n} records"
+                if progress is not None and prog_task is not None:
+                    progress.update(prog_task, advance=advance, description=description)
+                elif progress_callback:
+                    progress_callback(advance=advance, description=description)
+
+            plus = _pack_fasta_records(
+                records,
+                out_dir,
+                window_size,
+                max_span,
+                unpaired_prob,
+                chunk_size,
+                temperature,
+                strand,
+                workers,
+                on_batch,
+            )
+            # Mappings of a pair this service had loaded are now stale.
+            self._reset_packed()
+            self._profiles.clear()
+            return {name: plus for name, _ in records}
+
+        # Longest-job-first to minimise tail latency.
+        chromosomes = sorted(records, key=lambda cs: len(cs[1]), reverse=True)
 
         total_tasks = len(chromosomes)
         prog_task = None
@@ -1054,11 +1883,6 @@ class GenomeAccessibilityService:
 
         with ProcessPoolExecutor(max_workers=workers) as pool:
             for chrom, sequence in chromosomes:
-                out_path = str(
-                    self._require_dir()
-                    if output_format == "npy"
-                    else self._require_dir() / f"{chrom}{PARQUET_SUFFIX}"
-                )
                 fut = pool.submit(
                     _fold_full_chromosome,
                     sequence,
@@ -1066,8 +1890,8 @@ class GenomeAccessibilityService:
                     window_size,
                     max_span,
                     unpaired_prob,
-                    out_path,
-                    1_000_000,
+                    str(out_dir / f"{chrom}{PARQUET_SUFFIX}"),
+                    chunk_size,
                     temperature,
                     output_format=output_format,
                     strand=strand,
@@ -1157,38 +1981,30 @@ class GenomeAccessibilityService:
             dict.fromkeys(d for d in (self.cache_dir, self.data_dir) if d is not None)
         )
 
-    def _npy_path(self, chrom: str, strand: str) -> Path:
-        """The ``.npy`` the lookup uses: the first searched directory that has it.
+    def _find_cache(self, chrom: str, strand: str) -> Optional[tuple[Path, Path]]:
+        """``(npy, npz)`` of the strand's per-record cache, or ``None``.
 
-        Falls back to the ``cache_dir`` path, where a lazy build would write.
+        The first searched directory holding both files; a lone ``.npy`` does
+        not count, so it cannot shadow a complete cache further down the list.
         """
-        dirs = self._cache_dirs()
-        for directory in dirs:
-            npy = cache_paths(directory, chrom, strand)[0]
-            if npy.is_file():
-                return npy
-        return cache_paths(dirs[0], chrom, strand)[0]
-
-    def _cache_location(self, chrom: str, strand: str) -> Optional[Path]:
-        """The first searched directory holding both files of the strand's cache."""
         for directory in self._cache_dirs():
             npy_path, npz_path = cache_paths(directory, chrom, strand)
             if npy_path.is_file() and npz_path.is_file():
-                return directory
+                return npy_path, npz_path
         return None
 
     def _open_cache(self, chrom: str, strand: str) -> _CachedProfile | None:
         """Memory-map the (chrom, strand) cache if both its files exist."""
-        directory = self._cache_location(chrom, strand)
-        if directory is None:
+        found = self._find_cache(chrom, strand)
+        if found is None:
             return None
-        npy_path, npz_path = cache_paths(directory, chrom, strand)
+        npy_path, npz_path = found
         try:
             codes = np.load(npy_path, mmap_mode="r")
             with np.load(npz_path) as side:
                 exc_index = np.ascontiguousarray(side["index"], dtype=np.int64)
                 exc_value = np.ascontiguousarray(side["value"], dtype=np.float32)
-        except (OSError, ValueError, KeyError) as e:
+        except _CORRUPT_CACHE_ERRORS as e:
             raise AccessibilityError(
                 f"Corrupt accessibility cache for {chrom} {strand} "
                 f"({npy_path}, {npz_path}): {e}. Delete the files to rebuild them."
@@ -1202,26 +2018,28 @@ class GenomeAccessibilityService:
         return _CachedProfile(codes, exc_index, exc_value)
 
     def _cached_from_disk(self, chrom: str, strand: str) -> _CachedProfile:
-        """Map the cache for (chrom, strand), building it from Parquet if needed.
+        """Map the per-record cache for (chrom, strand), packing it if needed.
 
-        Built when absent, and rebuilt (with a warning) when the cache found is
-        older than the contig's Parquet in ``data_dir`` (see `_cache_is_stale`).
+        Reached when no current pack exists. A missing cache, or one older than
+        the contig's Parquet in ``data_dir`` (see `_cache_is_stale`, warned
+        about), makes `ensure_accessibility_cache` pack the Parquet directory;
+        the contig is then served from the pack.
         The age check runs until the contig's cache is known current, so the
         second strand and later re-mappings after LRU eviction skip it.
         """
         parquet = self._find_profile(chrom)
         stale_in: Optional[Path] = None
         if parquet is not None and chrom not in self._current:
-            found = self._cache_location(chrom, strand)
-            if found is not None and _cache_is_stale(found, chrom, parquet):
-                stale_in = found
+            found = self._find_cache(chrom, strand)
+            if found is not None and _cache_is_stale(found[0].parent, chrom, parquet):
+                stale_in = found[0].parent
         profile = None if stale_in is not None else self._open_cache(chrom, strand)
         if profile is None:
             if parquet is None:
                 searched = " or ".join(
                     str(cache_paths(d, chrom, strand)[0]) for d in self._cache_dirs()
                 )
-                raise AccessibilityError(
+                raise ProfileNotFoundError(
                     f"Profile for {chrom} not found: neither the cache "
                     f"{searched} nor the Parquet "
                     f"{self._require_dir() / f'{chrom}{PARQUET_SUFFIX}'} exists."
@@ -1231,16 +2049,26 @@ class GenomeAccessibilityService:
             else:
                 logger.info(
                     f"Accessibility cache for {chrom} missing in {self.cache_dir}; "
-                    f"building it from {parquet}"
+                    f"packing the profiles in {self.data_dir}"
                 )
             try:
-                build_accessibility_cache(parquet, cast(Path, self.cache_dir))
-            except OSError as e:
+                ensure_accessibility_cache(
+                    cast(Path, self.data_dir), cast(Path, self.cache_dir)
+                )
+            except (AccessibilityError, OSError) as e:
+                cause = e.__cause__ if isinstance(e, AccessibilityError) else e
+                if not isinstance(cause, OSError):
+                    raise
                 raise AccessibilityError(
                     f"Cannot write the accessibility cache for {chrom} to "
-                    f"{self.cache_dir}: {e}. Pass a writable cache directory "
+                    f"{self.cache_dir}: {cause}. Pass a writable cache directory "
                     "(--accessibility-cache-dir)."
-                ) from e
+                ) from cause
+            self._reset_packed()
+            packed_root = self._packed_dir()
+            if packed_root is not None:
+                self._current.add(chrom)
+                return self._packed_profile(chrom, strand, packed_root)[0]
             profile = self._open_cache(chrom, strand)
             if profile is None:
                 raise AccessibilityError(
@@ -1252,6 +2080,25 @@ class GenomeAccessibilityService:
         if profile.n_pos == 0:
             raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
         return profile
+
+    def _packed_profile(
+        self, chrom: str, strand: str, root: Path
+    ) -> tuple[_CachedProfile, str]:
+        """One record's view of the packed cache, and the ``.npy`` it comes from."""
+        packed = self._packed_strand(strand)
+        if packed is None:
+            raise MissingStrandError(
+                f"No data for strand {strand!r} in the packed cache {root}"
+            )
+        npy = str(packed_paths(root, strand)[0])
+        profile = packed.record(chrom)
+        if profile is None:
+            raise ProfileNotFoundError(
+                f"Profile for {chrom} not found in the packed cache {npy}"
+            )
+        if profile.n_pos == 0:
+            raise MissingStrandError(f"No data for strand {strand!r} in {chrom}")
+        return profile, npy
 
     def _ensure_profile(self, chrom: str, strand: str) -> str:
         """
@@ -1278,12 +2125,26 @@ class GenomeAccessibilityService:
             profile: _Profile = self._dense_profile(self._frames[chrom], strand, source)
         else:
             if self.data_dir is None:
-                raise AccessibilityError(
+                raise ProfileNotFoundError(
                     f"Profile for {chrom} not found among the in-memory "
                     f"accessibility frames ({', '.join(sorted(self._frames)) or 'none'})."
                 )
-            profile = self._cached_from_disk(chrom, strand)
-            source = str(self._npy_path(chrom, strand))
+            packed_root = None if chrom in self._frames else self._packed_dir()
+            if packed_root is not None:
+                profile, source = self._packed_profile(chrom, strand, packed_root)
+            else:
+                profile = self._cached_from_disk(chrom, strand)
+                packed_root = self._packed_dir()
+                found = (
+                    None if packed_root is not None else self._find_cache(chrom, strand)
+                )
+                source = str(
+                    packed_paths(packed_root, strand)[0]
+                    if packed_root is not None
+                    else found[0]
+                    if found is not None
+                    else "the accessibility cache"
+                )
 
         self._profiles[profile_key] = profile
         logger.info(f"Loaded accessibility profile for {chrom} {strand} from {source}")
@@ -1312,11 +2173,26 @@ class GenomeAccessibilityService:
                 )
                 lens = dict(zip(agg["strand"].to_list(), agg["position"].to_list()))
                 return lens.get("+"), lens.get("-")
+            if self._packed_dir() is not None:
+                packed_lens: list[Optional[int]] = []
+                for strand in ("+", "-"):
+                    packed = self._packed_strand(strand)
+                    rid = (
+                        -1
+                        if packed is None
+                        else int(packed.record_ids(np.array([chrom]))[0])
+                    )
+                    packed_lens.append(
+                        None if packed is None or rid < 0 else int(packed.lengths[rid])
+                    )
+                return packed_lens[0], packed_lens[1]
             out: list[Optional[int]] = []
             for strand in ("+", "-"):
-                npy = self._npy_path(chrom, strand)
+                found = self._find_cache(chrom, strand)
                 out.append(
-                    int(np.load(npy, mmap_mode="r").shape[0]) if npy.is_file() else None
+                    None
+                    if found is None
+                    else int(np.load(found[0], mmap_mode="r").shape[0])
                 )
             return out[0], out[1]
         except Exception as exc:  # noqa: BLE001 - diagnostics only
@@ -1379,15 +2255,45 @@ class GenomeAccessibilityService:
         return int(round(raw_val * 10.0)) / 10.0
 
     def annotate_opening_energy_vectorized(self, df: pl.DataFrame) -> pl.DataFrame:
-        """Add `opening_energy` column by vectorized numpy gather per (chrom, strand) group."""
+        """Add `opening_energy` column by vectorized numpy gather per (chrom, strand) group.
+
+        Hits on an unknown contig, on ``onTarget``, on a strand other than
+        ``+``/``-`` or outside their contig keep 10.0; so do hits on a strand
+        the profile lacks, with a warning. A cache that cannot be read raises
+        `AccessibilityError`.
+        """
         n_rows = df.height
         opening_energies = np.full(n_rows, 10.0, dtype=np.float32)
 
-        chroms = df["chrom"].to_numpy()
         starts = df["start"].to_numpy().astype(np.int64)
         ends = df["end"].to_numpy().astype(np.int64)
         strands = df["strand"].to_numpy()
 
+        if n_rows == 0:
+            return df.with_columns(pl.Series("opening_energy", [], dtype=pl.Float32))
+
+        if not self._frames and self._packed_dir() is not None:
+            # Map each distinct contig once: a per-hit array of names costs
+            # the longest name's width for every hit. Nulls read as "None",
+            # as `str` makes them on the per-group path below.
+            chrom = df["chrom"].cast(pl.String).fill_null("None")
+            uniq = chrom.unique(maintain_order=True)
+            inv = chrom.replace_strict(
+                uniq, np.arange(uniq.len(), dtype=np.int64), return_dtype=pl.Int64
+            ).to_numpy()
+            self._annotate_packed(
+                np.asarray(uniq.to_list(), dtype=str),
+                inv,
+                starts,
+                ends,
+                strands,
+                opening_energies,
+            )
+            return df.with_columns(
+                pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
+            )
+
+        chroms = df["chrom"].to_numpy()
         groups: dict[tuple, list] = defaultdict(list)
         for i in range(n_rows):
             c = str(chroms[i])
@@ -1396,12 +2302,14 @@ class GenomeAccessibilityService:
             groups[(c, str(strands[i]))].append(i)
 
         for (chrom, strand), row_indices in groups.items():
+            if strand not in ("+", "-"):
+                continue
             try:
                 profile_key = self._ensure_profile(chrom, strand)
             except MissingStrandError:
                 _warn_missing_strand(chrom, strand)
                 continue
-            except Exception:
+            except ProfileNotFoundError:
                 continue
 
             profile = self._profiles[profile_key]
@@ -1420,3 +2328,76 @@ class GenomeAccessibilityService:
         return df.with_columns(
             pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
         )
+
+    def _annotate_packed(
+        self,
+        names: np.ndarray,
+        inv: np.ndarray,
+        starts: np.ndarray,
+        ends: np.ndarray,
+        strands: np.ndarray,
+        out: np.ndarray,
+    ) -> None:
+        """Fill ``out`` with every hit's opening energy from the packed cache.
+
+        Hit ``i`` is on contig ``names[inv[i]]``; each distinct name is looked
+        up once. One vectorised pass per strand: hits are mapped to records,
+        turned into global rows (``record offset + site_cells`` row) and gathered
+        in a single call. Unknown records, ``onTarget``, other strands and hits
+        outside their record keep the default already in ``out``. Records whose
+        strands differ in length are warned about once, as on the per-record
+        path.
+        """
+        on_target = names == "onTarget"
+        self._check_packed_lengths(names[~on_target])
+        for strand in ("+", "-"):
+            sel = np.flatnonzero(strands == strand)
+            sel = sel[~on_target[inv[sel]]]
+            if sel.size == 0:
+                continue
+            packed = self._packed_strand(strand)
+            if packed is None:
+                _warn_missing_strand(str(names[inv[sel[0]]]), strand)
+                continue
+            rid = packed.record_ids(names)[inv[sel]]
+            known = rid >= 0
+            lengths = (
+                np.where(known, packed.lengths[np.maximum(rid, 0)], 0)
+                if packed.lengths.size
+                else np.zeros(rid.shape, dtype=np.int64)
+            )
+            empty = known & (lengths == 0)
+            if empty.any():
+                _warn_missing_strand(str(names[inv[sel[np.argmax(empty)]]]), strand)
+            rows, cols, in_bounds = site_cells(
+                strand, starts[sel], ends[sel], lengths, packed.codes.shape[1]
+            )
+            ok = known & in_bounds & (lengths > 0)
+            if not ok.any():
+                continue
+            global_rows = rows[ok] + packed.offsets[rid[ok]]
+            vals = packed.whole.gather(global_rows, cols[ok])
+            out[sel[ok]] = (np.round(vals * 10.0) / 10.0).astype(np.float32)
+
+    def _check_packed_lengths(self, names: np.ndarray) -> None:
+        """`check_strand_lengths` for the packed records in ``names``, once each.
+
+        Diagnostics only, like `_strand_lengths`: a strand that cannot be
+        loaded here is reported by the lookup itself, never by this check.
+        """
+        if names.size == 0:
+            return
+        try:
+            mismatched = self._packed_length_mismatches()
+        except Exception as exc:  # noqa: BLE001 - diagnostics only
+            logger.debug(f"could not compare packed strand lengths: {exc}")
+            self._packed_mismatches = {}
+            return
+        if not mismatched:
+            return
+        root = cast(Path, self._packed_dir())
+        source = str(packed_paths(root, "+")[0])
+        for name in names.tolist():
+            if name in mismatched and name not in self._strands_checked:
+                self._strands_checked.add(name)
+                check_strand_lengths(name, *mismatched[name], source)

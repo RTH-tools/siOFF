@@ -54,10 +54,12 @@ off_targets:
   # Accessibility profiles — choose ONE source (or omit for energy-only P(OT))
   # ---------------------------------------------------------------------------
 
-  # Directory of per-chromosome accessibility profiles produced by the
-  # "sioff accessibility" command: by default the memory-mapped
-  # {chrom}_{plus,minus}.access.npy cache, or {chrom}.accessibility.parquet
-  # files with its output_format: parquet.
+  # Directory of accessibility profiles produced by the "sioff accessibility"
+  # command: by default the memory-mapped packed cache
+  # accessibility.{plus,minus}.packed.npy + .packed.npz, or one
+  # {chrom}.accessibility.parquet per record with its output_format: parquet
+  # (packed on the first off-targets run). A v0.2.0 per-record
+  # {chrom}_{plus,minus}.access.npy cache is still read.
   accessibility_dir: ../examples/data/accessibility
 
   # Where the cache is read from and, when missing, built
@@ -172,7 +174,7 @@ off_targets:
 # ACCESSIBILITY COMMAND
 # Required when command: "accessibility"
 # Three operating modes (mutually exclusive; see below):
-#   1. Full-genome  : --fasta required; profiles written per chromosome
+#   1. Full-genome  : --fasta required; profiles written as the packed cache
 #   2. Binding-site : --fasta + --risearch-dir/--risearch-file (CLI-only)
 #   3. Profiles→Parquet: --profiles-dir + --risearch-dir (CLI-only, no FASTA needed)
 # =============================================================================

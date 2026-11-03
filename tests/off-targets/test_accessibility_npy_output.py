@@ -1,9 +1,10 @@
 """``sioff accessibility`` writes the uint8 cache directly (``--output-format npy``).
 
-The npy output must be the very files `build_accessibility_cache` makes from
-the Parquet of the same fold, so ``off-targets`` answers the same whichever way
-the cache came about: an npy-only ``-a``, a Parquet ``-a`` with its cache built
-on the first run, or a genome folded on the fly.
+The npy output must be the very packed pair `pack_parquet_profiles` makes from
+the Parquet of the same fold (and a per-record fold the very files
+`build_accessibility_cache` makes), so ``off-targets`` answers the same
+whichever way the cache came about: an npy-only ``-a``, a Parquet ``-a`` with
+its cache built on the first run, or a genome folded on the fly.
 
 The off-target comparisons run on the example data (6 kb genome, hits on both
 strands inside it), so the opening energies they compare are looked up, not the
@@ -22,6 +23,8 @@ from sioff.services.accessibility import (
     _fold_full_chromosome,
     build_accessibility_cache,
     cache_paths,
+    pack_parquet_profiles,
+    packed_paths,
 )
 
 # Read-only: folds and caches go to tmp_path.
@@ -83,20 +86,29 @@ def dirs(tmp_path_factory) -> tuple[Path, Path, list[str]]:
 
 def test_default_format_is_npy_and_parquet_is_opt_in(dirs) -> None:
     npy_dir, parquet_dir, chroms = dirs
-    assert not list(npy_dir.glob("*.parquet"))
     assert sorted(f.name for f in npy_dir.iterdir()) == sorted(
-        p.name for c in chroms for s in "+-" for p in cache_paths(npy_dir, c, s)
+        p.name for s in "+-" for p in packed_paths(npy_dir, s)
     )
-    assert not [f for f in parquet_dir.iterdir() if ".access." in f.name]
+    assert not [
+        f for f in parquet_dir.iterdir() if ".access." in f.name or ".packed." in f.name
+    ]
 
 
 def test_npy_output_equals_cache_built_from_parquet(dirs, tmp_path: Path) -> None:
     npy_dir, parquet_dir, chroms = dirs
-    for chrom in chroms:
-        build_accessibility_cache(
-            parquet_dir / f"{chrom}.accessibility.parquet", tmp_path
+    assert pack_parquet_profiles(parquet_dir, tmp_path) == chroms
+    for strand in "+-":
+        (npy_a, npz_a), (npy_b, npz_b) = (
+            packed_paths(npy_dir, strand),
+            packed_paths(tmp_path, strand),
         )
-    _assert_same_cache(npy_dir, tmp_path, chroms)
+        assert npy_a.read_bytes() == npy_b.read_bytes(), strand
+        with np.load(npz_a) as x, np.load(npz_b) as y:
+            # FASTA order and file-name order agree for single-record genome.fa.
+            assert sorted(x["names"].tolist()) == sorted(y["names"].tolist())
+            for key in ("index", "value", "lengths"):
+                assert x[key].dtype == y[key].dtype, key
+                np.testing.assert_array_equal(x[key], y[key])
 
 
 def test_npy_output_equals_parquet_cache_across_chunks(tmp_path: Path) -> None:

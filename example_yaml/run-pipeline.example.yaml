@@ -47,7 +47,7 @@ slurm:
 
 
 # =============================================================================
-# Step: accessibility  (pre-compute per-chromosome accessibility profiles)
+# Step: accessibility  (pre-compute accessibility profiles for every record)
 # =============================================================================
 accessibility:
   fasta: ../examples/data/genome.fa
@@ -57,8 +57,10 @@ accessibility:
   unpaired: 30
   temperature: 37.0
   workers: 1
-  # npy (default): the uint8 .access.npy cache off-targets memory-maps;
-  # parquet: one {chrom}.accessibility.parquet per chromosome.
+  # npy (default): the packed uint8 cache off-targets memory-maps,
+  # accessibility.{plus,minus}.packed.npy + .packed.npz (4 files, or 2 with
+  # --strand +, whatever the number of records);
+  # parquet: one {chrom}.accessibility.parquet per record.
   output_format: npy
   # both (default), or + to fold each sequence as given only: for a
   # transcriptome FASTA, with sense_only: true on the off-targets step.
@@ -75,7 +77,7 @@ off_targets:
   expression_metric: RPKM
   # accessibility_dir populated by the accessibility step above
   accessibility_dir: ./sioff_example_out/accessibility/
-  # Where the .access.npy cache is read from and built (default:
+  # Where the packed cache is read from and built (default:
   # accessibility_dir). Set it when accessibility_dir is read-only or to stage
   # the cache on node-local disk.
   # accessibility_cache_dir: ./sioff_example_out/accessibility_cache/

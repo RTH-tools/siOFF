@@ -2,7 +2,8 @@
 
 A transcriptome FASTA already holds each target in its sense orientation, so
 the reverse complement need not be folded. A plus-only profile has no ``-``
-rows; its npy form carries an empty ``-`` cache, which is what
+rows; ``sioff accessibility`` writes no minus pair for it, and a per-record
+npy fold carries an empty ``-`` cache, which is what
 `build_accessibility_cache` makes from such a Parquet. A minus-strand hit
 looked up in it keeps the default opening energy and logs a warning, unless
 ``sense_only`` drops it before the lookup.
@@ -28,6 +29,7 @@ from sioff.services.accessibility import (
     _fold_full_chromosome,
     build_accessibility_cache,
     cache_paths,
+    packed_paths,
 )
 
 DATA = Path(__file__).parent / "data"
@@ -136,8 +138,11 @@ def test_cli_strand_plus_writes_a_plus_only_profile(tmp_path: Path) -> None:
             ],
         )
         assert result.exit_code == 0, result.output
-    assert np.load(cache_paths(tmp_path / "npy", "chr1", "-")[0]).shape == (0, N_U)
-    assert np.load(cache_paths(tmp_path / "npy", "chr1", "+")[0]).shape[0] > 0
+    npy_dir = tmp_path / "npy"
+    assert sorted(f.name for f in npy_dir.iterdir()) == sorted(
+        p.name for p in packed_paths(npy_dir, "+")
+    )
+    assert np.load(packed_paths(npy_dir, "+")[0]).shape[0] > 0
     df = pl.read_parquet(tmp_path / "parquet" / "chr1.accessibility.parquet")
     assert df["strand"].unique().to_list() == ["+"]
 

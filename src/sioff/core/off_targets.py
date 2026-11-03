@@ -86,7 +86,7 @@ def _prepare_accessibility_cache(
     accessibility_cache_dir : pathlib.Path, optional
         Where the cache lives; defaults to ``accessibility_dir``.
     workers : int
-        Processes used to build missing contigs.
+        Processes used to pack the profiles.
 
     Returns
     -------
@@ -135,7 +135,7 @@ def _prepare_accessibility_cache(
         ) from write_error
     if built:
         logger.info(
-            f"[accessibility] built accessibility cache for {len(built)} contig(s) "
+            f"[accessibility] packed accessibility cache for {len(built)} record(s) "
             f"in {cache_dir} in {time.perf_counter() - t0:.1f}s"
         )
     else:
@@ -230,7 +230,7 @@ def _init_worker(
     on_target_map: dict,
     self_hyb_emin: dict,
     temperature: float = 37.0,
-    accessibility_cache_dir: str = "",
+    accessibility_cache_dir: Optional[str] = None,
     summary_only: bool = False,
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
@@ -239,7 +239,9 @@ def _init_worker(
     rather than being re-parsed from the original GTF/GFF3, so all workers share
     the same physical memory pages via the OS page cache. With
     ``accessibility_dir`` the service memory-maps the uint8 cache the parent
-    built in ``accessibility_cache_dir`` before starting the pool.
+    built and checked in ``accessibility_cache_dir`` (``None``: in
+    ``accessibility_dir``) before starting the pool, so the worker does not
+    check it against the Parquet again.
     """
     os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
     # pyarrow reads the shared transcriptome IPC and the cache-building Parquet,
@@ -264,7 +266,12 @@ def _init_worker(
         acc_service = GenomeAccessibilityService(
             Path(accessibility_dir),
             max_cached=4,
-            cache_dir=Path(accessibility_cache_dir),
+            cache_dir=(
+                Path(accessibility_cache_dir)
+                if accessibility_cache_dir is not None
+                else None
+            ),
+            verify_pack=False,
         )
 
     _WORKER_PROB_SERVICE = ProbabilityService(acc_service, temperature=temperature)
@@ -748,8 +755,8 @@ def compute_off_targets_single(
         time and memory per stage (CLI ``--profile``). A disabled profiler is
         used when omitted.
     accessibility_progress_callback : callable, optional
-        Called as ``callback(advance=1, description=str)`` after each
-        chromosome is folded on the fly; only used with ``genome_file``.
+        Called as ``callback(advance=n, description=str)`` after each batch
+        of ``n`` records is folded on the fly; only used with ``genome_file``.
 
     Returns
     -------
@@ -980,8 +987,12 @@ def compute_off_targets_single(
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
     elif accessibility_dir:
+        # _prepare_accessibility_cache checked (or rebuilt) the pack above.
         acc_service = GenomeAccessibilityService(
-            Path(accessibility_dir), max_cached=4, cache_dir=cache_dir
+            Path(accessibility_dir),
+            max_cached=4,
+            cache_dir=cache_dir,
+            verify_pack=False,
         )
         prob_service = ProbabilityService(acc_service, temperature=temperature)
         return _finish(prob_service, df)
@@ -1247,7 +1258,7 @@ def compute_off_targets_directory(
         on_target_map,
         self_hyb_emin,
         temperature,
-        str(cache_dir) if cache_dir is not None else "",
+        str(cache_dir) if cache_dir is not None else None,
         summary_only,
     )
 

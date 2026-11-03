@@ -214,6 +214,8 @@ __marimo__/
 *.gz
 *.npy
 *.access.exceptions.npz
+!examples/data/accessibility/*.npy
+!examples/data/accessibility/*.npz
 
 # Pipeline run logs
 logs/

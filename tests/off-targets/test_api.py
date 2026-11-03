@@ -18,6 +18,7 @@ import sioff
 DATA_DIR = Path(__file__).parent / "data"
 RISEARCH_FILE = DATA_DIR / "risearch_siRNAID.out"
 GENOME_FASTA = DATA_DIR / "genome.fa"
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "data"
 
 
 def test_public_api_exposes_callables() -> None:
@@ -232,26 +233,27 @@ def test_off_targets_predictions_and_file_together_raise() -> None:
 
 def test_off_targets_accepts_in_memory_accessibility(tmp_path: Path) -> None:
     """sioff.accessibility -> sioff.off_targets(accessibility=...) matches the
-    Parquet-directory path built from the same profiles, and writes nothing."""
+    Parquet-directory path built from the same profiles, and writes nothing.
+
+    Runs on the example data (read-only), whose hits lie inside the genome, so
+    the compared opening energies are looked up rather than the 10.0 default.
+    """
     profiles = sioff.accessibility(
-        GENOME_FASTA, window_size=40, max_span=20, unpaired_prob=10
+        EXAMPLES / "genome.fa", window_size=40, max_span=20, unpaired_prob=10
     )
     acc_dir = tmp_path / "acc"
     acc_dir.mkdir()
     for chrom, frame in profiles.items():
         frame.write_parquet(acc_dir / f"{chrom}.accessibility.parquet")
 
-    genome_predictions = DATA_DIR / "risearch_genome_example.out"
-    from_dir = sioff.off_targets(
-        risearch_file=genome_predictions, accessibility_dir=acc_dir
-    )
+    predictions = EXAMPLES / "predictions.out"
+    from_dir = sioff.off_targets(risearch_file=predictions, accessibility_dir=acc_dir)
     files_before = set(tmp_path.rglob("*"))
-    from_frames = sioff.off_targets(
-        risearch_file=genome_predictions, accessibility=profiles
-    )
+    from_frames = sioff.off_targets(risearch_file=predictions, accessibility=profiles)
 
     assert isinstance(from_frames, pl.DataFrame)
     assert "opening_energy" in from_frames.columns
+    assert (from_frames["opening_energy"] != 10.0).any(), "every hit fell back to 10.0"
     assert from_frames.sort(from_frames.columns).equals(from_dir.sort(from_dir.columns))
     assert set(tmp_path.rglob("*")) == files_before, "in-memory run wrote files"
 

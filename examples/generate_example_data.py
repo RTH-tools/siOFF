@@ -12,7 +12,8 @@ Files written (all under examples/data/):
     annotation.gtf       7 single-exon genes with RPKM expression values
     predictions.out      RIsearch2-format predictions of sirnas.fa vs genome.fa,
                          produced by the in-process RIsearch bindings
-    accessibility/       the memory-mapped npy cache from `sioff accessibility`
+    accessibility/       the packed memory-mapped npy cache from `sioff accessibility`
+                         (accessibility.{plus,minus}.packed.{npy,npz})
                          (ViennaRNA RNAplfold)
 
 Usage:
