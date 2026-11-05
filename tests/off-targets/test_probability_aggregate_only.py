@@ -31,7 +31,6 @@ def _frame(seed: int = 3, n: int = 400) -> pl.DataFrame:
             "end": rng.integers(10_000, 20_000, n),
             "strand": rng.choice(["+", "-"], n),
             "energy": energy,
-            "raw_e_min": np.float32(-31.0),
             "opening_energy": rng.uniform(0.0, 12.0, n).astype(np.float32),
             "exp_value": rng.uniform(0.0, 50.0, n).astype(np.float32),
             "gene_id": rng.choice(["g1", "g2", "g3", "g4"], n),
@@ -48,6 +47,7 @@ def test_aggregate_only_reports_the_same_sums(on_target_map):
         theta_values=THETA,
         on_target_map=on_target_map,
         precomputed_opening_energy=True,
+        e_min={"s1": -31.0, "s2": -31.0, "s3": -31.0},
     )
     full_df, full = svc.calculate_probabilities_per_sirna(_frame(), **kw)
     agg_df, agg = svc.calculate_probabilities_per_sirna(
