@@ -117,33 +117,3 @@ def test_directory_mode_with_annotation(tmp_path: Path) -> None:
     df = pl.concat(frames, how="diagonal_relaxed")
     assert set(df["sirna_id"]) == {"siRNA_1", "siRNA_4"}
     assert df["gene_id"].null_count() == 0
-
-
-def test_legacy_format_merges_alpha_gamma_columns(tmp_path: Path) -> None:
-    """`--legacy-format --detailed-report` joins one column pair per (alpha, gamma) set."""
-    from typer.testing import CliRunner
-
-    from sioff.cli import app
-
-    pred = tmp_path / "siRNA_4.out"
-    lines = (EXAMPLES / "predictions.out").read_text().splitlines(keepends=True)
-    pred.write_text("".join(line for line in lines if line.startswith("siRNA_4\t")))
-    out = tmp_path / "out.tsv"
-    result = CliRunner().invoke(
-        app,
-        [
-            "off-targets",
-            "-r",
-            str(pred),
-            "-t",
-            str(EXAMPLES / "annotation.gtf"),
-            "--legacy-format",
-            "--detailed-report",
-            "-o",
-            str(out),
-        ],
-    )
-    assert result.exit_code == 0, result.output
-    text = out.with_suffix(".results").read_text()
-    assert "## End of off-target info" in text
-    assert "None" not in text

@@ -9,6 +9,15 @@ from omegaconf import MISSING, OmegaConf, DictConfig
 from sioff.models import PredictionsMode
 
 
+# off_targets keys that were removed; each maps to what to do instead.
+REMOVED_OFF_TARGETS_KEYS: dict[str, str] = {
+    "legacy_format": (
+        "the .summary files carry the partition-function header; "
+        "--detailed-report keeps the per-interaction weights"
+    ),
+}
+
+
 @dataclass
 class OffTargetsConfig:
     """Schema for off-targets command configuration."""
@@ -37,7 +46,6 @@ class OffTargetsConfig:
     alpha: str = "1.0"
     gamma: str = "1.0"
     theta: str = ""
-    legacy_format: bool = False
     detailed_report: bool = False
     sense_only: bool = False
     type: str = PredictionsMode.GW
@@ -71,10 +79,17 @@ class PipelineConfig:
 
 def load_config(config_path: Path) -> DictConfig:
     """Load and validate a YAML config file, resolving relative paths."""
+    raw = cast(DictConfig, OmegaConf.load(config_path))
+    off_targets_raw = raw.get("off_targets")
+    if isinstance(off_targets_raw, DictConfig):
+        for key, hint in REMOVED_OFF_TARGETS_KEYS.items():
+            if key in off_targets_raw:
+                raise ValueError(f"'{key}' was removed from off_targets: {hint}")
+
     schema = OmegaConf.structured(PipelineConfig)
     # merge() is typed DictConfig | ListConfig; merging into a structured
     # (dict) schema always yields a DictConfig.
-    cfg = cast(DictConfig, OmegaConf.merge(schema, OmegaConf.load(config_path)))
+    cfg = cast(DictConfig, OmegaConf.merge(schema, raw))
 
     if cfg.command not in ("off-targets", "accessibility"):
         raise ValueError(

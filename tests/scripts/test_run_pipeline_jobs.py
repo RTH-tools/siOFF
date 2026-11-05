@@ -132,6 +132,10 @@ class TestBuildOffTargets:
             tmp_path / "scratch" / "acc"
         )
 
+    def test_removed_off_targets_key_is_an_error(self, tmp_path):
+        with pytest.raises(ValueError, match="'legacy_format' was removed"):
+            rp._build_off_targets({"legacy_format": True}, tmp_path)
+
     def test_boolean_flags_are_bare_and_opt_in(self, tmp_path):
         assert "--sense-only" not in rp._build_off_targets({}, tmp_path)
 

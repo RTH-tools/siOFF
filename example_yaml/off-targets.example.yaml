@@ -137,11 +137,9 @@ off_targets:
   # Path for the main output file (TSV by default; extension depends on output_format).
   output: ./sioff_example_out/off_targets.tsv
 
-  # Write in legacy .results format aggregated by transcript (old pipeline). Default: false
-  legacy_format: false
-
-  # Write per-transcript probability breakdown alongside .results. Default: false
-  # Only effective when legacy_format is true.
+  # Keep the raw Boltzmann weights (boltzmann_weight*), partition functions
+  # (Z_sirna*) and E_min for every interaction in the output table. Default: false
+  # Not compatible with summary_only.
   detailed_report: false
 
   # ---------------------------------------------------------------------------

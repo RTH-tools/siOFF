@@ -105,6 +105,7 @@ def off_targets(
     sense_only: bool = False,
     predictions_type: str = "gw",
     n_workers: int = 1,
+    detailed_report: bool = False,
 ) -> Union[pl.DataFrame, Iterator[pl.DataFrame]]:
     """Analyse siRNA off-target predictions, returning results in memory.
 
@@ -274,6 +275,10 @@ def off_targets(
         single-frame forms, and the number of spawned worker processes (one
         siRNA file at a time each) for the directory form. CLI:
         ``-j/--workers``, whose default is the CPU count.
+    detailed_report : bool, default False
+        Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min`` columns
+        for every interaction in the output; by default they are dropped.
+        CLI: ``--detailed-report``.
 
     Returns
     -------
@@ -289,9 +294,9 @@ def off_targets(
         alpha=gamma=theta=1); and one ``P_off_target:alpha=X,gamma=Y`` or
         ``P_off_target:theta=T`` column per extra parameter value. Multi-siRNA
         and swept runs also carry ``is_on_target`` and the per-parameter
-        ``dG_total:...`` columns; the single-frame forms additionally keep the
-        ``E_min``, Boltzmann-weight and ``Z_sirna`` intermediates, which the
-        directory form drops before yielding.
+        ``dG_total:...`` columns. With ``detailed_report`` every form also
+        keeps the ``E_min``, ``boltzmann_weight*`` and ``Z_sirna*``
+        intermediates.
 
     Raises
     ------
@@ -371,6 +376,7 @@ def off_targets(
             sense_only=sense_only,
             predictions_type=predictions_type,
             n_workers=n_workers,
+            detailed_report=detailed_report,
         )
         # Yield bare per-siRNA DataFrames (the core yields (df, meta) tuples).
         # Closing this generator propagates GeneratorExit to core_gen, tearing
@@ -408,6 +414,7 @@ def off_targets(
         sense_only=sense_only,
         predictions_type=predictions_type,
         n_workers=n_workers,
+        detailed_report=detailed_report,
     )
     return df
 

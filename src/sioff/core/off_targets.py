@@ -14,9 +14,7 @@ exceptions, no file writes):
 
 ``meta`` carries the partition-function state downstream formatters need:
 ``z_per_sirna``/``on_target_weights`` (multi-siRNA), or ``z_total`` etc.
-(single-siRNA). When ``legacy_format`` is requested the single core also stashes
-the rendered legacy report under ``meta["legacy_text"]`` (it reuses the already
-built accessibility service, avoiding a second on-the-fly fold).
+(single-siRNA).
 
 The public wrappers [`sioff.off_targets`][sioff.off_targets], [`sioff.accessibility`][sioff.accessibility],
 [`sioff.index`][sioff.index] and [`sioff.search`][sioff.search] in `sioff.api` add path
@@ -72,6 +70,7 @@ _WORKER_SELF_HYB_EMIN: dict = {}
 # --summary-only: score per siRNA with ProbabilityService(aggregate_only=True)
 # and return only the metadata, no per-site table.
 _WORKER_SUMMARY_ONLY: bool = False
+_WORKER_DETAILED_REPORT: bool = False
 
 
 def _prepare_accessibility_cache(
@@ -223,6 +222,26 @@ def _read_shared_ipc(path: Path) -> pl.DataFrame:
     return cast(pl.DataFrame, pl.from_arrow(table, rechunk=False))
 
 
+_HEAVY_COLUMN_PREFIXES = ("boltzmann_weight", "Z_sirna")
+
+
+def _drop_heavy_columns(df: pl.DataFrame) -> pl.DataFrame:
+    """Drop the raw Boltzmann weights, partition functions and ``E_min``.
+
+    These per-interaction columns are intermediate to the probabilities; they
+    are kept only under ``detailed_report``.
+
+    Returns
+    -------
+    polars.DataFrame
+        ``df`` without those columns.
+    """
+    drop_cols = [
+        c for c in df.columns if c.startswith(_HEAVY_COLUMN_PREFIXES) or c == "E_min"
+    ]
+    return df.drop(drop_cols) if drop_cols else df
+
+
 def _init_worker(
     ipc_path: str,
     accessibility_dir: str,
@@ -232,6 +251,7 @@ def _init_worker(
     temperature: float = 37.0,
     accessibility_cache_dir: Optional[str] = None,
     summary_only: bool = False,
+    detailed_report: bool = False,
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
 
@@ -250,6 +270,7 @@ def _init_worker(
 
     global _WORKER_DF_TRANS, _WORKER_INTERSECTOR, _WORKER_PROB_SERVICE
     global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN, _WORKER_SUMMARY_ONLY
+    global _WORKER_DETAILED_REPORT
 
     if ipc_path:
         # Memory-map the transcriptome the parent wrote (sorted, uncompressed,
@@ -280,6 +301,7 @@ def _init_worker(
     _WORKER_ON_TARGET_MAP = on_target_map
     _WORKER_SELF_HYB_EMIN = self_hyb_emin
     _WORKER_SUMMARY_ONLY = summary_only
+    _WORKER_DETAILED_REPORT = detailed_report
 
 
 def _process_one_sirna(
@@ -348,13 +370,8 @@ def _process_one_sirna(
     _t_prob = time.perf_counter()
 
     # Drop heavy intermediate columns before returning
-    drop_cols = [
-        c
-        for c in df.columns
-        if c.startswith("boltzmann_weight") or c.startswith("Z_sirna") or c == "E_min"
-    ]
-    if drop_cols:
-        df = df.drop(drop_cols)
+    if not _m._WORKER_DETAILED_REPORT:
+        df = _drop_heavy_columns(df)
 
     arrow = df.to_arrow()
     _t_end = time.perf_counter()
@@ -597,7 +614,6 @@ def compute_off_targets_single(
     theta: str = "",
     sense_only: bool = False,
     predictions_type: str = "gw",
-    legacy_format: bool = False,
     detailed_report: bool = False,
     n_workers: int = 1,
     profiler: Optional[PipelineProfiler] = None,
@@ -616,7 +632,7 @@ def compute_off_targets_single(
     (the ``dict[chrom -> DataFrame]`` that [`sioff.accessibility`][sioff.accessibility] returns),
     ``accessibility_dir`` (per-chromosome Parquet files) or ``genome_file``
     (fold on the fly into a temporary directory that lives only for the
-    probability and legacy-report computation). With none of them, opening
+    probability computation). With none of them, opening
     energies are treated as zero.
 
     When ``gtf_file`` is given, the predictions are intersected with the
@@ -625,7 +641,7 @@ def compute_off_targets_single(
     frame holds more than one ``sirna_id`` or when any non-baseline ``alpha`` /
     ``gamma`` / ``theta`` value is requested; otherwise the single-siRNA model
     (which alone supports ``on_target_file``, ``on_target_risearch_file``,
-    ``query_file``, ``on_target_accessibility`` and ``legacy_format``).
+    ``query_file`` and ``on_target_accessibility``).
 
     Writes no files and prints nothing.
 
@@ -711,7 +727,7 @@ def compute_off_targets_single(
     query_file : pathlib.Path, optional
         siRNA query FASTA used for the on-target computation (CLI
         ``-q/--query``); required when ``on_target_file`` is set. Its stem
-        names the siRNA in the legacy report.
+        names the siRNA.
     on_target_expression : float, default 1000.0
         Expression level assigned to the on-target (CLI
         ``-oexp/--on-target-expression``).
@@ -741,12 +757,10 @@ def compute_off_targets_single(
         ``"gw"`` for genome-wide predictions (interval intersection with the
         annotation) or ``"tw"`` for transcriptome-wide predictions (join on
         transcript ID) (CLI ``--type``).
-    legacy_format : bool, default False
-        Also render the legacy ``gw.results``-style report, aggregated by
-        transcript, into ``meta["legacy_text"]`` (CLI ``--legacy-format``).
     detailed_report : bool, default False
-        Include per-transcript off-target probabilities in the legacy report
-        (CLI ``--detailed-report``). Only meaningful with ``legacy_format``.
+        Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min`` columns
+        for every interaction in the returned table; by default they are
+        dropped (CLI ``--detailed-report``).
     n_workers : int, default 1
         Number of parallel threads for the genome-wide intersection (CLI
         ``-j/--workers``).
@@ -765,15 +779,14 @@ def compute_off_targets_single(
         end, strand, energy``, plus ``trans_start, trans_end, gene_id,
         transcript_id, exp_value`` when intersected with ``gtf_file``, plus the
         probability columns ``opening_energy``, ``dG_total`` and
-        ``P_off_target``. The per-siRNA model additionally adds ``E_min``,
-        ``is_on_target``, ``boltzmann_weight``, ``Z_sirna`` and
-        ``Z_sirna_noacc``, and repeats ``dG_total``, ``energy``,
-        ``boltzmann_weight``, ``Z_sirna*`` and ``P_off_target`` with a
-        ``:alpha=A,gamma=G`` or ``:theta=T`` suffix for each extra parameter
-        set. ``meta`` always contains ``"_report"`` (a dict with ``n_loaded``,
+        ``P_off_target``, plus ``is_on_target``. ``dG_total``, ``energy`` and
+        ``P_off_target`` repeat with a ``:alpha=A,gamma=G`` or ``:theta=T``
+        suffix for each extra parameter set. With ``detailed_report`` the
+        table also holds ``E_min``, ``boltzmann_weight*`` and ``Z_sirna*``
+        (each repeated per parameter set). ``meta`` always contains ``"_report"`` (a dict with ``n_loaded``,
         ``energy_min``, ``energy_max``, ``sense_only``, ``n_features``,
-        ``n_intersected`` and ``preview``, the raw prediction head) and, when
-        ``legacy_format`` is set, ``"legacy_text"``. The per-siRNA model adds
+        ``n_intersected`` and ``preview``, the raw prediction head). The per-siRNA
+        model adds
         ``"n_sirnas"``, ``"z_per_sirna"``, ``"on_target_weights"`` and
         ``"on_target_count"``; the single-siRNA model adds ``"z_total"``,
         ``"z_off_target"``, ``"w_on_target"``, ``"dG_on_target"``,
@@ -941,21 +954,8 @@ def compute_off_targets_single(
             _s.rows_out = frame.height
         logger.info(f"After probabilities: {frame.height:,} rows")
 
-        # Legacy report must be rendered here (reuses prob_service's accessibility
-        # service, avoiding a second on-the-fly fold). Replicates the CLI's call,
-        # which uses calculate_legacy_format's default alpha/gamma pairs.
-        if legacy_format:
-            sirna_id = query_file.stem if query_file else "siRNA"
-            meta["legacy_text"] = prob_service.calculate_legacy_format(
-                frame,
-                sirna_id=sirna_id,
-                on_target_path=on_target_file,
-                query_path=query_file,
-                on_target_expression=on_target_expression,
-                on_target_accessibility_path=on_target_accessibility,
-                on_target_risearch_path=on_target_risearch_file,
-                verbose=detailed_report,
-            )
+        if not detailed_report:
+            frame = _drop_heavy_columns(frame)
         meta["_report"] = report
         return frame, meta
 
@@ -978,7 +978,7 @@ def compute_off_targets_single(
         return _finish(prob_service, df)
     elif genome_file:
         # Compute accessibility on-the-fly into a temp dir; the dir must outlive the
-        # probability + legacy computation (both read the profiles), so do them
+        # probability computation (it reads the profiles), so do it
         # inside the context manager before it is torn down.
         with tempfile.TemporaryDirectory(prefix="risearch_accessibility_") as temp_dir:
             acc_service = GenomeAccessibilityService(Path(temp_dir), max_cached=4)
@@ -1021,6 +1021,7 @@ def compute_off_targets_directory(
     predictions_type: str = "gw",
     n_workers: int = 1,
     summary_only: bool = False,
+    detailed_report: bool = False,
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
     """Compute off-target probabilities for a directory of per-siRNA files.
 
@@ -1119,6 +1120,10 @@ def compute_off_targets_directory(
         score with ``aggregate_only`` and ``df`` is empty, so no per-site table
         is built or sent back to this process. ``meta`` is unchanged and
         carries ``"n_rows"``, the number of scored site x transcript rows.
+    detailed_report : bool, default False
+        Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min`` columns
+        in each ``df`` (CLI ``--detailed-report``). Has no effect with
+        ``summary_only``, whose ``df`` is empty.
 
     Yields
     ------
@@ -1129,7 +1134,9 @@ def compute_off_targets_directory(
         ``gtf_file`` is given, ``opening_energy``, ``dG_total``,
         ``is_on_target`` and ``P_off_target``, plus ``dG_total``, ``energy`` and
         ``P_off_target`` repeated with a ``:alpha=A,gamma=G`` or ``:theta=T``
-        suffix for each extra parameter set (empty with ``summary_only``).
+        suffix for each extra parameter set (empty with ``summary_only``). With
+        ``detailed_report`` it also holds ``E_min``, ``boltzmann_weight*`` and
+        ``Z_sirna*``.
         ``meta`` contains ``"n_sirnas"``, ``"n_rows"``,
         ``"z_per_sirna"``, ``"on_target_weights"``, ``"on_target_count"`` and
         ``"_timings"`` (per-stage wall times for the worker: ``load_s``,
@@ -1240,6 +1247,7 @@ def compute_off_targets_directory(
         temperature,
         str(cache_dir) if cache_dir is not None else None,
         summary_only,
+        detailed_report,
     )
 
     try:
