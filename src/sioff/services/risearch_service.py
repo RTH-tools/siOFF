@@ -132,6 +132,7 @@ class RIsearchService:
         no_dedup: bool = False,
         alignment: bool = False,
         threads: Optional[int] = None,
+        sense_only: bool = False,
     ) -> pl.DataFrame:
         """Run RIsearch and return hits as a DataFrame (sirna_id, chrom, start, end, strand, energy).
 
@@ -189,6 +190,15 @@ class RIsearchService:
             hits are the same either way, and skipping the traceback is faster.
         ``threads``
             Worker threads; ``None`` uses ``RAYON_NUM_THREADS``, else every core.
+
+        One option is siOFF's own, not risearch's:
+
+        ``sense_only``
+            Keep only ``+``-strand hits, for a target FASTA whose records are
+            already in sense orientation (a transcriptome). risearch indexes
+            both strands and has no option to search one, so the ``-`` hits are
+            dropped after the search: the returned frame shrinks, but the
+            search's time and peak memory do not.
         """
 
         if not query_path.exists():
@@ -278,6 +288,9 @@ class RIsearchService:
             )
         except Exception as e:
             raise RIsearchError(f"RIsearch search failed: {e}") from e
+
+        if sense_only:
+            raw = raw.filter(pl.col("strand") == "+")
 
         extra = list(ALIGNMENT_COLUMNS) if alignment else []
         if raw.is_empty():

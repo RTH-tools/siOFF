@@ -559,6 +559,7 @@ def search(
     no_dedup: bool = False,
     alignment: bool = False,
     threads: Optional[int] = None,
+    sense_only: bool = False,
 ) -> pl.DataFrame:
     """Run a RIsearch search and return the hits as a DataFrame.
 
@@ -654,6 +655,12 @@ def search(
     threads : int, optional
         Worker threads; ``None`` uses ``RAYON_NUM_THREADS``, else every core.
         CLI: ``-j/--threads``.
+    sense_only : bool, default False
+        Keep only ``+``-strand hits, for a target whose records are already in
+        sense orientation, such as a transcriptome. A siOFF filter, not a
+        risearch option: risearch indexes and searches both strands, so this
+        shrinks the returned frame but not the search's time or memory. CLI:
+        ``--sense-only``.
 
     Returns
     -------
@@ -720,4 +727,5 @@ def search(
         no_dedup=no_dedup,
         alignment=alignment,
         threads=threads,
+        sense_only=sense_only,
     )
