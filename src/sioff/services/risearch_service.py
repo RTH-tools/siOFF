@@ -42,6 +42,14 @@ class RIsearchError(Exception):
 # Note `s95` alone is the data directory, not an id — risearch rejects it.
 VALID_DSM_IDS = frozenset({"t04", "slh04", "s95-rna-dna", "s95-dna-rna"})
 
+# Temperatures risearch accepts, in °C (it raises outside this range, but only
+# once the search is under way).
+TEMPERATURE_RANGE = (0, 50)
+
+# Columns added to the hits by `alignment=True`: risearch's query coordinates
+# (same convention as `start`/`end`) and its pairing string.
+ALIGNMENT_COLUMNS = ("q_start", "q_end", "alignment")
+
 
 class RIsearchService:
     """Wrapper for the risearch PyO3 bindings.
@@ -114,11 +122,26 @@ class RIsearchService:
         seed_end: Optional[int] = None,
         seed_wobble: bool = True,
         matrix: Union[str, Path] = "t04",
+        mismatches: int = 0,
+        mismatch_prefix: int = 1,
+        mismatch_suffix: int = 0,
+        temperature: int = 37,
+        penalty: float = 0.0,
+        seed_energy: float = 0.0,
+        no_max_prune: bool = False,
+        no_dedup: bool = False,
+        alignment: bool = False,
+        threads: Optional[int] = None,
     ) -> pl.DataFrame:
         """Run RIsearch and return hits as a DataFrame (sirna_id, chrom, start, end, strand, energy).
 
         target_fasta is required when the index was not built in this session
         via index_target() — needed to resolve integer target indices to names.
+
+        Every option of ``risearch.search`` is passed explicitly, with siOFF's
+        own default, so an upstream default change cannot move our numbers
+        (see ``penalty`` below for the time it did). The defaults reproduce the
+        searches siOFF ran before these options were exposed.
 
         Seed geometry and energy-model parameters mirror the RIsearch2 CLI:
 
@@ -136,6 +159,36 @@ class RIsearchService:
             the ``-z`` nearest-neighbour energy parameter set; one of
             ``VALID_DSM_IDS`` (``t04`` by default) or the path of a custom
             long-form DSM TSV table.
+
+        The other ``risearch.search`` options:
+
+        ``mismatches``, ``mismatch_prefix``, ``mismatch_suffix``
+            Mismatches allowed inside a seed, and the matches required at its
+            5' and 3' ends around them (risearch's Python defaults, 1 and 0;
+            its CLI ``--mismatch-max`` instead sets both to the mismatch count).
+            A mismatched seed holding an uninterrupted run of the full seed
+            length is dropped, since the perfect seed already covers it.
+        ``temperature``
+            Energy-model temperature in °C, an integer in ``TEMPERATURE_RANGE``;
+            37 is risearch's own default. A custom DSM table ignores it.
+        ``penalty``
+            kcal/mol added per extended nucleotide, included in the reported
+            energy (risearch >= 3.0.0a4). RIsearch2's C ``-d`` took dacal/mol,
+            so its recommended 30 is 0.3 here. Its upstream default was 3.5 in
+            0.0.0a1 and 0.0 from 3.0.0a2 on; siOFF's is 0.0 either way.
+        ``seed_energy``
+            Accepted by risearch for compatibility; no effect in 3.0.0a4/a5.
+        ``no_max_prune``
+            Also extend non-maximal seeds (redundant hits).
+        ``no_dedup``
+            Report every seed's hit instead of one best hit per duplex.
+        ``alignment``
+            Add ``ALIGNMENT_COLUMNS``: the query coordinates and risearch's
+            pairing string (``P`` pair, ``W`` G:U, ``U`` mismatch, ``T`` / ``Q``
+            extra target / query base, query 5' to 3'). Off by default: the
+            hits are the same either way, and skipping the traceback is faster.
+        ``threads``
+            Worker threads; ``None`` uses ``RAYON_NUM_THREADS``, else every core.
         """
 
         if not query_path.exists():
@@ -176,6 +229,20 @@ class RIsearchService:
                     f"{seed_start}:{seed_end} — positions {seed_start}-{seed_end} "
                     f"span {window} nt"
                 )
+        for name, value in (
+            ("mismatches", mismatches),
+            ("mismatch_prefix", mismatch_prefix),
+            ("mismatch_suffix", mismatch_suffix),
+        ):
+            if value < 0:
+                raise RIsearchError(f"{name} must be 0 or more, got {value}")
+        low, high = TEMPERATURE_RANGE
+        if not low <= temperature <= high:
+            raise RIsearchError(
+                f"temperature must be {low}-{high} °C (risearch's range), got {temperature}"
+            )
+        if threads is not None and threads < 1:
+            raise RIsearchError(f"threads must be at least 1, got {threads}")
 
         try:
             import risearch
@@ -191,18 +258,28 @@ class RIsearchService:
                 energy_threshold=energy_threshold,
                 seed_wobble=seed_wobble,
                 matrix=matrix,
-                # Pinned, not inherited. `penalty`'s upstream default changed
+                mismatches=mismatches,
+                mismatch_prefix=mismatch_prefix,
+                mismatch_suffix=mismatch_suffix,
+                temperature=temperature,
+                # Passed, never inherited. `penalty`'s upstream default changed
                 # 3.5 -> 0.0 between pins, and 0.0.0a1 applied it with the wrong
                 # sign, so simply omitting it moved our E_min by 7 kcal/mol on a
-                # pin bump with no siOFF change. 0.0 matches the original C
-                # default (`extPen = 0`). Not exposed as a flag: its semantics
-                # differ across versions (units, sign, and whether it reaches
-                # the reported energy at all) — see RTH-tools/risearch#27.
-                penalty=0.0,
+                # pin bump with no siOFF change. siOFF's default 0.0 matches the
+                # original C default (`extPen = 0`). Exposed since risearch
+                # 3.0.0a4 settled its meaning (kcal/mol per extended nucleotide,
+                # in the reported energy) — see RTH-tools/risearch#27.
+                penalty=penalty,
+                seed_energy=seed_energy,
+                no_max_prune=no_max_prune,
+                no_dedup=no_dedup,
+                alignment=alignment,
+                threads=threads,
             )
         except Exception as e:
             raise RIsearchError(f"RIsearch search failed: {e}") from e
 
+        extra = list(ALIGNMENT_COLUMNS) if alignment else []
         if raw.is_empty():
             logger.info("Search complete: 0 hits")
             return pl.DataFrame(
@@ -213,6 +290,11 @@ class RIsearchService:
                     "end": pl.Int32,
                     "strand": pl.Utf8,
                     "energy": pl.Float32,
+                    **(
+                        {"q_start": pl.Int32, "q_end": pl.Int32, "alignment": pl.Utf8}
+                        if alignment
+                        else {}
+                    ),
                 }
             )
 
@@ -227,9 +309,11 @@ class RIsearchService:
                 ]
             )
             .rename({"t_start": "start", "t_end": "end"})
-            .select(["sirna_id", "chrom", "start", "end", "strand", "energy"])
+            .select(["sirna_id", "chrom", "start", "end", "strand", "energy", *extra])
             .cast({"start": pl.Int32, "end": pl.Int32, "energy": pl.Float32})
         )
+        if alignment:
+            df = df.cast({"q_start": pl.Int32, "q_end": pl.Int32})
 
         logger.info(f"Search complete: {df.height} hits")
         return df

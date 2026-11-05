@@ -463,7 +463,21 @@ Available on `sioff` itself, before any subcommand.
 | `-z / --matrix` | Energy parameter set: `t04` (default), `slh04`, `s95-rna-dna`, `s95-dna-rna`, or the path of a custom DSM TSV table (`q1 q2 t1 t2 delta_g_kcal_per_mol`) |
 | `-e / --max-extension` | Max extension length on each side (default: 20) |
 | `-E / --energy` | Energy threshold in kcal/mol (default: −10.0) |
+| `--mismatches` | Mismatches allowed inside the seed (RIsearch `--mismatch-max`; default: 0). A mismatched seed holding an uninterrupted run of the full seed length is dropped, as the perfect seed covers it |
+| `--mismatch-prefix` | Matches required at the seed's 5′ end before any mismatch (default: 1, as risearch's Python API; its CLI defaults to the mismatch count) |
+| `--mismatch-suffix` | Matches required at the seed's 3′ end after any mismatch (default: 0) |
+| `-T / --temperature` | Energy-model temperature in °C, 0–50 (default: 37; a custom DSM table ignores it) |
+| `-d / --penalty` | kcal/mol added per extended nucleotide, included in the reported energy (default: 0.0). RIsearch2's C `-d` took dacal/mol: its recommended 30 is 0.3 here |
+| `--seed-energy` | Accepted by risearch for compatibility; no effect in risearch 3.0.0a4/a5 (default: 0.0) |
+| `--no-max-prune` | Also extend non-maximal seeds (redundant hits) |
+| `--no-dedup` | Report every seed's hit instead of one best hit per duplex |
+| `--alignment` | Add the columns `q_start`, `q_end` and `alignment` (pairing string, query 5′→3′: `P` pair, `W` G:U, `U` mismatch, `T`/`Q` extra target/query base) |
+| `-j / --threads` | Worker threads (default: `RAYON_NUM_THREADS`, else every core) |
 | `-o / --output` | Output TSV file (default: stdout) |
+
+Every option is passed to `risearch.search` explicitly with siOFF's default, so
+a change of upstream default cannot move the results; the defaults give the
+same hits as before these options existed.
 
 ---
 
