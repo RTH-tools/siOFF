@@ -102,6 +102,89 @@ def search(
             help="Energy threshold in kcal/mol (only hits below this value are kept).",
         ),
     ] = -10.0,
+    mismatches: Annotated[
+        int,
+        typer.Option(
+            "--mismatches",
+            help=(
+                "Mismatches allowed inside the seed (RIsearch --mismatch-max). A "
+                "mismatched seed holding an uninterrupted run of the full seed "
+                "length is dropped: the perfect seed covers it."
+            ),
+        ),
+    ] = 0,
+    mismatch_prefix: Annotated[
+        int,
+        typer.Option(
+            "--mismatch-prefix",
+            help="Matches required at the seed's 5' end before any mismatch.",
+        ),
+    ] = 1,
+    mismatch_suffix: Annotated[
+        int,
+        typer.Option(
+            "--mismatch-suffix",
+            help="Matches required at the seed's 3' end after any mismatch.",
+        ),
+    ] = 0,
+    temperature: Annotated[
+        int,
+        typer.Option(
+            "--temperature",
+            "-T",
+            help="Energy-model temperature in °C, 0-50 (a custom DSM table ignores it).",
+        ),
+    ] = 37,
+    penalty: Annotated[
+        float,
+        typer.Option(
+            "--penalty",
+            "-d",
+            help=(
+                "kcal/mol added per extended nucleotide, included in the reported "
+                "energy. RIsearch2's C -d took dacal/mol: its recommended 30 is 0.3 here."
+            ),
+        ),
+    ] = 0.0,
+    seed_energy: Annotated[
+        float,
+        typer.Option(
+            "--seed-energy",
+            help="Accepted by risearch for compatibility; no effect in risearch 3.0.0a4/a5.",
+        ),
+    ] = 0.0,
+    no_max_prune: Annotated[
+        bool,
+        typer.Option(
+            "--no-max-prune",
+            help="Also extend non-maximal seeds (gives redundant hits).",
+        ),
+    ] = False,
+    no_dedup: Annotated[
+        bool,
+        typer.Option(
+            "--no-dedup",
+            help="Report every seed's hit instead of one best hit per duplex.",
+        ),
+    ] = False,
+    alignment: Annotated[
+        bool,
+        typer.Option(
+            "--alignment",
+            help=(
+                "Add the columns q_start, q_end and alignment (pairing string, query "
+                "5'->3': P pair, W G:U, U mismatch, T/Q extra target/query base)."
+            ),
+        ),
+    ] = False,
+    threads: Annotated[
+        Optional[int],
+        typer.Option(
+            "--threads",
+            "-j",
+            help="Worker threads (default: RAYON_NUM_THREADS, else every core).",
+        ),
+    ] = None,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Enable verbose logging.")
     ] = False,
@@ -131,6 +214,16 @@ def search(
             matrix=matrix,
             max_extension=max_extension,
             energy_threshold=energy_threshold,
+            mismatches=mismatches,
+            mismatch_prefix=mismatch_prefix,
+            mismatch_suffix=mismatch_suffix,
+            temperature=temperature,
+            penalty=penalty,
+            seed_energy=seed_energy,
+            no_max_prune=no_max_prune,
+            no_dedup=no_dedup,
+            alignment=alignment,
+            threads=threads,
         )
     except RIsearchError as e:
         typer.secho(f"Error: {e}", fg=typer.colors.RED, err=True)

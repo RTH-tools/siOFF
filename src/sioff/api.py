@@ -549,6 +549,16 @@ def search(
     seed_end: Optional[int] = None,
     seed_wobble: bool = True,
     matrix: Union[str, Path] = "t04",
+    mismatches: int = 0,
+    mismatch_prefix: int = 1,
+    mismatch_suffix: int = 0,
+    temperature: int = 37,
+    penalty: float = 0.0,
+    seed_energy: float = 0.0,
+    no_max_prune: bool = False,
+    no_dedup: bool = False,
+    alignment: bool = False,
+    threads: Optional[int] = None,
 ) -> pl.DataFrame:
     """Run a RIsearch search and return the hits as a DataFrame.
 
@@ -564,7 +574,9 @@ def search(
     model. ``matrix`` (``-z``) selects the nearest-neighbour parameter set: a
     bundled id (see `sioff.services.risearch_service.VALID_DSM_IDS` for
     the models risearch ships) or, given a path, a custom long-form DSM TSV
-    table.
+    table. Every other ``risearch.search`` option is passed through too, each
+    with siOFF's own default, so an upstream default change cannot move the
+    results.
 
     Parameters
     ----------
@@ -608,13 +620,48 @@ def search(
         DNA-DNA), ``"s95-rna-dna"`` or ``"s95-dna-rna"`` (Sugimoto 1995,
         RNA/DNA hybrids), or the path of a custom long-form DSM TSV table with
         columns ``q1 q2 t1 t2 delta_g_kcal_per_mol``. CLI: ``-z/--matrix``.
+    mismatches : int, default 0
+        Mismatches allowed inside a seed (RIsearch's ``--mismatch-max``). A
+        mismatched seed that holds an uninterrupted run of the full seed length
+        is dropped, as the perfect seed covers it. CLI: ``--mismatches``.
+    mismatch_prefix : int, default 1
+        Matches required at the seed's 5' end before any mismatch. CLI:
+        ``--mismatch-prefix``.
+    mismatch_suffix : int, default 0
+        Matches required at the seed's 3' end after any mismatch. CLI:
+        ``--mismatch-suffix``.
+    temperature : int, default 37
+        Energy-model temperature in °C, 0 to 50; a custom DSM table ignores it.
+        CLI: ``-T/--temperature``.
+    penalty : float, default 0.0
+        kcal/mol added per extended nucleotide, included in the reported
+        energy. RIsearch2's C ``-d`` took dacal/mol: its recommended 30 is 0.3
+        here. CLI: ``-d/--penalty``.
+    seed_energy : float, default 0.0
+        Accepted by risearch for compatibility; it has no effect in risearch
+        3.0.0a4/a5. CLI: ``--seed-energy``.
+    no_max_prune : bool, default False
+        Also extend non-maximal seeds, which gives redundant hits. CLI:
+        ``--no-max-prune``.
+    no_dedup : bool, default False
+        Report every seed's hit instead of one best hit per duplex. CLI:
+        ``--no-dedup``.
+    alignment : bool, default False
+        Add the columns ``q_start``, ``q_end`` (query coordinates, same
+        convention as ``start``/``end``) and ``alignment`` (pairing string,
+        query 5' to 3': ``P`` pair, ``W`` G:U, ``U`` mismatch, ``T`` / ``Q``
+        extra target / query base). CLI: ``--alignment``.
+    threads : int, optional
+        Worker threads; ``None`` uses ``RAYON_NUM_THREADS``, else every core.
+        CLI: ``-j/--threads``.
 
     Returns
     -------
     polars.DataFrame
         One row per hit with the columns ``sirna_id`` (query record ID),
         ``chrom`` (target sequence name), ``start``, ``end``, ``strand`` and
-        ``energy`` (hybridisation energy, kcal/mol).
+        ``energy`` (hybridisation energy, kcal/mol), followed by ``q_start``,
+        ``q_end`` and ``alignment`` when *alignment* is set.
 
     Raises
     ------
@@ -625,8 +672,9 @@ def search(
         cannot be resolved, *matrix* is neither a bundled id nor an existing
         file, the seed specification is inconsistent (``seed_start`` without
         ``seed_end``, ``seed_start < 1``, ``seed_end < seed_start``, or a seed
-        longer than its window), or the search itself fails, including when
-        the ``risearch`` package is not installed.
+        longer than its window), a mismatch count is negative, *temperature*
+        is outside 0-50 °C, *threads* is below 1, or the search itself fails,
+        including when the ``risearch`` package is not installed.
 
     See Also
     --------
@@ -662,4 +710,14 @@ def search(
         seed_end=seed_end,
         seed_wobble=seed_wobble,
         matrix=matrix,
+        mismatches=mismatches,
+        mismatch_prefix=mismatch_prefix,
+        mismatch_suffix=mismatch_suffix,
+        temperature=temperature,
+        penalty=penalty,
+        seed_energy=seed_energy,
+        no_max_prune=no_max_prune,
+        no_dedup=no_dedup,
+        alignment=alignment,
+        threads=threads,
     )

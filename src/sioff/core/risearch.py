@@ -123,12 +123,26 @@ def run_search(
     seed_end: Optional[int] = None,
     seed_wobble: bool = True,
     matrix: Union[str, Path] = "t04",
+    mismatches: int = 0,
+    mismatch_prefix: int = 1,
+    mismatch_suffix: int = 0,
+    temperature: int = 37,
+    penalty: float = 0.0,
+    seed_energy: float = 0.0,
+    no_max_prune: bool = False,
+    no_dedup: bool = False,
+    alignment: bool = False,
+    threads: Optional[int] = None,
 ) -> pl.DataFrame:
     """Run a RIsearch search and return hits as a Polars DataFrame.
 
     ``target`` is required when the index was built outside this process (it
     is needed to resolve RIsearch's integer target indices to sequence names);
     after [`build_index`][sioff.core.risearch.build_index] in the same process it may be omitted.
+
+    Every ``risearch.search`` option is passed through, each with siOFF's own
+    default, so an upstream default change cannot move the results; the
+    defaults reproduce the searches siOFF ran before these options existed.
 
     Seed geometry and energy-model parameters mirror the RIsearch2 CLI.
     ``seed_start``/``seed_end``/``seed_length`` are the ``-s n:m/l`` seed spec:
@@ -147,8 +161,9 @@ def run_search(
     propagate unchanged: `FileNotFoundError` when ``query`` or ``index``
     does not exist, and `RIsearchError`
     when ``target`` is needed but missing, the seed geometry is invalid,
-    ``matrix`` is neither a bundled id nor an existing file, or the risearch
-    bindings fail.
+    ``matrix`` is neither a bundled id nor an existing file, a mismatch count
+    is negative, ``temperature`` is outside 0-50 °C, ``threads`` is below 1,
+    or the risearch bindings fail.
 
     Parameters
     ----------
@@ -184,13 +199,48 @@ def run_search(
         ``"s95-dna-rna"`` (Sugimoto 1995, RNA/DNA hybrids), or the path of a
         custom long-form DSM TSV table with columns
         ``q1 q2 t1 t2 delta_g_kcal_per_mol``.
+    mismatches : int, default 0
+        Mismatches allowed inside a seed (CLI ``--mismatches``; RIsearch's
+        ``--mismatch-max``). A mismatched seed that holds an uninterrupted run
+        of the full seed length is dropped, as the perfect seed covers it.
+    mismatch_prefix : int, default 1
+        Matches required at the seed's 5' end before any mismatch (CLI
+        ``--mismatch-prefix``).
+    mismatch_suffix : int, default 0
+        Matches required at the seed's 3' end after any mismatch (CLI
+        ``--mismatch-suffix``).
+    temperature : int, default 37
+        Energy-model temperature in °C, 0 to 50 (CLI ``-T/--temperature``). A
+        custom DSM table ignores it.
+    penalty : float, default 0.0
+        kcal/mol added per extended nucleotide, included in the reported
+        energy (CLI ``-d/--penalty``). RIsearch2's C ``-d`` took dacal/mol: its
+        recommended 30 is 0.3 here.
+    seed_energy : float, default 0.0
+        Accepted by risearch for compatibility; it has no effect in risearch
+        3.0.0a4/a5 (CLI ``--seed-energy``).
+    no_max_prune : bool, default False
+        Also extend non-maximal seeds, which gives redundant hits (CLI
+        ``--no-max-prune``).
+    no_dedup : bool, default False
+        Report every seed's hit instead of one best hit per duplex (CLI
+        ``--no-dedup``).
+    alignment : bool, default False
+        Add the columns ``q_start``, ``q_end`` (query coordinates, same
+        convention as ``start``/``end``) and ``alignment`` (pairing string,
+        query 5' to 3': ``P`` pair, ``W`` G:U, ``U`` mismatch, ``T`` / ``Q``
+        extra target / query base) (CLI ``--alignment``).
+    threads : int, optional
+        Worker threads; ``None`` uses ``RAYON_NUM_THREADS``, else every core
+        (CLI ``-j/--threads``).
 
     Returns
     -------
     polars.DataFrame
         One row per hit with columns ``sirna_id, chrom, start, end, strand,
         energy`` (the schema [`sioff.off_targets`][sioff.off_targets] accepts as
-        ``predictions``).
+        ``predictions``), followed by ``q_start, q_end, alignment`` when
+        ``alignment`` is set.
 
     See Also
     --------
@@ -210,4 +260,14 @@ def run_search(
         seed_end=seed_end,
         seed_wobble=seed_wobble,
         matrix=matrix,
+        mismatches=mismatches,
+        mismatch_prefix=mismatch_prefix,
+        mismatch_suffix=mismatch_suffix,
+        temperature=temperature,
+        penalty=penalty,
+        seed_energy=seed_energy,
+        no_max_prune=no_max_prune,
+        no_dedup=no_dedup,
+        alignment=alignment,
+        threads=threads,
     )
