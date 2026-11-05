@@ -299,16 +299,6 @@ def test_oracle_sees_what_the_writer_wrote(folded):
 
 
 @pytest.fixture
-def warnings_seen():
-    from loguru import logger
-
-    seen: list[str] = []
-    handler = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
-    yield seen
-    logger.remove(handler)
-
-
-@pytest.fixture
 def truncated(tmp_path):
     """The synthetic profile with the last minus-strand position missing."""
     rows = []

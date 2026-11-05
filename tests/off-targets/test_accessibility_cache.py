@@ -340,12 +340,6 @@ def _capture_warnings():
         logger.remove(handler)
 
 
-@pytest.fixture
-def warnings_seen():
-    with _capture_warnings() as seen:
-        yield seen
-
-
 def _stale_warnings(seen: list[str]) -> list[str]:
     return [m for m in seen if "does not match the Parquet profiles" in m]
 
