@@ -4,8 +4,9 @@ The entry points are free of CLI concerns (no stdout, no Typer/Click
 exceptions):
 
 - [`compute_off_targets`][sioff.core.off_targets.compute_off_targets] -- the
-  one engine. A predictions file or a folder of them is split into one part
-  per siRNA, and every siRNA is scored as its own task; a generator yielding
+  one engine. A predictions file, a folder of them, an in-memory frame or the
+  hits of an in-process search is split into one part per siRNA, and every
+  siRNA is scored as its own task; a generator yielding
   ``(pl.DataFrame, meta)`` per siRNA.
 - [`compute_off_targets_single`][sioff.core.off_targets.compute_off_targets_single] -- a single prediction source (an in-memory
   DataFrame, one RIsearch2 output file, or RIsearch run in-process); returns
@@ -30,6 +31,7 @@ The public wrappers [`sioff.off_targets`][sioff.off_targets], [`sioff.accessibil
 coercion and mode dispatch on top of this layer.
 """
 
+import copy
 import ctypes
 import gc
 import multiprocessing
@@ -49,9 +51,10 @@ import pyarrow as pa
 import pyarrow.ipc
 from loguru import logger
 
-from sioff.core.split import merge_splits, split_file
+from sioff.core.split import merge_splits, split_file, split_frame
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
 from sioff.services.accessibility import (
+    PARQUET_SUFFIX,
     AccessibilityError,
     GenomeAccessibilityService,
     ensure_accessibility_cache,
@@ -1397,6 +1400,9 @@ class _Executor:
         self._init_kwargs = init_kwargs
         self._pool: Optional[ProcessPoolExecutor] = None
         self._state: Optional[dict[str, Any]] = None
+        # Set before the first _init_worker call: one that fails part-way has
+        # still set some of the globals, and close() must reset them too.
+        self._init_attempted = False
         self._env_saved = False
         self._prev_polars_threads: Optional[str] = None
 
@@ -1471,9 +1477,13 @@ class _Executor:
             else:
                 os.environ["POLARS_MAX_THREADS"] = self._prev_polars_threads
             self._env_saved = False
-        if self._state is not None:
-            globals().update(_WORKER_STATE_DEFAULTS)
+        if self._init_attempted:
+            # Copies, so the defaults' own dicts never become live state.
+            globals().update(
+                {name: copy.copy(v) for name, v in _WORKER_STATE_DEFAULTS.items()}
+            )
             self._state = None
+            self._init_attempted = False
 
     def _start_pool(self, threads_per_worker: int) -> None:
         # Polars sizes its thread pool when it is imported, which in a spawned
@@ -1497,6 +1507,7 @@ class _Executor:
     def _enter_worker_state(self) -> None:
         module_globals = globals()
         if self._state is None:
+            self._init_attempted = True
             _init_worker(
                 polars_max_threads=self.n_workers, in_process=True, **self._init_kwargs
             )
@@ -1534,6 +1545,34 @@ def _input_files(path: Path) -> list[Path]:
     if not path.is_file():
         raise FileNotFoundError(f"RIsearch2 output file not found: {path}")
     return [path]
+
+
+def _search_in_process(
+    sirna_fasta: Path,
+    target_fasta: Path,
+    target_index: Optional[Path],
+    matrix: Union[str, Path],
+) -> pl.DataFrame:
+    """Search the siRNAs against the target with RIsearch, in this process.
+
+    The target is indexed first unless ``target_index`` is given; the index is
+    built (or reused) next to ``target_fasta``.
+
+    Returns
+    -------
+    polars.DataFrame
+        The hits in the ``sioff.search`` schema.
+    """
+    service = RIsearchService()
+    index_path = (
+        target_index if target_index is not None else service.index_target(target_fasta)
+    )
+    return service.run_search(
+        query_path=sirna_fasta,
+        index_path=index_path,
+        target_fasta=target_fasta,
+        matrix=matrix,
+    )
 
 
 def _split_inputs(
@@ -1636,8 +1675,10 @@ def compute_off_targets(
     input takes the same path: a file is treated as a folder holding one file,
     and every input file is split into one Parquet part per ``sirna_id``. A
     single ``sioff search`` TSV holding every siRNA and a folder of per-siRNA
-    files therefore run the same way. A ``sirna_id`` found in two input files
-    is an error. Each siRNA is then scored as its own task: its part is
+    files therefore run the same way, and so do the ``predictions`` frame and
+    the hits of the in-process search, which are split in this process. A
+    ``sirna_id`` found in two input files is an error. Each siRNA is then
+    scored as its own task: its part is
     loaded, filtered to the sense strand with ``sense_only``, intersected with
     the transcriptome and scored with the per-siRNA partition function.
     siRNAs with no predictions left after filtering and intersection are
@@ -1664,17 +1705,26 @@ def compute_off_targets(
     on-target IDs without ``gtf_file`` (a warning). After the last siRNA, the
     siRNAs whose on-target matched no row are named in one warning.
 
+    **Accessibility** reaches the workers as a memory-mapped packed cache,
+    whatever its source: the cache of ``accessibility_dir``, the
+    ``accessibility`` profiles written to a temporary directory and packed
+    there, or ``genome_file`` folded into one. Without any of them, opening
+    energies are treated as zero.
+
     **Temporary files**: the transcriptome is written once to an Arrow IPC
-    file that every task memory-maps, and the split parts go to another
-    temporary directory. Both are removed in a ``finally``. Consume the
-    generator fully, call ``.close()`` on it, or wrap it in
+    file that every task memory-maps, the split parts go to another temporary
+    directory, and so do the packed ``accessibility`` profiles or the
+    ``genome_file`` fold. All of them are removed in a ``finally``, on error
+    too. Consume the generator fully, call ``.close()`` on it, or wrap it in
     `contextlib.closing` for deterministic teardown.
 
     Parameters
     ----------
     predictions : polars.DataFrame, optional
-        In-memory predictions in the ``sioff.search`` schema. Not supported
-        yet: raises `NotImplementedError`.
+        In-memory predictions, typically the value returned by
+        [`sioff.search`][sioff.search]. Must contain the columns ``sirna_id,
+        chrom, start, end, strand, energy``; extra columns are dropped and
+        compatible dtypes are cast to the RIsearch schema.
     risearch_file : pathlib.Path, optional
         A predictions file, or a directory of them (CLI
         ``-r/--risearch-file``): RIsearch2 output (plain or ``.gz``), a
@@ -1682,14 +1732,18 @@ def compute_off_targets(
         ``*.tsv``, ``*.out`` and ``*.parquet`` is read, each holding one siRNA
         or many.
     sirna_fasta : pathlib.Path, optional
-        Query FASTA for an in-process search (CLI ``-s/--sirna-fasta``); it
-        does not feed E_min. The search is not supported yet: without
-        ``risearch_file`` this raises `NotImplementedError`.
+        Query FASTA for an in-process RIsearch run against ``target_fasta``
+        (CLI ``-s/--sirna-fasta``), searched with ``matrix``; duplicate
+        sequence IDs are rejected. It is only the query: it cannot be
+        combined with ``risearch_file`` or ``predictions``, and the
+        perfect-match energies come from ``sirna_table``.
     target_fasta : pathlib.Path, optional
-        Target FASTA for the in-process search (CLI ``--target-fasta``).
+        Target FASTA (genome or transcriptome) for the in-process search
+        (CLI ``--target-fasta``/``--genome``); required with ``sirna_fasta``.
     target_index : pathlib.Path, optional
         Pre-built RIsearch index for ``target_fasta`` (CLI
-        ``-idx/--target-index``).
+        ``-idx/--target-index``). When omitted the index is built (or reused)
+        next to ``target_fasta``.
     gtf_file : pathlib.Path, optional
         Transcriptome annotation, GTF or GFF3 (CLI ``-t/--transcriptome``).
         Rows with expression <= 0 are dropped; predictions are intersected
@@ -1704,21 +1758,25 @@ def compute_off_targets(
         Annotation format: ``"auto"``, ``"gtf"`` or ``"gff3"``; BED is
         rejected (CLI ``--transcriptome-format``).
     accessibility : Mapping[str, polars.DataFrame], optional
-        In-memory accessibility profiles. Not supported yet: raises
-        `NotImplementedError`.
+        In-memory accessibility profiles, ``dict[chrom -> DataFrame]`` with
+        the columns ``position, strand, u1..uN`` and both strands stacked, as
+        returned by [`sioff.accessibility`][sioff.accessibility]. They are
+        written to a temporary directory and packed there. Mutually
+        exclusive with ``accessibility_dir``.
     accessibility_dir : pathlib.Path, optional
         The npy cache from ``sioff accessibility`` or per-chromosome Parquet
         files (CLI ``-a/--accessibility-dir``). For Parquet the cache is built
         (or rebuilt, when older than its Parquet) in
         ``accessibility_cache_dir`` first, before anything else is read.
-        Without any profile source, opening energies are treated as zero.
+        Mutually exclusive with ``accessibility``.
     accessibility_cache_dir : pathlib.Path, optional
         Where the cache is read from and built; default ``accessibility_dir``
         (CLI ``--accessibility-cache-dir``). Created if absent.
     genome_file : pathlib.Path, optional
-        Genome FASTA to fold during the run (CLI ``-f/--fasta``). Not
-        supported yet: without ``accessibility_dir`` this raises
-        `NotImplementedError`.
+        Genome FASTA to fold during the run (CLI ``-f/--fasta``), straight
+        into a packed cache in a temporary directory. Only folded when
+        neither ``accessibility`` nor ``accessibility_dir`` is given; those
+        profiles are used instead.
     window_size : int, default 80
         RNAplfold window size for folding ``genome_file`` (CLI
         ``-W/--window``).
@@ -1773,7 +1831,8 @@ def compute_off_targets(
         Called once with the number of siRNAs to score, after the inputs are
         split and checked and before any siRNA is scored.
     accessibility_progress_callback : callable, optional
-        Progress callback for folding ``genome_file``.
+        Called as ``callback(advance=n, description=str)`` after each batch
+        of ``n`` records of ``genome_file`` is folded.
 
     Yields
     ------
@@ -1797,21 +1856,26 @@ def compute_off_targets(
     ------
     ValueError
         When both ``predictions`` and ``risearch_file``, or both
-        ``accessibility`` and ``accessibility_dir``, are given; when no
-        prediction source is given; when ``sirna_fasta`` is given without
-        ``target_fasta``; when the siRNA table cannot be read; when a
-        ``sirna_id`` occurs in two input files; and when an alpha/gamma pair
-        other than (1, 1) is computed and a siRNA with predictions has no
-        row in ``sirna_table`` (or there is no table).
-    NotImplementedError
-        For the sources not wired in yet: ``predictions``, an in-process
-        search, ``accessibility`` and ``genome_file``.
+        ``accessibility`` and ``accessibility_dir``, are given; when
+        ``sirna_fasta`` is given with ``risearch_file`` or ``predictions``;
+        when no prediction source is given; when ``sirna_fasta`` is given
+        without ``target_fasta``; when ``predictions`` lacks a required
+        column; when ``sirna_fasta`` holds a duplicate ID; when the siRNA
+        table cannot be read; when a ``sirna_id`` occurs in two input files;
+        and when an alpha/gamma pair other than (1, 1) is computed and a
+        siRNA with predictions has no row in ``sirna_table`` (or there is no
+        table).
     FileNotFoundError
         When ``risearch_file`` does not exist, or is a directory without
-        prediction files.
+        prediction files; when ``sirna_fasta``, ``target_fasta`` or
+        ``target_index`` does not exist.
+    RIsearchError
+        `sioff.services.risearch_service.RIsearchError`, when the in-process
+        search or indexing ``target_fasta`` fails.
     AccessibilityError
         When ``accessibility_dir`` (and ``accessibility_cache_dir``) holds no
-        profile, or the cache cannot be built.
+        profile, when the cache cannot be built, or when ``accessibility``
+        cannot be packed or ``genome_file`` cannot be folded.
     WorkerFailureError
         After the last successful siRNA, when an input file could not be
         split or a siRNA could not be scored.
@@ -1826,39 +1890,46 @@ def compute_off_targets(
             "predictions and risearch_file are two sources for the same input; "
             "pass one of them"
         )
+    if sirna_fasta is not None and (
+        risearch_file is not None or predictions is not None
+    ):
+        raise ValueError(
+            "sirna_fasta is the query for the in-process search and cannot be "
+            "combined with risearch_file or predictions; the perfect-match energy "
+            "for E_min now comes from the siRNA table"
+        )
     if accessibility is not None and accessibility_dir is not None:
         raise ValueError(
             "accessibility and accessibility_dir are two sources for the same "
             "input; pass one of them"
         )
-    if predictions is None and risearch_file is None:
-        if sirna_fasta is None:
-            raise ValueError(
-                "Must provide predictions (a DataFrame), risearch_file (a file "
-                "or a directory) or sirna_fasta"
-            )
-        if target_fasta is None:
-            raise ValueError(
-                "sirna_fasta requires target_fasta when running RIsearch dynamically"
-            )
-    if risearch_file is None:
-        raise NotImplementedError(
-            "compute_off_targets reads risearch_file only; in-memory predictions "
-            "and the in-process search are not supported yet"
+    input_files: list[Path] = []
+    frame: Optional[pl.DataFrame] = None
+    if risearch_file is not None:
+        input_files = _input_files(Path(risearch_file))
+    elif predictions is not None:
+        frame = _coerce_predictions(predictions)
+    elif sirna_fasta is None:
+        raise ValueError(
+            "Must provide predictions (a DataFrame), risearch_file (a file "
+            "or a directory) or sirna_fasta"
         )
-    if accessibility is not None or (
-        genome_file is not None and accessibility_dir is None
-    ):
-        raise NotImplementedError(
-            "compute_off_targets reads accessibility_dir only; in-memory profiles "
-            "and genome folding are not supported yet"
+    elif target_fasta is None:
+        raise ValueError(
+            "sirna_fasta requires target_fasta when running RIsearch dynamically"
         )
-    input_files = _input_files(Path(risearch_file))
-    # Workers only ever memory-map the finished cache.
+    else:
+        # The search itself runs in step 5; duplicate query IDs fail now.
+        RIsearchService().validate_sirna_fasta(Path(sirna_fasta))
+    # Workers only ever memory-map the finished cache. In-memory profiles and
+    # a fold get theirs in step 4, inside the try, so its temporary directory
+    # is always removed.
+    acc_dir: Optional[Path] = None
     cache_dir: Optional[Path] = None
     if accessibility_dir is not None:
+        acc_dir = Path(accessibility_dir)
         cache_dir = _prepare_accessibility_cache(
-            Path(accessibility_dir), accessibility_cache_dir, n_workers
+            acc_dir, accessibility_cache_dir, n_workers
         )
 
     # 2. The siRNA table: on-targets and perfect-match sequences.
@@ -1872,13 +1943,37 @@ def compute_off_targets(
     theta_vals = _parse_theta(theta)
     needs_e_min = any(pair != (1.0, 1.0) for pair in alpha_gamma_pairs)
 
+    spill_dir: Optional[str] = None
     ipc_dir: Optional[str] = None
     split_root: Optional[str] = None
     executor: Optional[_Executor] = None
     try:
-        # 4. The transcriptome, sorted by (chrom, strand, start) so each
-        # task's partitions are zero-copy slices of the memory-mapped file,
-        # and uncompressed so it can be memory-mapped at all; see
+        # 4. The worker inputs. Profiles held in memory are written out as
+        # Parquet and packed; a genome is folded straight into a packed
+        # cache. -a (and so -f with -a) needs neither.
+        if accessibility is not None:
+            spill_dir = tempfile.mkdtemp(prefix="sioff_acc_")
+            for chrom, profile in accessibility.items():
+                profile.write_parquet(
+                    Path(spill_dir) / f"{chrom}{PARQUET_SUFFIX}", compression="lz4"
+                )
+            acc_dir = Path(spill_dir)
+            cache_dir = _prepare_accessibility_cache(acc_dir, None, n_workers)
+        elif genome_file is not None and accessibility_dir is None:
+            spill_dir = tempfile.mkdtemp(prefix="sioff_fold_")
+            acc_dir = Path(spill_dir)
+            GenomeAccessibilityService(acc_dir).compute_genome_accessibility(
+                Path(genome_file),
+                window_size=window_size,
+                max_span=max_span,
+                unpaired_prob=unpaired_prob,
+                temperature=temperature,
+                output_format="npy",
+                progress_callback=accessibility_progress_callback,
+            )
+        # The transcriptome, sorted by (chrom, strand, start) so each task's
+        # partitions are zero-copy slices of the memory-mapped file, and
+        # uncompressed so it can be memory-mapped at all; see
         # preload_transcriptome.
         ipc_path = ""
         if gtf_file is not None:
@@ -1901,9 +1996,7 @@ def compute_off_targets(
             n_workers,
             {
                 "ipc_path": ipc_path,
-                "accessibility_dir": (
-                    str(accessibility_dir) if accessibility_dir is not None else ""
-                ),
+                "accessibility_dir": str(acc_dir) if acc_dir is not None else "",
                 "on_target_map": on_target_map,
                 "self_hyb_emin": {},
                 "temperature": temperature,
@@ -1915,9 +2008,22 @@ def compute_off_targets(
             },
         )
 
-        # 5. Split phase.
+        # 5. Split phase: input files in tasks, a frame here.
         split_root = tempfile.mkdtemp(prefix="sioff_split_")
-        parts = _split_inputs(executor, input_files, Path(split_root))
+        if input_files:
+            parts = _split_inputs(executor, input_files, Path(split_root))
+        else:
+            if frame is None:
+                # Step 1 checked both FASTAs and the query's IDs.
+                assert sirna_fasta is not None and target_fasta is not None
+                frame = _search_in_process(
+                    Path(sirna_fasta),
+                    Path(target_fasta),
+                    Path(target_index) if target_index is not None else None,
+                    matrix,
+                )
+            parts = dict(sorted(split_frame(frame, Path(split_root) / "0").items()))
+            frame = None  # the parts hold the rows now
         n_split_failures = len(executor.failures)
 
         # 6. Checks, before any scoring.
@@ -1954,13 +2060,16 @@ def compute_off_targets(
         # processes x threads within n_workers.
         n_proc = max(1, min(executor.n_workers, len(tasks)))
         n_on_target_rows: dict[str, int] = {}
-        for _, (arrow_table, meta) in executor.run(
+        for sid, (arrow_table, meta) in executor.run(
             _score_part,
             tasks,
             threads_per_worker=max(1, executor.n_workers // n_proc),
             uses_worker_state=True,
         ):
             if arrow_table is None:
+                # --sense-only and the intersection left no row, so none
+                # can be its on-target either.
+                n_on_target_rows[sid] = 0
                 continue
             n_on_target_rows.update(meta["n_on_target_rows"])
             df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
@@ -1987,9 +2096,12 @@ def compute_off_targets(
                 "per-siRNA workers", executor.failures, n_split_failures + len(tasks)
             )
     finally:
-        # 10. Pool first (its workers hold the files open), then the files.
-        if executor is not None:
-            executor.close()
-        for tmp in (split_root, ipc_dir):
-            if tmp is not None:
-                shutil.rmtree(tmp, ignore_errors=True)
+        # 10. Pool first (its workers hold the files open), then the files,
+        # even if shutting the pool down fails.
+        try:
+            if executor is not None:
+                executor.close()
+        finally:
+            for tmp in (split_root, ipc_dir, spill_dir):
+                if tmp is not None:
+                    shutil.rmtree(tmp, ignore_errors=True)
