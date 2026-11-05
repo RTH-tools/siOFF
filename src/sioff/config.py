@@ -15,6 +15,11 @@ REMOVED_OFF_TARGETS_KEYS: dict[str, str] = {
         "the .summary files carry the partition-function header; "
         "--detailed-report keeps the per-interaction weights"
     ),
+    "on_target": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
+    "query": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
 }
 
 
@@ -34,11 +39,6 @@ class OffTargetsConfig:
     window: int = 80
     span: int = 40
     unpaired: int = 30
-    on_target: Optional[str] = None
-    on_target_risearch_file: Optional[str] = None
-    query: Optional[str] = None
-    on_target_expression: float = 1000.0
-    on_target_accessibility: Optional[str] = None
     temperature: float = 37.0
     matrix: str = (
         "t04"  # bundled DSM id, or a DSM TSV path (resolved like the other paths)
@@ -109,10 +109,6 @@ def _resolve_paths(cfg: DictConfig, base_dir: Path) -> DictConfig:
             "accessibility_cache_dir",
             "output",
             "fasta",
-            "on_target",
-            "on_target_risearch_file",
-            "query",
-            "on_target_accessibility",
         ],
         "accessibility": ["fasta", "output"],
     }
@@ -152,10 +148,6 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
         "accessibility_cache_dir",
         "output",
         "fasta",
-        "on_target",
-        "on_target_risearch_file",
-        "query",
-        "on_target_accessibility",
     ]:
         if key in kwargs and kwargs[key] is not None:
             kwargs[key] = Path(kwargs[key])
@@ -176,8 +168,6 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
                 "feature": "feature_type",
                 "output": "output_file",
                 "fasta": "genome_file",
-                "on_target": "on_target_file",
-                "query": "query_file",
             }
         )
         # Typer OptionInfo objects become defaults when calling the function directly,

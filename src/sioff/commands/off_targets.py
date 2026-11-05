@@ -177,51 +177,6 @@ def run(
             ),
         ),
     ] = "t04",
-    on_target_file: Annotated[
-        Optional[Path],
-        typer.Option(
-            "-on",
-            "--on-target",
-            help="Path to On-Target sequence FASTA (for Partition Function).",
-            exists=True,
-            readable=True,
-        ),
-    ] = None,
-    on_target_risearch_file: Annotated[
-        Optional[Path],
-        typer.Option(
-            "--on-target-risearch-file",
-            "-on-ris",
-            help="Path to pre-computed RIsearch output file for On-Target (skips on-the-fly calculation).",
-            exists=True,
-            readable=True,
-        ),
-    ] = None,
-    query_file: Annotated[
-        Optional[Path],
-        typer.Option(
-            "-q",
-            "--query",
-            help="Path to siRNA query FASTA (required if --on-target is used).",
-            exists=True,
-            readable=True,
-        ),
-    ] = None,
-    on_target_expression: Annotated[
-        float,
-        typer.Option(
-            "--on-target-expression",
-            "-oexp",
-            help="Expression level for On-Target (default: 1000.0).",
-        ),
-    ] = 1000.0,
-    on_target_accessibility: Annotated[
-        Optional[Path],
-        typer.Option(
-            "--on-target-accessibility",
-            help="Accessibility Parquet for the on-target (same schema as accessibility command output). Falls back to on-the-fly computation if omitted.",
-        ),
-    ] = None,
     on_target_ids_file: Annotated[
         Optional[Path],
         typer.Option(
@@ -344,10 +299,6 @@ def run(
     accessibility_cache_dir = _as_path(accessibility_cache_dir)
     output_file = _as_path(output_file)
     genome_file = _as_path(genome_file)
-    on_target_file = _as_path(on_target_file)
-    on_target_risearch_file = _as_path(on_target_risearch_file)
-    query_file = _as_path(query_file)
-    on_target_accessibility = _as_path(on_target_accessibility)
     on_target_ids_file = _as_path(on_target_ids_file)
 
     console.print(Panel("siOFF", style="bold cyan"))
@@ -450,7 +401,6 @@ def run(
                 temperature=temperature,
                 matrix=matrix,
                 on_target_ids_file=on_target_ids_file,
-                on_target_expression=on_target_expression,
                 alpha=alpha,
                 gamma=gamma,
                 theta=theta,
@@ -634,11 +584,6 @@ def run(
                 unpaired_prob=unpaired_prob,
                 temperature=temperature,
                 matrix=matrix,
-                on_target_file=on_target_file,
-                on_target_risearch_file=on_target_risearch_file,
-                query_file=query_file,
-                on_target_expression=on_target_expression,
-                on_target_accessibility=on_target_accessibility,
                 on_target_ids_file=on_target_ids_file,
                 alpha=alpha,
                 gamma=gamma,
@@ -697,13 +642,6 @@ def run(
                     theta_vals,
                 )
                 (out_dir / f"{sid}.summary").write_text(summary_text)
-
-        # On-target details (single-siRNA mode only).
-        if meta.get("has_on_target", False):
-            console.print(
-                f"  └─ On-Target: ΔG_total={meta['dG_on_target']:.2f} kcal/mol, "
-                f"P(on)={meta.get('p_on_target', 0.0):.10f}"
-            )
 
         # Results preview table (sorts df by P_off_target — preserved so the saved
         # TSV is ordered identically to the pre-refactor output).

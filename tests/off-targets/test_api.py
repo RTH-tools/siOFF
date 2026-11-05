@@ -296,3 +296,16 @@ def test_search_output_feeds_off_targets_in_memory(tmp_path: Path) -> None:
     assert df.height > 0
     assert "P_off_target" in df.columns
     assert set(tmp_path.rglob("*")) == files_before, "in-memory run wrote files"
+
+
+def test_off_targets_has_no_fasta_on_target_parameters() -> None:
+    """The FASTA-based on-target options are gone; the on-target is an ID."""
+    params = inspect.signature(sioff.off_targets).parameters
+    for name in (
+        "on_target_file",
+        "on_target_risearch_file",
+        "query_file",
+        "on_target_expression",
+        "on_target_accessibility",
+    ):
+        assert name not in params

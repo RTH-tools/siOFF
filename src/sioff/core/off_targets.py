@@ -13,8 +13,7 @@ exceptions, no file writes):
   deterministic cleanup.
 
 ``meta`` carries the partition-function state downstream formatters need:
-``z_per_sirna``/``on_target_weights`` (multi-siRNA), or ``z_total`` etc.
-(single-siRNA).
+``z_per_sirna`` and ``on_target_weights``.
 
 The public wrappers [`sioff.off_targets`][sioff.off_targets], [`sioff.accessibility`][sioff.accessibility],
 [`sioff.index`][sioff.index] and [`sioff.search`][sioff.search] in `sioff.api` add path
@@ -308,7 +307,6 @@ def _process_one_sirna(
     file_path_str: str,
     alpha_gamma_pairs: list,
     theta_vals: list,
-    on_target_expression: float,
     sense_only: bool,
     predictions_type: str,
 ) -> tuple:
@@ -364,12 +362,12 @@ def _process_one_sirna(
         alpha_gamma_pairs=alpha_gamma_pairs,
         theta_values=theta_vals,
         on_target_map=on_target_map,
-        on_target_expression=on_target_expression,
         aggregate_only=_m._WORKER_SUMMARY_ONLY,
     )
     _t_prob = time.perf_counter()
 
-    # Drop heavy intermediate columns before returning
+    # Drop heavy intermediate columns before returning (only without
+    # detailed_report, which keeps them)
     if not _m._WORKER_DETAILED_REPORT:
         df = _drop_heavy_columns(df)
 
@@ -433,7 +431,6 @@ def _stream_sirnas(
     all_files: list[Path],
     alpha_gamma_pairs: list,
     theta_vals: list,
-    on_target_expression: float,
     sense_only: bool,
     predictions_type: str,
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
@@ -456,7 +453,6 @@ def _stream_sirnas(
             str(f),
             alpha_gamma_pairs,
             theta_vals,
-            on_target_expression,
             sense_only,
             predictions_type,
         ): f
@@ -603,11 +599,6 @@ def compute_off_targets_single(
     unpaired_prob: int = 30,
     temperature: float = 37.0,
     matrix: Union[str, Path] = "t04",
-    on_target_file: Optional[Path] = None,
-    on_target_risearch_file: Optional[Path] = None,
-    query_file: Optional[Path] = None,
-    on_target_expression: float = 1000.0,
-    on_target_accessibility: Optional[Path] = None,
     on_target_ids_file: Optional[Path] = None,
     alpha: str = "1.0",
     gamma: str = "1.0",
@@ -636,12 +627,7 @@ def compute_off_targets_single(
     energies are treated as zero.
 
     When ``gtf_file`` is given, the predictions are intersected with the
-    annotation before probabilities are computed. The probability model is
-    chosen automatically: the per-siRNA partition function is used when the
-    frame holds more than one ``sirna_id`` or when any non-baseline ``alpha`` /
-    ``gamma`` / ``theta`` value is requested; otherwise the single-siRNA model
-    (which alone supports ``on_target_file``, ``on_target_risearch_file``,
-    ``query_file`` and ``on_target_accessibility``).
+    annotation before probabilities are computed.
 
     Writes no files and prints nothing.
 
@@ -716,25 +702,6 @@ def compute_off_targets_single(
         id or the path of a DSM TSV table (CLI ``-z/--matrix``). Use the set the
         predictions were searched with: E_min is the reference energy of the
         alpha/gamma clamp.
-    on_target_file : pathlib.Path, optional
-        On-target sequence FASTA for the single-siRNA partition function (CLI
-        ``-on/--on-target``). Requires ``query_file``; adds an ``onTarget`` row
-        to the result and populates ``meta["p_on_target"]``.
-    on_target_risearch_file : pathlib.Path, optional
-        Pre-computed RIsearch output for the on-target hybridisation (CLI
-        ``-on-ris/--on-target-risearch-file``); skips the on-the-fly RIsearch
-        run against ``on_target_file``.
-    query_file : pathlib.Path, optional
-        siRNA query FASTA used for the on-target computation (CLI
-        ``-q/--query``); required when ``on_target_file`` is set. Its stem
-        names the siRNA.
-    on_target_expression : float, default 1000.0
-        Expression level assigned to the on-target (CLI
-        ``-oexp/--on-target-expression``).
-    on_target_accessibility : pathlib.Path, optional
-        Accessibility Parquet for the on-target, same schema as the
-        ``sioff accessibility`` output (CLI ``--on-target-accessibility``).
-        Falls back to on-the-fly folding when omitted.
     on_target_ids_file : pathlib.Path, optional
         Two-column TSV mapping ``sirna_id`` to on-target ``transcript_id``
         (CLI ``-oi/--on-target-ids``), used by the per-siRNA model to flag and
@@ -783,14 +750,11 @@ def compute_off_targets_single(
         ``P_off_target`` repeat with a ``:alpha=A,gamma=G`` or ``:theta=T``
         suffix for each extra parameter set. With ``detailed_report`` the
         table also holds ``E_min``, ``boltzmann_weight*`` and ``Z_sirna*``
-        (each repeated per parameter set). ``meta`` always contains ``"_report"`` (a dict with ``n_loaded``,
-        ``energy_min``, ``energy_max``, ``sense_only``, ``n_features``,
-        ``n_intersected`` and ``preview``, the raw prediction head). The per-siRNA
-        model adds
-        ``"n_sirnas"``, ``"z_per_sirna"``, ``"on_target_weights"`` and
-        ``"on_target_count"``; the single-siRNA model adds ``"z_total"``,
-        ``"z_off_target"``, ``"w_on_target"``, ``"dG_on_target"``,
-        ``"has_on_target"`` and, with an on-target, ``"p_on_target"``.
+        (each repeated per parameter set). ``meta`` always contains
+        ``"_report"`` (a dict with ``n_loaded``, ``energy_min``,
+        ``energy_max``, ``sense_only``, ``n_features``, ``n_intersected`` and
+        ``preview``, the raw prediction head), plus ``"n_sirnas"``,
+        ``"z_per_sirna"``, ``"on_target_weights"`` and ``"on_target_count"``.
 
     Raises
     ------
@@ -949,7 +913,6 @@ def compute_off_targets_single(
                 alpha_gamma_pairs=alpha_gamma_pairs,
                 theta_values=theta_vals,
                 on_target_map=on_target_map if on_target_map else None,
-                on_target_expression=on_target_expression,
             )
             _s.rows_out = frame.height
         logger.info(f"After probabilities: {frame.height:,} rows")
@@ -1013,7 +976,6 @@ def compute_off_targets_directory(
     temperature: float = 37.0,
     matrix: Union[str, Path] = "t04",
     on_target_ids_file: Optional[Path] = None,
-    on_target_expression: float = 1000.0,
     alpha: str = "1.0",
     gamma: str = "1.0",
     theta: str = "",
@@ -1092,9 +1054,6 @@ def compute_off_targets_directory(
     on_target_ids_file : pathlib.Path, optional
         Two-column TSV mapping ``sirna_id`` to on-target ``transcript_id``
         (CLI ``-oi/--on-target-ids``); lines starting with ``#`` are ignored.
-    on_target_expression : float, default 1000.0
-        Expression level assigned to the on-target (CLI
-        ``-oexp/--on-target-expression``).
     alpha : str, default "1.0"
         Alpha clamping parameter(s) as a ``";"``-separated string, e.g.
         ``"0.8;1.0"`` (CLI ``--alpha``). Every ``alpha`` is paired with every
@@ -1262,7 +1221,6 @@ def compute_off_targets_directory(
                 all_files,
                 alpha_gamma_pairs,
                 theta_vals,
-                on_target_expression,
                 sense_only,
                 predictions_type,
             )

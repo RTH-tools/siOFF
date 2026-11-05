@@ -181,6 +181,11 @@ _REMOVED_OFF_TARGETS_KEYS = {
         "the .summary files carry the partition-function header; "
         "--detailed-report keeps the per-interaction weights"
     ),
+    "on_target": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
+    "query": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
 }
 
 
@@ -202,10 +207,6 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("accessibility_cache_dir", "--accessibility-cache-dir"),
         ("output", "--output"),
         ("fasta", "--fasta"),
-        ("on_target", "--on-target"),
-        ("on_target_risearch_file", "--on-target-risearch-file"),
-        ("query", "--query"),
-        ("on_target_accessibility", "--on-target-accessibility"),
         ("on_target_ids", "--on-target-ids"),
     ]:
         val = _resolve(cfg.get(key), base)
@@ -222,7 +223,6 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("span", "--span"),
         ("unpaired", "--unpaired"),
         ("temperature", "--temperature"),
-        ("on_target_expression", "--on-target-expression"),
         ("alpha", "--alpha"),
         ("gamma", "--gamma"),
         ("theta", "--theta"),

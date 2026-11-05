@@ -1,18 +1,9 @@
-import tempfile
-from pathlib import Path
-from typing import Optional, Tuple, Dict, cast
+from typing import Optional, Tuple, Dict
 
-import numpy as np
 import polars as pl
 from loguru import logger
 
-from sioff.services.accessibility import (
-    GenomeAccessibilityService,
-    _reverse_complement,
-    site_cells,
-)
-from sioff.services.helpers import read_fasta
-from sioff.services.risearch_service import RIsearchService
+from sioff.services.accessibility import GenomeAccessibilityService
 
 # Gas constant in kcal/mol*K
 R = 0.001987
@@ -49,8 +40,6 @@ class ProbabilityService:
         alpha_gamma_pairs: Optional[list[tuple[float, float]]] = None,
         theta_values: Optional[list[float]] = None,
         on_target_map: Optional[dict[str, str]] = None,
-        on_target_expression: float = 1000.0,
-        on_target_fasta_data: Optional[dict[str, dict]] = None,
         precomputed_opening_energy: bool = False,
         aggregate_only: bool = False,
     ) -> Tuple[pl.DataFrame, Dict]:
@@ -63,8 +52,8 @@ class ProbabilityService:
         all ``--summary-only`` needs, and for a large grid it is most of the
         memory (385 columns on millions of rows for the RIsearch3 benchmark).
 
-        Mode A (in_predictions): on-target rows already in df, tagged by ID match.
-        Mode B (fasta): on-target energy comes from on_target_fasta_data; rows excluded from df.
+        With an ``on_target_map`` the on-target rows are already in ``df`` and
+        are tagged by ID match.
 
         With ``precomputed_opening_energy`` the frame must already carry an
         ``opening_energy`` column (e.g. gathered chromosome-major by the
@@ -107,14 +96,9 @@ class ProbabilityService:
             # row's weight and probability into null).
             df = df.with_columns(pl.col("exp_value").fill_null(0.0))
 
-        use_fasta_mode = on_target_fasta_data is not None
         in_predictions_mode = (
-            on_target_map is not None
-            and not use_fasta_mode
-            and "transcript_id" in df.columns
+            on_target_map is not None and "transcript_id" in df.columns
         )
-
-        on_target_data_fasta: dict[str, dict] = {}
 
         if in_predictions_mode:
             # Filter to siRNAs present here — avoids O(N_corpus) OR chain per worker call
@@ -142,36 +126,6 @@ class ProbabilityService:
                 f"In-predictions on-target mode: tagged {n_on} rows as on-target (from {len(local_map)} mappings)"
             )
 
-        elif (
-            on_target_fasta_data is not None
-            and on_target_map
-            and "transcript_id" in df.columns
-        ):
-            on_target_data_fasta = on_target_fasta_data
-
-            exclude_conditions = [
-                (pl.col("sirna_id") == sid)
-                & (
-                    (pl.col("transcript_id") == on_target_map[sid])
-                    | (
-                        pl.col("gene_id") == on_target_map[sid]
-                        if "gene_id" in df.columns
-                        else pl.lit(False)
-                    )
-                )
-                for sid in on_target_fasta_data
-                if sid in on_target_map
-            ]
-            if exclude_conditions:
-                exclude_expr = exclude_conditions[0]
-                for cond in exclude_conditions[1:]:
-                    exclude_expr = exclude_expr | cond
-                df = df.filter(~exclude_expr)
-                logger.info(
-                    f"FASTA mode: excluded on-target rows for {len(on_target_fasta_data)} siRNAs"
-                )
-
-            df = df.with_columns(pl.lit(False).alias("is_on_target"))
         else:
             df = df.with_columns(pl.lit(False).alias("is_on_target"))
 
@@ -298,78 +252,6 @@ class ProbabilityService:
                 f"In-predictions mode: computed on-target weights for {on_df.height} siRNAs"
             )
 
-        elif on_target_data_fasta:
-            min_e_dict = {
-                row["sirna_id"]: cast(float, row["E_min"])
-                for row in min_energies.to_dicts()
-            }
-            z_modifications = []
-
-            for suffix, dG_col, dG_noacc_col in calc_configs:
-                on_target_w = {}
-                on_target_w_noacc = {}
-
-                for sirna_id, data in on_target_data_fasta.items():
-                    orig_energy = data["energy"]
-                    orig_open = data.get("opening_energy", 0.0)
-                    e_min = min(min_e_dict.get(sirna_id, orig_energy), orig_energy)
-
-                    if suffix.startswith(":alpha="):
-                        parts = suffix.split(",")
-                        alpha = float(parts[0].split("=")[1])
-                        gamma = float(parts[1].split("=")[1])
-                        if orig_energy < alpha * e_min:
-                            assigned_e = gamma * e_min + orig_open
-                            assigned_e_noacc = gamma * e_min
-                        else:
-                            assigned_e = orig_energy + orig_open
-                            assigned_e_noacc = orig_energy
-                    elif suffix.startswith(":theta="):
-                        theta = float(suffix.split("=")[1])
-                        assigned_e = ((theta * (orig_energy + 10.0)) - 10.0) + orig_open
-                        assigned_e_noacc = (theta * (orig_energy + 10.0)) - 10.0
-                    else:
-                        assigned_e = orig_energy + orig_open
-                        assigned_e_noacc = orig_energy
-
-                    w_on = on_target_expression * np.exp(-assigned_e / self._RT)
-                    w_on_noacc = on_target_expression * np.exp(
-                        -assigned_e_noacc / self._RT
-                    )
-                    on_target_w[sirna_id] = w_on
-                    on_target_w_noacc[sirna_id] = w_on_noacc
-
-                    if sirna_id not in on_target_weight_metadata:
-                        on_target_weight_metadata[sirna_id] = {}
-                    on_target_weight_metadata[sirna_id][f"W_on{suffix}"] = w_on
-                    on_target_weight_metadata[sirna_id][f"W_on_noacc{suffix}"] = (
-                        w_on_noacc
-                    )
-
-                z_col = f"Z_sirna{suffix}"
-                z_noacc_col = f"Z_sirna_noacc{suffix}"
-                z_modifications.extend(
-                    [
-                        (
-                            pl.col(z_col)
-                            + pl.col("sirna_id").replace_strict(
-                                on_target_w, default=0.0
-                            )
-                        ).alias(z_col),
-                        (
-                            pl.col(z_noacc_col)
-                            + pl.col("sirna_id").replace_strict(
-                                on_target_w_noacc, default=0.0
-                            )
-                        ).alias(z_noacc_col),
-                    ]
-                )
-
-            z_df = z_df.with_columns(z_modifications)
-            logger.info(
-                f"FASTA mode: added on-target weights for {len(on_target_data_fasta)} siRNAs to partition functions"
-            )
-
         z_stats_dict = {row["sirna_id"]: row for row in z_df.to_dicts()}
         metadata = {
             "n_sirnas": len(unique_sirnas),
@@ -480,172 +362,3 @@ class ProbabilityService:
             return df
 
         return self.accessibility_service.annotate_opening_energy_vectorized(df)
-
-    def _calculate_on_target_dg(
-        self,
-        on_target_path: Path,
-        query_path: Path,
-        accessibility_path: Optional[Path] = None,
-        risearch_path: Optional[Path] = None,
-    ) -> float:
-        dG_hyb, dG_open = self._calculate_on_target_components(
-            on_target_path, query_path, accessibility_path, risearch_path
-        )
-        return dG_hyb + dG_open
-
-    def _calculate_on_target_components(
-        self,
-        on_target_path: Path,
-        query_path: Path,
-        accessibility_path: Optional[Path] = None,
-        risearch_path: Optional[Path] = None,
-    ) -> tuple[float, float]:
-        """Return (dG_hyb, dG_open) for on-target; computes accessibility on-the-fly if not provided."""
-        if risearch_path:
-            dG_hyb, t_start, t_end, strand = self._parse_risearch_file(risearch_path)
-        else:
-            dG_hyb, t_start, t_end, strand = self._run_risearch_binary(
-                query_path, on_target_path
-            )
-
-        # 2. Accessibility Energy
-        dG_open = 0.0
-
-        if accessibility_path and accessibility_path.exists() and t_end > 0:
-            # Use pre-computed accessibility Parquet file
-            try:
-                df_acc = (
-                    pl.read_parquet(accessibility_path)
-                    .filter(pl.col("strand") == strand)
-                    .sort("position")
-                )
-                u_cols = sorted(
-                    [
-                        c
-                        for c in df_acc.columns
-                        if c.startswith("u") and c[1:].isdigit()
-                    ],
-                    key=lambda x: int(x[1:]),
-                )
-                max_pos = int(cast(int, df_acc["position"].max()))
-                n_u = len(u_cols)
-                profile = np.full((max_pos, n_u), 25.5, dtype=np.float32)
-                pos_0 = df_acc["position"].to_numpy() - 1
-                for col_idx, col_name in enumerate(u_cols):
-                    profile[pos_0, col_idx] = df_acc[col_name].to_numpy()
-
-                rows, cols, in_bounds = site_cells(
-                    strand,
-                    np.array([t_start]),
-                    np.array([t_end]),
-                    profile.shape[0],
-                    profile.shape[1],
-                )
-                if in_bounds[0]:
-                    dG_open = int(round(float(profile[rows[0], cols[0]]) * 10.0)) / 10.0
-                else:
-                    dG_open = 10.0
-
-            except Exception as e:
-                logger.error(f"Failed to read on-target accessibility parquet: {e}")
-                dG_open = 0.0
-
-        elif t_end > 0:
-            # Compute accessibility on-the-fly from the on-target FASTA
-            try:
-                sequence = None
-                for seq_id, seq in read_fasta(on_target_path):
-                    sequence = seq
-                    break
-
-                if sequence:
-                    logger.info(
-                        f"Computing on-target accessibility on-the-fly (len={len(sequence)})"
-                    )
-
-                    # A '-' hit sits on the reverse complement of the on-target
-                    # sequence: fold that molecule, whose rows are RC positions,
-                    # exactly as the genome-wide profiles store the '-' strand.
-                    folded = (
-                        _reverse_complement(sequence) if strand == "-" else sequence
-                    )
-                    with tempfile.TemporaryDirectory() as tmpdir:
-                        temp_service = GenomeAccessibilityService(Path(tmpdir))
-                        profile = temp_service.compute_sequence_accessibility(
-                            folded, temperature=self._temperature
-                        )
-
-                        if profile.size > 0 and profile.ndim == 2:
-                            rows, cols, in_bounds = site_cells(
-                                strand,
-                                np.array([t_start]),
-                                np.array([t_end]),
-                                profile.shape[0],
-                                profile.shape[1],
-                            )
-                            target_idx = int(rows[0])
-                            col_idx = int(cols[0])
-
-                            if in_bounds[0]:
-                                dG_open = float(profile[target_idx, col_idx])
-                                logger.info(
-                                    f"On-target opening energy: {dG_open:.2f} kcal/mol"
-                                )
-                            else:
-                                logger.warning(
-                                    f"Binding site index {target_idx} out of bounds (len={profile.shape[0]})"
-                                )
-                                dG_open = 10.0
-                        else:
-                            logger.warning("Empty or 1D profile from ViennaRNA")
-                            dG_open = 10.0
-                else:
-                    logger.warning(
-                        f"No sequence found in on-target FASTA: {on_target_path}"
-                    )
-
-            except Exception as e:
-                logger.error(f"Failed to compute on-target accessibility: {e}")
-                dG_open = 0.0
-
-        return dG_hyb, dG_open
-
-    def _run_risearch_binary(
-        self, query_path: Path, target_path: Path
-    ) -> tuple[float, int, int, str]:
-        return RIsearchService().search_single_sirna(query_path, target_path)
-
-    def _parse_risearch_file(self, path: Path) -> tuple[float, int, int, str]:
-        """Parse pre-computed RIsearch output; return (best_energy, start, end, strand)."""
-        if not path.exists():
-            logger.error(f"Provided RIsearch file not found: {path}")
-            return 0.0, 0, 0, "+"
-
-        energies = []
-        try:
-            with open(path, "r") as f:
-                for line in f:
-                    line = line.strip()
-                    if not line or line.startswith("#"):
-                        continue
-                    parts = line.split()
-                    if len(parts) >= 8:
-                        try:
-                            energies.append(
-                                (
-                                    float(parts[7]),
-                                    int(parts[4]),
-                                    int(parts[5]),
-                                    parts[6],
-                                )
-                            )
-                        except ValueError:
-                            pass
-        except Exception as e:
-            logger.error(f"Error reading RIsearch file {path}: {e}")
-            return 0.0, 0, 0, "+"
-
-        if energies:
-            return min(energies, key=lambda x: x[0])
-        logger.warning(f"No valid predictions found in {path}")
-        return 0.0, 0, 0, "+"

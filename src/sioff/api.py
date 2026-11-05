@@ -93,11 +93,6 @@ def off_targets(
     unpaired_prob: int = 30,
     temperature: float = 37.0,
     matrix: Union[str, Path] = "t04",
-    on_target_file: Optional[Union[str, Path]] = None,
-    on_target_risearch_file: Optional[Union[str, Path]] = None,
-    query_file: Optional[Union[str, Path]] = None,
-    on_target_expression: float = 1000.0,
-    on_target_accessibility: Optional[Union[str, Path]] = None,
     on_target_ids_file: Optional[Union[str, Path]] = None,
     alpha: str = "1.0",
     gamma: str = "1.0",
@@ -222,24 +217,6 @@ def off_targets(
         self-hybridisation E_min of ``sirna_fasta``: a bundled id or the path of
         a DSM TSV table. Use the set the predictions were searched with; E_min
         is the reference energy of the alpha/gamma clamp. CLI: ``-z/--matrix``.
-    on_target_file : str or pathlib.Path, optional
-        On-target sequence FASTA for the single-siRNA partition function; its
-        hybridisation energy against ``query_file`` is computed in-process with
-        RIsearch and enters the partition function as the on-target term.
-        Requires ``query_file``. CLI: ``-on/--on-target``.
-    on_target_risearch_file : str or pathlib.Path, optional
-        Pre-computed RIsearch output for the on-target, skipping the
-        on-the-fly on-target search. CLI: ``-on-ris/--on-target-risearch-file``.
-    query_file : str or pathlib.Path, optional
-        siRNA query FASTA used together with ``on_target_file``. CLI:
-        ``-q/--query``.
-    on_target_expression : float, default 1000.0
-        Expression level assigned to the on-target transcript in the partition
-        function. CLI: ``-oexp/--on-target-expression``.
-    on_target_accessibility : str or pathlib.Path, optional
-        Accessibility Parquet for the on-target sequence (same schema as the
-        ``sioff accessibility`` output). Computed on the fly when omitted.
-        CLI: ``--on-target-accessibility``.
     on_target_ids_file : str or pathlib.Path, optional
         Two-column tab-separated file mapping ``sirna_id`` to the ID of its
         on-target transcript or gene (multi-siRNA form). Predictions of a siRNA
@@ -313,8 +290,8 @@ def off_targets(
         contains no prediction files.
     RIsearchError
         `sioff.services.risearch_service.RIsearchError`, when the
-        in-process RIsearch run (``sirna_fasta`` form or on-target search)
-        fails, including when the ``risearch`` package is not installed.
+        in-process RIsearch run (``sirna_fasta`` form) fails, including when the
+        ``risearch`` package is not installed.
     AccessibilityError
         `sioff.services.accessibility.AccessibilityError`, when folding
         ``genome_file`` fails, an accessibility profile is missing or
@@ -369,7 +346,6 @@ def off_targets(
             temperature=temperature,
             matrix=matrix,
             on_target_ids_file=_p(on_target_ids_file),
-            on_target_expression=on_target_expression,
             alpha=alpha,
             gamma=gamma,
             theta=theta,
@@ -402,11 +378,6 @@ def off_targets(
         unpaired_prob=unpaired_prob,
         temperature=temperature,
         matrix=matrix,
-        on_target_file=_p(on_target_file),
-        on_target_risearch_file=_p(on_target_risearch_file),
-        query_file=_p(query_file),
-        on_target_expression=on_target_expression,
-        on_target_accessibility=_p(on_target_accessibility),
         on_target_ids_file=_p(on_target_ids_file),
         alpha=alpha,
         gamma=gamma,
