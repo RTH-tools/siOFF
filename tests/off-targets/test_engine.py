@@ -17,6 +17,7 @@ import pytest
 from loguru import logger
 from polars.testing import assert_frame_equal
 
+import sioff
 import sioff.core.off_targets as core
 from sioff.core.off_targets import WorkerFailureError, compute_off_targets
 from sioff.core.split import split_frame
@@ -25,11 +26,18 @@ from sioff.services.risearch_service import RIsearchService
 
 EX = Path(__file__).resolve().parents[2] / "examples" / "data"
 PREDICTIONS = EX / "predictions.out"
+GENOME = EX / "genome.fa"
 SIRNAS = ["siRNA_1", "siRNA_2", "siRNA_3", "siRNA_4", "siRNA_5"]
-SORT_KEYS = ["sirna_id", "chrom", "start", "end", "strand", "transcript_id"]
+# energy breaks ties: a search can report two hits on one site.
+SORT_KEYS = ["sirna_id", "chrom", "start", "end", "strand", "transcript_id", "energy"]
 NO_T_WARNING = (
     "--sirna-table on-target IDs are matched after intersection; "
     "without -t/--transcriptome no row can be on-target"
+)
+SIRNA_FASTA_ERROR = (
+    "sirna_fasta is the query for the in-process search and cannot be combined "
+    "with risearch_file or predictions; the perfect-match energy for E_min now "
+    "comes from the siRNA table"
 )
 
 
@@ -148,12 +156,21 @@ def test_meta_carries_the_per_sirna_keys(tmp_path):
         assert {"load_s", "intersect_s", "prob_s", "total_s"} <= meta["_timings"].keys()
 
 
-def test_on_split_gets_the_sirna_count_before_scoring(tmp_path):
-    calls: list[int] = []
-    gen = compute_off_targets(risearch_file=PREDICTIONS, on_split=calls.append)
-    assert calls == []
+def test_on_split_gets_the_sirna_count_before_scoring(tmp_path, monkeypatch):
+    events: list = []
+    real = core._score_part
+
+    def recording(*args):
+        events.append("scored")
+        return real(*args)
+
+    monkeypatch.setattr(core, "_score_part", recording)  # in-process: n_workers=1
+    gen = compute_off_targets(
+        risearch_file=PREDICTIONS, n_workers=1, on_split=events.append
+    )
+    assert events == []
     next(gen)
-    assert calls == [len(SIRNAS)]
+    assert events == [len(SIRNAS), "scored"]
     gen.close()
 
 
@@ -378,7 +395,9 @@ def _engine_dirs(root: Path) -> list[str]:
     return sorted(
         p.name
         for p in root.iterdir()
-        if p.name.startswith(("sioff_split_", "risearch_ipc_"))
+        if p.name.startswith(
+            ("sioff_split_", "risearch_ipc_", "sioff_acc_", "sioff_fold_")
+        )
     )
 
 
@@ -443,3 +462,233 @@ def test_perfect_match_energy_comes_from_the_table_sequence(tmp_path):
         perfect = RIsearchService().self_hybridization_emin(seqs[sid], sid)
         expected = min(perfect, float(rows["energy"].min()))
         assert rows["E_min"].unique().to_list() == [pytest.approx(expected, abs=1e-5)]
+
+
+# ---------------------------------------------------------------------------
+# Review findings carried into B5
+# ---------------------------------------------------------------------------
+def _without_rows_for_sirna_1(tmp_path: Path, cause: str) -> Path:
+    """The predictions, with every siRNA_1 row lost to --sense-only or to -t."""
+    is_1 = pl.col("sirna_id") == "siRNA_1"
+    column, value = ("strand", "-") if cause == "sense_only" else ("chrom", "nowhere")
+    path = tmp_path / "predictions.parquet"
+    RIsearchParser().load(PREDICTIONS).with_columns(
+        pl.when(is_1).then(pl.lit(value)).otherwise(pl.col(column)).alias(column)
+    ).write_parquet(path)
+    return path
+
+
+@pytest.mark.parametrize("n_workers", [1, 2])
+@pytest.mark.parametrize("cause", ["sense_only", "intersection"])
+def test_on_target_sirna_with_no_rows_left_is_warned(
+    tmp_path, warnings_seen, cause, n_workers
+):
+    table = _table(
+        tmp_path, {sid: "transcript_1" if sid == "siRNA_1" else "" for sid in SIRNAS}
+    )
+    results = list(
+        compute_off_targets(
+            risearch_file=_without_rows_for_sirna_1(tmp_path, cause),
+            gtf_file=EX / "annotation.gtf",
+            sirna_table=table,
+            sense_only=cause == "sense_only",
+            n_workers=n_workers,
+        )
+    )
+    scored_ids = {sid for df, _ in results for sid in df["sirna_id"].unique()}
+    assert "siRNA_1" not in scored_ids and scored_ids
+    hits = [m for m in warnings_seen if "no on-target row" in m]
+    assert hits == ["1 siRNA(s) have no on-target row (W_on = 0): siRNA_1"]
+
+
+def test_failed_in_process_init_still_resets_the_worker_state(monkeypatch):
+    def broken(*args, **kwargs):
+        raise RuntimeError("no probability service")
+
+    # _init_worker sets the transcriptome globals, then fails on this.
+    monkeypatch.setattr(core, "ProbabilityService", broken)
+    # Put back at teardown even if the reset under test is missing.
+    monkeypatch.setattr(core, "_WORKER_DF_TRANS", None)
+    monkeypatch.setattr(core, "_WORKER_INTERSECTOR", None)
+    with pytest.raises(WorkerFailureError, match="no probability service"):
+        list(
+            compute_off_targets(
+                risearch_file=PREDICTIONS, gtf_file=EX / "annotation.gtf", n_workers=1
+            )
+        )
+    assert core._WORKER_DF_TRANS is None
+    assert core._WORKER_INTERSECTOR is None
+
+
+def test_reset_worker_state_does_not_share_the_defaults():
+    list(compute_off_targets(risearch_file=PREDICTIONS, n_workers=1))
+    for name, default in core._WORKER_STATE_DEFAULTS.items():
+        if isinstance(default, dict):
+            live = getattr(core, name)
+            assert live == {} and live is not default, name
+
+
+def test_temp_dirs_are_removed_when_close_fails(tmp_root, monkeypatch):
+    real_close = core._Executor.close
+
+    def failing_close(self):
+        real_close(self)
+        raise RuntimeError("close failed")
+
+    monkeypatch.setattr(core._Executor, "close", failing_close)
+    during: list[str] = []
+    with pytest.raises(RuntimeError, match="close failed"):
+        list(
+            compute_off_targets(
+                risearch_file=PREDICTIONS,
+                gtf_file=EX / "annotation.gtf",
+                on_split=lambda n: during.extend(_engine_dirs(tmp_root)),
+            )
+        )
+    assert len(during) == 2
+    assert _engine_dirs(tmp_root) == []
+
+
+# ---------------------------------------------------------------------------
+# In-memory predictions, the in-process search, in-memory profiles, folding
+# ---------------------------------------------------------------------------
+@pytest.fixture(scope="module")
+def profiles() -> dict[str, pl.DataFrame]:
+    """The example genome folded in memory, with the engine's fold defaults."""
+    return sioff.accessibility(genome=GENOME)
+
+
+@pytest.mark.parametrize("source", ["risearch_file", "predictions"])
+def test_sirna_fasta_is_only_the_search_query(tmp_root, scored, source):
+    given = (
+        {"risearch_file": PREDICTIONS}
+        if source == "risearch_file"
+        else {"predictions": RIsearchParser().load(PREDICTIONS)}
+    )
+    gen = compute_off_targets(sirna_fasta=EX / "sirnas.fa", **given)
+    with pytest.raises(ValueError) as info:
+        next(gen)
+    assert str(info.value) == SIRNA_FASTA_ERROR
+    assert scored == [] and _engine_dirs(tmp_root) == []
+
+
+@pytest.mark.parametrize("n_workers", [1, 2])
+def test_predictions_frame_matches_the_file(tmp_path, perfect_match, n_workers):
+    table = _table(tmp_path, {sid: "" for sid in SIRNAS})
+
+    def run(**source):
+        results = list(
+            compute_off_targets(
+                **source,
+                gtf_file=EX / "annotation.gtf",
+                accessibility_dir=EX / "accessibility",
+                sirna_table=table,
+                alpha="0.8",
+                gamma="0.8",
+                n_workers=n_workers,
+            )
+        )
+        z = {s: r for _, meta in results for s, r in meta["z_per_sirna"].items()}
+        return _collect(results), z
+
+    from_file, z_file = run(risearch_file=PREDICTIONS)
+    from_frame, z_frame = run(predictions=RIsearchParser().load(PREDICTIONS))
+    assert sorted(z_file) == SIRNAS
+    assert_frame_equal(from_frame, from_file)
+    assert z_frame == z_file
+
+
+@pytest.mark.parametrize("prebuilt_index", [True, False])
+def test_in_process_search_feeds_the_engine(tmp_path, prebuilt_index):
+    pytest.importorskip("risearch")
+    # A copy, so an index built next to the target never lands in examples/.
+    genome = tmp_path / "genome.fa"
+    shutil.copy(GENOME, genome)
+    hits = sioff.search(
+        EX / "sirnas.fa", sioff.index(genome, tmp_path / "ref.idx"), target=genome
+    )
+    assert hits.height > 0
+    kw = {"gtf_file": EX / "annotation.gtf", "accessibility_dir": EX / "accessibility"}
+    expected = _collect(compute_off_targets(predictions=hits, **kw))
+
+    index = sioff.index(genome, tmp_path / "prebuilt.idx") if prebuilt_index else None
+    got = _collect(
+        compute_off_targets(
+            sirna_fasta=EX / "sirnas.fa", target_fasta=genome, target_index=index, **kw
+        )
+    )
+    assert_frame_equal(got, expected)
+    # Without target_index the index is built next to the target.
+    assert (tmp_path / "genome.idx").exists() is not prebuilt_index
+
+
+def test_in_memory_accessibility_matches_the_directory(tmp_path, profiles):
+    acc_dir = tmp_path / "acc"
+    acc_dir.mkdir()
+    for chrom, frame in profiles.items():
+        frame.write_parquet(acc_dir / f"{chrom}.accessibility.parquet")
+
+    def run(**source):
+        return _collect(
+            compute_off_targets(
+                risearch_file=PREDICTIONS,
+                gtf_file=EX / "annotation.gtf",
+                n_workers=2,
+                **source,
+            )
+        )
+
+    in_memory = run(accessibility=profiles)
+    assert (in_memory["opening_energy"] != 0).any(), "the profiles were not used"
+    assert_frame_equal(in_memory, run(accessibility_dir=acc_dir), rel_tol=1e-6)
+
+
+def test_genome_fold_matches_precomputed_profiles(profiles):
+    progress: list[dict] = []
+
+    def run(**source):
+        return _collect(
+            compute_off_targets(
+                risearch_file=PREDICTIONS,
+                gtf_file=EX / "annotation.gtf",
+                n_workers=2,
+                **source,
+            )
+        )
+
+    folded = run(
+        genome_file=GENOME,
+        accessibility_progress_callback=lambda **kw: progress.append(kw),
+    )
+    assert progress, "the fold reports its progress"
+    assert (folded["opening_energy"] != 0).any(), "the fold was not used"
+    assert_frame_equal(folded, run(accessibility=profiles), rel_tol=1e-6)
+
+
+@pytest.mark.parametrize("ending", ["success", "error", "closed early"])
+@pytest.mark.parametrize("source", ["accessibility", "genome_file"])
+def test_spills_are_removed(tmp_root, profiles, source, ending):
+    prefix = "sioff_acc_" if source == "accessibility" else "sioff_fold_"
+    given = (
+        {"accessibility": profiles}
+        if source == "accessibility"
+        else {"genome_file": GENOME}
+    )
+    during: list[str] = []
+
+    def on_split(n):
+        during.extend(_engine_dirs(tmp_root))
+        if ending == "error":
+            raise RuntimeError("stop")
+
+    gen = compute_off_targets(risearch_file=PREDICTIONS, on_split=on_split, **given)
+    if ending == "error":
+        with pytest.raises(RuntimeError, match="stop"):
+            list(gen)
+    elif ending == "closed early":
+        next(gen)
+        gen.close()
+    else:
+        assert len(list(gen)) == len(SIRNAS)
+    assert [n for n in during if n.startswith(prefix)], "no spill seen mid-run"
+    assert _engine_dirs(tmp_root) == []
