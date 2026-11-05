@@ -26,9 +26,12 @@ class RIsearchParser:
     """Parser for RIsearch2 prediction output files."""
 
     def load(self, path: Path) -> pl.DataFrame:
-        """Load RIsearch2 TSV output (or ``sioff search -o`` output) into a validated DataFrame."""
+        """Load RIsearch2 output, ``sioff search -o`` output or Parquet into a validated DataFrame."""
         _check_file(path)
-        if _has_search_header(path):
+        if path.suffix == ".parquet":
+            # Stored extras (e.g. raw_e_min) are dropped; E_min is passed in.
+            df = pl.read_parquet(path).select(RISEARCH_COLUMNS)
+        elif _has_search_header(path):
             df = pl.read_csv(path, separator="\t", infer_schema=False).select(
                 RISEARCH_COLUMNS
             )
