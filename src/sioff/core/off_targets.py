@@ -356,12 +356,19 @@ def _process_one_sirna(
     df = _apply_self_hyb_emin(df, self_hyb_emin)
     _t_intersect = time.perf_counter()
 
-    # Probabilities
+    # Probabilities. E_min is the file's raw_e_min (full-scan minimum), or the
+    # self-hybridisation value _apply_self_hyb_emin put there.
+    e_min = (
+        dict(df.group_by("sirna_id").agg(pl.col("raw_e_min").min()).iter_rows())
+        if "raw_e_min" in df.columns
+        else None
+    )
     df, meta = prob_service.calculate_probabilities_per_sirna(
         df,
         alpha_gamma_pairs=alpha_gamma_pairs,
         theta_values=theta_vals,
         on_target_map=on_target_map,
+        e_min=e_min,
         aggregate_only=_m._WORKER_SUMMARY_ONLY,
     )
     _t_prob = time.perf_counter()

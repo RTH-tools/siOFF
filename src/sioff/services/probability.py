@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Dict
+from typing import Mapping, Optional, Tuple, Dict
 
 import polars as pl
 from loguru import logger
@@ -40,6 +40,7 @@ class ProbabilityService:
         alpha_gamma_pairs: Optional[list[tuple[float, float]]] = None,
         theta_values: Optional[list[float]] = None,
         on_target_map: Optional[dict[str, str]] = None,
+        e_min: Optional[Mapping[str, float]] = None,
         precomputed_opening_energy: bool = False,
         aggregate_only: bool = False,
     ) -> Tuple[pl.DataFrame, Dict]:
@@ -54,6 +55,12 @@ class ProbabilityService:
 
         With an ``on_target_map`` the on-target rows are already in ``df`` and
         are tagged by ID match.
+
+        With ``e_min`` (``sirna_id -> E_min``) the clamp of every alpha/gamma
+        set is anchored on that value; a siRNA missing from it raises
+        ``ValueError``. Without it ``E_min`` is the minimum ``energy`` of the
+        siRNA's rows in ``df``. The metadata's ``n_on_target_rows`` counts each
+        siRNA's rows tagged on-target (0 when none).
 
         With ``precomputed_opening_energy`` the frame must already carry an
         ``opening_energy`` column (e.g. gathered chromosome-major by the
@@ -129,12 +136,17 @@ class ProbabilityService:
         else:
             df = df.with_columns(pl.lit(False).alias("is_on_target"))
 
-        # Use raw_e_min (from full genome scan) when available; fall back to
-        # post-intersection minimum. raw_e_min is set by the parser when loading
-        # per-siRNA directory files.
-        if "raw_e_min" in df.columns:
-            min_energies = df.group_by("sirna_id").agg(
-                pl.col("raw_e_min").min().alias("E_min")
+        if e_min is not None:
+            missing = sorted(str(sid) for sid in unique_sirnas if sid not in e_min)
+            if missing:
+                raise ValueError(f"No E_min given for siRNA(s): {', '.join(missing)}")
+            min_energies = pl.DataFrame(
+                {
+                    "sirna_id": unique_sirnas,
+                    "E_min": pl.Series([e_min[sid] for sid in unique_sirnas]).cast(
+                        df["energy"].dtype
+                    ),
+                }
             )
         else:
             min_energies = df.group_by("sirna_id").agg(
@@ -236,7 +248,14 @@ class ProbabilityService:
         if not aggregate_only:
             df = df.with_columns(all_weight_exprs)
 
-        agg_df = df.group_by("sirna_id").agg(z_aggs + on_aggs)
+        agg_df = df.group_by("sirna_id").agg(
+            z_aggs + on_aggs + [pl.col("is_on_target").sum().alias("_n_on")]
+        )
+        n_on_target_rows = {
+            row["sirna_id"]: int(row["_n_on"])
+            for row in agg_df.select("sirna_id", "_n_on").iter_rows(named=True)
+        }
+        agg_df = agg_df.drop("_n_on")
         z_df = agg_df.select(["sirna_id"] + z_col_names)
 
         on_target_weight_metadata = {}
@@ -259,6 +278,7 @@ class ProbabilityService:
             "z_per_sirna": z_stats_dict,
             "on_target_weights": on_target_weight_metadata,
             "on_target_count": len(on_target_weight_metadata),
+            "n_on_target_rows": n_on_target_rows,
         }
         if aggregate_only:
             return df.head(0), metadata
