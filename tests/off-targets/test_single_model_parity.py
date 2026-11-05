@@ -49,6 +49,7 @@ def test_per_sirna_model_matches_the_boltzmann_formula(build):
     p = w / w.sum()
 
     assert per["dG_total"].to_list() == pytest.approx(dg.to_list(), rel=1e-6)
-    assert per["P_off_target"].fill_null(0.0).to_list() == pytest.approx(
-        p.to_list(), rel=1e-6
-    )
+    assert per["P_off_target"].null_count() == 0
+    assert per["boltzmann_weight"].null_count() == 0
+    assert per["P_off_target"].to_list() == pytest.approx(p.to_list(), rel=1e-6)
+    assert per["boltzmann_weight"].to_list() == pytest.approx(w.to_list(), rel=1e-6)

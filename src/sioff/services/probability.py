@@ -102,6 +102,10 @@ class ProbabilityService:
 
         if "exp_value" not in df.columns:
             df = df.with_columns(pl.lit(1.0).alias("exp_value"))
+        else:
+            # A missing expression carries no weight (a null would turn the
+            # row's weight and probability into null).
+            df = df.with_columns(pl.col("exp_value").fill_null(0.0))
 
         use_fasta_mode = on_target_fasta_data is not None
         in_predictions_mode = (
