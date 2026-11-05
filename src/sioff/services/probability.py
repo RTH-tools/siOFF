@@ -43,134 +43,6 @@ class ProbabilityService:
         self._temperature = temperature
         self._RT = R * (temperature + 273.15)
 
-    def calculate_probabilities(
-        self,
-        df: pl.DataFrame,
-        on_target_path: Optional[Path] = None,
-        query_path: Optional[Path] = None,
-        on_target_expression: float = 1000.0,
-        on_target_accessibility_path: Optional[Path] = None,
-        on_target_risearch_path: Optional[Path] = None,
-        precomputed_opening_energy: bool = False,
-    ) -> Tuple[pl.DataFrame, Dict]:
-        """Z = Σ(Expr_i × exp(-dG_total_i / RT)); P(t) = W_t / Z.
-
-        With ``precomputed_opening_energy`` the frame must already carry an
-        ``opening_energy`` column and no accessibility lookup is performed.
-        """
-        if "energy" not in df.columns:
-            logger.warning("No 'energy' column found. Cannot calculate probabilities.")
-            return df, {}
-
-        if precomputed_opening_energy:
-            _require_opening_energy(df)
-        elif self.accessibility_service:
-            df = self._annotate_opening_energy(df)
-
-        if "opening_energy" in df.columns:
-            expr_dG_total = pl.col("energy") + pl.col("opening_energy")
-        else:
-            expr_dG_total = pl.col("energy")
-
-        df = df.with_columns(expr_dG_total.alias("dG_total"))
-
-        if "exp_value" in df.columns:
-            expr_val = pl.col("exp_value").fill_null(0.0)
-        else:
-            logger.info(
-                "No expression value found; assuming uniform expression=1.0 for Off-Targets"
-            )
-            expr_val = pl.lit(1.0)
-
-        df = df.with_columns(
-            (expr_val * ((-pl.col("dG_total") / self._RT).exp())).alias(
-                "boltzmann_weight"
-            )
-        )
-        z_partial = cast(float, df["boltzmann_weight"].sum())
-
-        w_on = 0.0
-        dG_total_on = 0.0
-        dG_open_on = 0.0
-        dG_hyb_on = 0.0
-
-        if on_target_path and query_path:
-            logger.info("Calculating On-Target weight...")
-            dG_hyb_on, dG_open_on = self._calculate_on_target_components(
-                on_target_path,
-                query_path,
-                on_target_accessibility_path,
-                on_target_risearch_path,
-            )
-            dG_total_on = dG_hyb_on + dG_open_on
-            w_on = on_target_expression * cast(float, np.exp(-dG_total_on / self._RT))
-            logger.info(f"On-Target dG_total={dG_total_on:.2f}, Weight={w_on:.2e}")
-
-        z_total = z_partial + w_on
-        logger.info(
-            f"Partition Function Z = {z_total:.2e} (Off-Target={z_partial:.2e}, On-Target={w_on:.2e})"
-        )
-
-        if z_total > 0:
-            df = df.with_columns(
-                (pl.col("boltzmann_weight") / z_total).alias("P_off_target")
-            )
-        else:
-            df = df.with_columns(pl.lit(0.0).alias("P_off_target"))
-
-        if on_target_path and query_path:
-            if on_target_risearch_path:
-                _hyb, _start, _end, _strand = self._parse_risearch_file(
-                    on_target_risearch_path
-                )
-            else:
-                _hyb, _start, _end, _strand = self._run_risearch_binary(
-                    query_path, on_target_path
-                )
-
-            p_on_val = w_on / z_total if z_total > 0 else 0.0
-
-            row_dict = {
-                "chrom": "onTarget",
-                "start": _start,
-                "end": _end,
-                "strand": _strand,
-                "transcript_id": "onTarget",
-                "gene_id": "onTarget",
-                "energy": _hyb,
-                "opening_energy": dG_open_on,
-                "dG_total": dG_total_on,
-                "exp_value": on_target_expression,
-                "P_off_target": p_on_val,
-            }
-
-            ont_df = pl.DataFrame([row_dict])
-
-            for col in df.columns:
-                if col not in ont_df.columns:
-                    ont_df = ont_df.with_columns(
-                        pl.lit(None, dtype=df.schema[col]).alias(col)
-                    )
-                else:
-                    target_dtype = df.schema[col]
-                    if target_dtype != ont_df.schema[col]:
-                        ont_df = ont_df.with_columns(pl.col(col).cast(target_dtype))
-
-            df = pl.concat([df, ont_df.select(df.columns)], how="vertical")
-
-        metadata = {
-            "z_total": z_total,
-            "z_off_target": z_partial,
-            "w_on_target": w_on,
-            "dG_on_target": dG_total_on,
-            "has_on_target": bool(on_target_path and query_path),
-        }
-
-        if on_target_path and query_path:
-            metadata["p_on_target"] = w_on / z_total if z_total > 0 else 0.0
-
-        return df, metadata
-
     def calculate_probabilities_per_sirna(
         self,
         df: pl.DataFrame,
@@ -203,23 +75,11 @@ class ProbabilityService:
             return df, {}
 
         if "sirna_id" not in df.columns:
-            logger.info("No sirna_id column; falling back to single partition function")
-            return self.calculate_probabilities(
-                df, precomputed_opening_energy=precomputed_opening_energy
+            raise ValueError(
+                "calculate_probabilities_per_sirna needs a 'sirna_id' column"
             )
 
         unique_sirnas = df["sirna_id"].unique()
-        if (
-            len(unique_sirnas) == 1
-            and not alpha_gamma_pairs
-            and not theta_values
-            and not on_target_map
-            and not on_target_fasta_data
-        ):
-            logger.info("Single siRNA detected; using standard calculation")
-            return self.calculate_probabilities(
-                df, precomputed_opening_energy=precomputed_opening_energy
-            )
 
         logger.info(
             f"Processing {len(unique_sirnas)} siRNAs with per-siRNA partition functions"

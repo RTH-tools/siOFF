@@ -914,10 +914,6 @@ def compute_off_targets_single(
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
     theta_vals = _parse_theta(theta)
 
-    unique_sirnas = df["sirna_id"].unique() if "sirna_id" in df.columns else []
-    has_custom_params = len(alpha_gamma_pairs) > 1 or len(theta_vals) > 0
-    is_multi_sirna = len(unique_sirnas) > 1 or has_custom_params
-
     on_target_map: dict[str, str] = {}
     if on_target_ids_file is not None:
         try:
@@ -934,31 +930,15 @@ def compute_off_targets_single(
             raise ValueError(f"Error parsing on-target mapping file: {e}") from e
 
     def _finish(prob_service: ProbabilityService, frame: pl.DataFrame):
-        if is_multi_sirna:
-            with profiler.stage(
-                "Probabilities (per-siRNA)", rows_in=frame.height
-            ) as _s:
-                frame, meta = prob_service.calculate_probabilities_per_sirna(
-                    frame,
-                    alpha_gamma_pairs=alpha_gamma_pairs,
-                    theta_values=theta_vals,
-                    on_target_map=on_target_map if on_target_map else None,
-                    on_target_expression=on_target_expression,
-                )
-                _s.rows_out = frame.height
-        else:
-            with profiler.stage(
-                "Probabilities (single-siRNA)", rows_in=frame.height
-            ) as _s:
-                frame, meta = prob_service.calculate_probabilities(
-                    frame,
-                    on_target_path=on_target_file,
-                    query_path=query_file,
-                    on_target_expression=on_target_expression,
-                    on_target_accessibility_path=on_target_accessibility,
-                    on_target_risearch_path=on_target_risearch_file,
-                )
-                _s.rows_out = frame.height
+        with profiler.stage("Probabilities (per-siRNA)", rows_in=frame.height) as _s:
+            frame, meta = prob_service.calculate_probabilities_per_sirna(
+                frame,
+                alpha_gamma_pairs=alpha_gamma_pairs,
+                theta_values=theta_vals,
+                on_target_map=on_target_map if on_target_map else None,
+                on_target_expression=on_target_expression,
+            )
+            _s.rows_out = frame.height
         logger.info(f"After probabilities: {frame.height:,} rows")
 
         # Legacy report must be rendered here (reuses prob_service's accessibility
