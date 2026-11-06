@@ -1547,6 +1547,37 @@ def _input_files(path: Path) -> list[Path]:
     return [path]
 
 
+def _check_profile_names(profiles: Mapping[str, pl.DataFrame]) -> None:
+    """Refuse in-memory profiles that cannot be spilled one file per chromosome.
+
+    Each key becomes ``<key>.accessibility.parquet`` in the spill directory,
+    so a key that is not a plain file name would fail there, or be written
+    outside it and never packed.
+
+    Raises
+    ------
+    ValueError
+        When there are no profiles, or when a key is empty, ``.`` or ``..``,
+        or holds ``/``, the path separator or a NUL; the message names every
+        such key.
+    """
+    if not profiles:
+        raise ValueError(
+            "accessibility holds no profiles; pass one per chromosome, as "
+            "sioff.accessibility returns"
+        )
+    bad = [
+        chrom
+        for chrom in profiles
+        if chrom in ("", ".", "..") or any(c in chrom for c in ("/", os.sep, "\0"))
+    ]
+    if bad:
+        raise ValueError(
+            "accessibility keys name the chromosomes and become file names; "
+            f"these cannot: {', '.join(map(repr, bad))}"
+        )
+
+
 def _search_in_process(
     sirna_fasta: Path,
     target_fasta: Path,
@@ -1761,8 +1792,10 @@ def compute_off_targets(
         In-memory accessibility profiles, ``dict[chrom -> DataFrame]`` with
         the columns ``position, strand, u1..uN`` and both strands stacked, as
         returned by [`sioff.accessibility`][sioff.accessibility]. They are
-        written to a temporary directory and packed there. Mutually
-        exclusive with ``accessibility_dir``.
+        written to a temporary directory, one ``<chrom>.accessibility.parquet``
+        per key, and packed there, so a key cannot be empty, ``.`` or ``..``,
+        or hold ``/``, the path separator or a NUL. Mutually exclusive with
+        ``accessibility_dir``.
     accessibility_dir : pathlib.Path, optional
         The npy cache from ``sioff accessibility`` or per-chromosome Parquet
         files (CLI ``-a/--accessibility-dir``). For Parquet the cache is built
@@ -1858,7 +1891,8 @@ def compute_off_targets(
         When both ``predictions`` and ``risearch_file``, or both
         ``accessibility`` and ``accessibility_dir``, are given; when
         ``sirna_fasta`` is given with ``risearch_file`` or ``predictions``;
-        when no prediction source is given; when ``sirna_fasta`` is given
+        when ``accessibility`` is empty or has a key that cannot be a file
+        name; when no prediction source is given; when ``sirna_fasta`` is given
         without ``target_fasta``; when ``predictions`` lacks a required
         column; when ``sirna_fasta`` holds a duplicate ID; when the siRNA
         table cannot be read; when a ``sirna_id`` occurs in two input files;
@@ -1903,6 +1937,8 @@ def compute_off_targets(
             "accessibility and accessibility_dir are two sources for the same "
             "input; pass one of them"
         )
+    if accessibility is not None:
+        _check_profile_names(accessibility)
     input_files: list[Path] = []
     frame: Optional[pl.DataFrame] = None
     if risearch_file is not None:
