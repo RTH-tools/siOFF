@@ -57,6 +57,22 @@ def _table_path(output_file: Path, output_format: str) -> Path:
     return output_file.with_name(output_file.name + ext)
 
 
+def _input_at(
+    path: Path, inputs: dict[str, Optional[Path]]
+) -> Optional[tuple[str, Path]]:
+    """The input file ``path`` is, if any: ``(its flag, the input as given)``.
+
+    ``samefile`` catches symlinks and other spellings of one file. Only files
+    count: an ``-r`` folder may hold the output.
+    """
+    if not path.exists():
+        return None
+    for name, given in inputs.items():
+        if given is not None and given.is_file() and path.samefile(given):
+            return _FLAG_NAMES.get(name, name), given
+    return None
+
+
 def _as_path(value: Optional[Path | str]) -> Optional[Path]:
     """Coerce a str (e.g. from the Python API) to Path; pass Path/None through."""
     return Path(value) if isinstance(value, str) else value
@@ -376,6 +392,26 @@ def run(
                 console.print(
                     f"[bold red]Error:[/bold red] {escape(str(out_path))} exists "
                     "and is not a regular file; pass another -o/--output"
+                )
+                raise typer.Exit(code=1)
+            clobbered = _input_at(
+                out_path,
+                {
+                    "risearch_file": risearch_file,
+                    "sirna_table": sirna_table,
+                    "sirna_fasta": sirna_fasta,
+                    "gtf_file": gtf_file,
+                    "genome_file": genome_file,
+                    "target_fasta": target_fasta,
+                    "target_index": target_index,
+                    "-z/--matrix": Path(matrix),
+                },
+            )
+            if clobbered is not None:
+                flag, given = clobbered
+                console.print(
+                    f"[bold red]Error:[/bold red] -o/--output resolves to the {flag} "
+                    f"input {escape(str(given))}; choose another -o/--output"
                 )
                 raise typer.Exit(code=1)
             out_path.parent.mkdir(parents=True, exist_ok=True)
