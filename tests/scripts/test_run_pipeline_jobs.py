@@ -136,6 +136,14 @@ class TestBuildOffTargets:
         with pytest.raises(ValueError, match="'legacy_format' was removed"):
             rp._build_off_targets({"legacy_format": True}, tmp_path)
 
+    def test_sirna_table_is_forwarded_and_on_target_ids_was_renamed(self, tmp_path):
+        cmd = rp._build_off_targets({"sirna_table": "t.tsv"}, tmp_path)
+        assert _flag(cmd, "--sirna-table") == str(tmp_path / "t.tsv")
+        with pytest.raises(
+            ValueError, match="'on_target_ids' was removed.*sirna_table"
+        ):
+            rp._build_off_targets({"on_target_ids": "m.tsv"}, tmp_path)
+
     def test_boolean_flags_are_bare_and_opt_in(self, tmp_path):
         assert "--sense-only" not in rp._build_off_targets({}, tmp_path)
 

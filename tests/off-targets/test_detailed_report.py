@@ -16,6 +16,19 @@ EX = Path(__file__).parents[2] / "examples" / "data"
 SUFFIX = ":alpha=0.8,gamma=0.8"
 
 
+def _sirna_table(tmp_path: Path) -> Path:
+    """The example siRNAs, no on-targets: alpha/gamma needs their sequences."""
+    lines = (EX / "sirnas.fa").read_text().split()
+    table = tmp_path / "sirna_table.tsv"
+    table.write_text(
+        "sirna_id\ton_target_id\tsequence\n"
+        + "".join(
+            f"{lines[i][1:]}\t\t{lines[i + 1]}\n" for i in range(0, len(lines), 2)
+        )
+    )
+    return table
+
+
 def _run(form: str, tmp_path: Path, detailed_report: bool) -> pl.DataFrame:
     if form == "file":
         source = EX / "predictions.out"
@@ -23,17 +36,15 @@ def _run(form: str, tmp_path: Path, detailed_report: bool) -> pl.DataFrame:
         source = tmp_path / "d"
         source.mkdir()
         shutil.copy(EX / "predictions.out", source / "predictions.out")
-    result = sioff.off_targets(
+    return sioff.off_targets(
         risearch_file=source,
         gtf_file=EX / "annotation.gtf",
         accessibility_dir=EX / "accessibility",
+        sirna_table=_sirna_table(tmp_path),
         alpha="0.8",
         gamma="0.8",
         detailed_report=detailed_report,
     )
-    if isinstance(result, pl.DataFrame):
-        return result
-    return pl.concat(list(result), how="diagonal_relaxed")
 
 
 @pytest.mark.parametrize("form", ["file", "directory"])

@@ -181,11 +181,15 @@ _REMOVED_OFF_TARGETS_KEYS = {
         "the .summary files carry the partition-function header; "
         "--detailed-report keeps the per-interaction weights"
     ),
-    "on_target": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
-    "query": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --sirna-table",
+    "query": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_expression": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_accessibility": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_ids": (
+        "renamed to sirna_table; the table needs a header with sirna_id, "
+        "on_target_id, sequence"
+    ),
 }
 
 
@@ -207,7 +211,7 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("accessibility_cache_dir", "--accessibility-cache-dir"),
         ("output", "--output"),
         ("fasta", "--fasta"),
-        ("on_target_ids", "--on-target-ids"),
+        ("sirna_table", "--sirna-table"),
     ]:
         val = _resolve(cfg.get(key), base)
         if val is not None:

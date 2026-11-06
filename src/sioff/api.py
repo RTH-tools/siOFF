@@ -1,8 +1,8 @@
 """Public Python API for siOFF.
 
 Importable functions that return results **in memory** and raise ordinary Python
-exceptions: no files are written, nothing is printed, and no ``typer.Exit`` /
-Click exceptions leak out. These wrap the pure `sioff.core` layer; the
+exceptions: no output files are written, nothing is printed, and no
+``typer.Exit`` / Click exceptions leak out. These wrap the pure `sioff.core` layer; the
 ``sioff`` CLI is a separate, file-writing wrapper over the same core.
 
 The four public functions are [`off_targets`][sioff.off_targets], [`accessibility`][sioff.accessibility],
@@ -15,23 +15,24 @@ Notes
 on-disk artifact, so the path (not in-memory data) is the natural result.
 
 ``sioff.index`` / ``sioff.search`` require the external ``risearch`` package,
-the same dependency the CLI's index/search commands need. ``off_targets`` on
-pre-computed predictions and ``accessibility`` never import it.
+the same dependency the CLI's index/search commands need. ``off_targets``
+imports it only for the in-process search and for the perfect-match energies
+an alpha/gamma pair other than (1, 1) needs; ``accessibility`` never does.
 
 Examples
 --------
 >>> import sioff
 >>> import polars as pl
 
-Single predictions file -> one DataFrame.
+A predictions file, or a directory of them -> one DataFrame.
 
 >>> df = sioff.off_targets(risearch_file="predictions.tsv", gtf_file="ann.gtf")
+>>> df = sioff.off_targets(risearch_file="preds_dir/", gtf_file="ann.gtf")
 
-A *directory* of per-siRNA files -> a generator of per-siRNA DataFrames.
+The same, one DataFrame per siRNA as each is scored.
 
->>> for sirna_df in sioff.off_targets(risearch_file="preds_dir/"):
+>>> for sirna_df in sioff.off_targets(risearch_file="preds_dir/", stream=True):
 ...     ...
->>> everything = pl.concat(list(sioff.off_targets(risearch_file="preds_dir/")))
 
 RIsearch index / search, and straight into the off-target analysis with no
 intermediate file.
@@ -47,7 +48,7 @@ Accessibility profiles in memory, keyed by chromosome.
 """
 
 from pathlib import Path
-from typing import Iterator, Mapping, Optional, Union, cast
+from typing import Generator, Iterator, Mapping, Optional, Union, cast
 
 import polars as pl
 
@@ -93,7 +94,7 @@ def off_targets(
     unpaired_prob: int = 30,
     temperature: float = 37.0,
     matrix: Union[str, Path] = "t04",
-    on_target_ids_file: Optional[Union[str, Path]] = None,
+    sirna_table: Optional[Union[str, Path]] = None,
     alpha: str = "1.0",
     gamma: str = "1.0",
     theta: str = "",
@@ -101,6 +102,7 @@ def off_targets(
     predictions_type: str = "gw",
     n_workers: int = 1,
     detailed_report: bool = False,
+    stream: bool = False,
 ) -> Union[pl.DataFrame, Iterator[pl.DataFrame]]:
     """Analyse siRNA off-target predictions, returning results in memory.
 
@@ -112,34 +114,45 @@ def off_targets(
 
     Predictions come from exactly one of:
 
+    - ``risearch_file``: a predictions file, or a directory of them. Each file
+      may hold one siRNA or many.
     - ``predictions``: an in-memory `polars.DataFrame` in the
       [`search`][sioff.search] schema (``sirna_id, chrom, start, end, strand, energy``),
-      typically the value returned by [`search`][sioff.search]; returns one DataFrame.
-    - ``risearch_file``: a RIsearch2 output file; returns one DataFrame. A
-      *directory* of per-siRNA files instead returns a **generator** yielding
-      one DataFrame per siRNA. The worker pool and a temporary Arrow IPC copy
-      of the transcriptome live for the lifetime of the generator, so consume
-      it fully, or wrap it in `contextlib.closing`, for prompt cleanup.
+      typically the value returned by [`search`][sioff.search].
     - ``sirna_fasta`` + ``target_fasta``: run RIsearch in-process first
       (requires the ``risearch`` package).
 
+    Every form takes the same path: the predictions are split into one part
+    per siRNA, and each siRNA is scored on its own, in ``n_workers``
+    processes. The result is one DataFrame, or with ``stream=True`` one
+    DataFrame per siRNA as each is scored.
+
+    **The siRNA table** (``sirna_table``) gives each siRNA its on-target and
+    its guide sequence. **E_min**, the reference energy of the alpha/gamma
+    clamp, is the lower of the siRNA's perfect-match energy (its sequence
+    searched against itself with ``matrix``) and its strongest hit left after
+    ``sense_only`` and the intersection. Every alpha/gamma pair other than
+    (1, 1) needs it, so every siRNA with predictions then needs a table row.
+
     Accessibility profiles come from at most one of ``accessibility`` (the
     ``dict[chrom -> DataFrame]`` returned by [`accessibility`][sioff.accessibility]),
-    ``accessibility_dir`` (per-chromosome Parquet files) or ``genome_file``
-    (fold on the fly). In-memory ``accessibility`` is for the single-frame
-    forms; the directory form streams through worker processes that read
-    profiles from disk, so it takes ``accessibility_dir`` only. Without any
-    profile source the probabilities are computed from hybridisation energy
-    alone.
+    ``accessibility_dir`` (the packed cache or per-chromosome Parquet files)
+    or ``genome_file`` (fold during the call). Without any profile source the
+    probabilities are computed from hybridisation energy alone.
 
-    Writes no files and prints nothing.
+    Writes no output files and prints nothing. The in-process search builds
+    the index ``<target>.idx`` next to ``target_fasta`` when ``target_index``
+    is omitted, and ``accessibility_dir`` gets its packed cache; temporary
+    files are removed before the call returns (with ``stream=True``, when the
+    stream is exhausted or closed).
 
     Parameters
     ----------
     risearch_file : str or pathlib.Path, optional
-        Pre-computed RIsearch2 output: a single file, or a directory of
-        per-siRNA files. A file returns one DataFrame; a directory switches to
-        the streaming per-siRNA generator described above. CLI:
+        Pre-computed predictions: a file, or a directory of files. Read are
+        RIsearch2 output (plain or ``.gz``), ``sioff search -o`` TSV and
+        Parquet; from a directory every ``*.gz``, ``*.tsv``, ``*.out`` and
+        ``*.parquet``. A ``sirna_id`` found in two files is an error. CLI:
         ``-r/--risearch-file``.
     predictions : polars.DataFrame, optional
         In-memory predictions in the [`search`][sioff.search] schema. The columns
@@ -149,25 +162,28 @@ def off_targets(
         through Parquet or your own manipulation still works. Mutually
         exclusive with ``risearch_file``. No CLI equivalent.
     sirna_fasta : str or pathlib.Path, optional
-        siRNA FASTA with one or more sequences and unique IDs. Without
-        ``risearch_file`` / ``predictions`` it triggers an in-process RIsearch
-        run against ``target_fasta``. With a directory ``risearch_file`` it is
-        instead used to compute each siRNA's self-hybridisation ``E_min`` for
-        the alpha/gamma clamp. CLI: ``-s/--sirna-fasta``.
+        siRNA FASTA with one or more sequences and unique IDs, searched
+        in-process against ``target_fasta``. It is only the search query: it
+        cannot be combined with ``risearch_file`` or ``predictions``, and the
+        perfect-match energies come from ``sirna_table``. CLI:
+        ``-s/--sirna-fasta``.
     target_fasta : str or pathlib.Path, optional
         Target FASTA (genome or transcriptome) for the in-process RIsearch
-        run; required together with ``sirna_fasta``. CLI: ``--target-fasta``
-        (alias ``--genome``).
+        run; required together with ``sirna_fasta`` and refused with
+        ``risearch_file`` or ``predictions``. CLI: ``--target-fasta`` (alias
+        ``--genome``).
     target_index : str or pathlib.Path, optional
         Pre-built RIsearch index of ``target_fasta``, to skip indexing on
-        repeated runs. When omitted the index is built (or reused) next to
-        ``target_fasta`` with an ``.idx`` suffix. CLI: ``-idx/--target-index``.
+        repeated runs; refused with ``risearch_file`` or ``predictions``. When
+        omitted the index is built (or reused) next to ``target_fasta`` with an
+        ``.idx`` suffix. CLI: ``-idx/--target-index``.
     gtf_file : str or pathlib.Path, optional
         Transcriptome annotation (GTF or GFF3). Predictions are
         intersected with its features, which adds ``transcript_id``,
-        ``gene_id`` and the expression column ``exp_value``. Without it no
-        intersection is performed and every prediction is kept with unit
-        expression. CLI: ``-t/--transcriptome``.
+        ``gene_id`` and the expression column ``exp_value``; features with
+        expression <= 0 are dropped first. Without it no intersection is
+        performed and every prediction is kept with unit expression. CLI:
+        ``-t/--transcriptome``.
     feature_type : str, default "exon"
         Feature type to select from a GTF/GFF3 annotation. CLI: ``--feature``.
     expression_metric : str, default "RPKM"
@@ -180,50 +196,57 @@ def off_targets(
     accessibility : dict[str, polars.DataFrame], optional
         In-memory accessibility profiles keyed by chromosome, each frame with
         columns ``position, strand, u1..uN`` and both strands stacked, as
-        returned by [`accessibility`][sioff.accessibility]. Accepted by the single-frame forms
-        only; mutually exclusive with ``accessibility_dir``. No CLI equivalent.
+        returned by [`accessibility`][sioff.accessibility]. They are written to a
+        temporary directory and packed into the same cache
+        ``accessibility_dir`` uses, so the opening energies match that path.
+        Each key becomes a file name, so it cannot be empty, ``.`` or ``..``,
+        or hold ``/``. Mutually exclusive with ``accessibility_dir``. No CLI
+        equivalent.
     accessibility_dir : str or pathlib.Path, optional
         The packed npy cache from ``sioff accessibility`` or per-chromosome
         Parquet files. Parquet is packed into the cache in
-        ``accessibility_cache_dir`` before scoring starts, in both forms, and
-        rebuilt when the Parquet changes. The only accessibility
-        source the directory form accepts. CLI: ``-a/--accessibility-dir``.
+        ``accessibility_cache_dir`` before scoring starts, and rebuilt when
+        the Parquet changes. CLI: ``-a/--accessibility-dir``.
     accessibility_cache_dir : str or pathlib.Path, optional
-        Where the cache is read from and built; default ``accessibility_dir``.
-        Created if absent; use it when ``accessibility_dir`` is read-only or
-        to stage the cache on local disk. It may also hold a complete cache
-        without any Parquet. CLI: ``--accessibility-cache-dir``.
+        Where the cache of ``accessibility_dir`` is read from and built;
+        default ``accessibility_dir``. Created if absent; use it when
+        ``accessibility_dir`` is read-only or to stage the cache on local
+        disk. It may also hold a complete cache without any Parquet. Refused
+        with ``accessibility`` or ``genome_file``. CLI:
+        ``--accessibility-cache-dir``.
     genome_file : str or pathlib.Path, optional
-        Genome FASTA to fold on the fly; the profiles go to a temporary
-        directory that is removed when the call returns. Ignored when
-        ``accessibility`` or ``accessibility_dir`` is given, and not available
-        for the directory form. CLI: ``-f/--fasta``.
+        Genome FASTA to fold during the call; the profiles go to a temporary
+        directory that is removed when the run ends. Refused with
+        ``accessibility`` or ``accessibility_dir``. CLI: ``-f/--fasta``.
     window_size : int, default 80
-        Local-folding window size ``W`` for on-the-fly accessibility
-        (``genome_file`` only). CLI: ``-W/--window``.
+        Local-folding window size ``W`` for ``genome_file``. CLI:
+        ``-W/--window``.
     max_span : int, default 40
-        Maximum base-pair span ``L`` for on-the-fly accessibility. CLI:
+        Maximum base-pair span ``L`` for ``genome_file``. CLI:
         ``-L/--span``.
     unpaired_prob : int, default 30
         Length ``u`` of the unpaired stretch for which opening energies are
         computed (profile columns ``u1..u{unpaired_prob}``). CLI:
         ``-u/--unpaired``.
     temperature : float, default 37.0
-        Folding temperature in degrees Celsius. Affects both on-the-fly
-        accessibility and the ``RT`` term of the partition function. CLI:
-        ``-T/--temperature``.
+        Folding temperature in degrees Celsius. Affects both the
+        ``genome_file`` fold and the ``RT`` term of the partition function.
+        CLI: ``-T/--temperature``.
     matrix : str or pathlib.Path, default "t04"
         Energy parameter set for the in-process search and for the
-        self-hybridisation E_min of ``sirna_fasta``: a bundled id or the path of
-        a DSM TSV table. Use the set the predictions were searched with; E_min
-        is the reference energy of the alpha/gamma clamp. CLI: ``-z/--matrix``.
-    on_target_ids_file : str or pathlib.Path, optional
-        Two-column tab-separated file mapping ``sirna_id`` to the ID of its
-        on-target transcript or gene (multi-siRNA form). Predictions of a siRNA
-        that fall on its mapped ID are tagged ``is_on_target`` and contribute
-        the on-target weight instead of counting as off-targets. Needs
-        ``gtf_file`` so that ``transcript_id`` exists. CLI:
-        ``-oi/--on-target-ids``.
+        perfect-match energies of E_min: a bundled id or the path of a DSM
+        TSV table. Use the set the predictions were searched with; E_min is
+        the reference energy of the alpha/gamma clamp. CLI: ``-z/--matrix``.
+    sirna_table : str or pathlib.Path, optional
+        Tab-separated siRNA table with a header row: ``sirna_id``,
+        ``on_target_id`` (the transcript or gene the siRNA is designed
+        against; may be empty) and ``sequence`` (the guide strand, ACGU or
+        ACGT). Predictions of a siRNA that fall on its on-target are tagged
+        ``is_on_target`` and contribute the on-target weight instead of
+        counting as off-targets; this needs ``gtf_file``, so that
+        ``transcript_id`` exists. The sequence gives the perfect-match energy
+        of E_min. Required when an alpha/gamma pair other than (1, 1) is
+        computed; optional otherwise. CLI: ``--sirna-table``.
     alpha : str, default "1.0"
         Alpha clamping parameter(s) as semicolon-separated floats, e.g.
         ``"0.8;1.0"``. For every ``(alpha, gamma)`` pair with
@@ -248,46 +271,57 @@ def off_targets(
         ``chrom`` holds a transcript ID that is joined on ``transcript_id``.
         CLI: ``--type``.
     n_workers : int, default 1
-        Parallelism: the number of threads for the intersection in the
-        single-frame forms, and the number of spawned worker processes (one
-        siRNA file at a time each) for the directory form. CLI:
-        ``-j/--workers``, whose default is the CPU count.
+        Worker processes that split the inputs and score the siRNAs, one
+        siRNA per task, for every input form. A pool is started only when
+        more than one task can run at once. CLI: ``-j/--workers``, whose
+        default is the CPU count.
     detailed_report : bool, default False
         Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min`` columns
         for every interaction in the output; by default they are dropped.
         CLI: ``--detailed-report``.
+    stream : bool, default False
+        Return a generator of one DataFrame per siRNA, in the order they are
+        scored, instead of one DataFrame. The worker pool and the temporary
+        files live as long as the generator: consume it fully, or close it
+        (``contextlib.closing``), for prompt cleanup. No CLI equivalent; the
+        CLI always streams to its output file.
 
     Returns
     -------
     polars.DataFrame or Iterator[polars.DataFrame]
-        One DataFrame for ``predictions``, a single ``risearch_file`` or
-        ``sirna_fasta``; for a directory ``risearch_file``, a generator that
-        yields one DataFrame per siRNA. Each row is one prediction with the
-        input columns ``sirna_id, chrom, start, end, strand, energy``; the
-        annotation columns ``transcript_id, gene_id, exp_value`` when
-        ``gtf_file`` is given; ``opening_energy`` (the accessibility penalty,
-        kcal/mol) when a profile source is given; ``dG_total``
-        (``energy + opening_energy``); ``P_off_target`` (baseline
-        alpha=gamma=theta=1); and one ``P_off_target:alpha=X,gamma=Y`` or
-        ``P_off_target:theta=T`` column per extra parameter value. Multi-siRNA
-        and swept runs also carry ``is_on_target`` and the per-parameter
-        ``dG_total:...`` columns. With ``detailed_report`` every form also
-        keeps the ``E_min``, ``boltzmann_weight*`` and ``Z_sirna*``
-        intermediates.
+        One DataFrame holding every siRNA's rows (empty when nothing was
+        scored), or with ``stream=True`` a generator yielding one DataFrame
+        per siRNA. Each row is one prediction with the input columns
+        ``sirna_id, chrom, start, end, strand, energy``; the annotation
+        columns ``trans_start, trans_end, gene_id, transcript_id`` when
+        ``gtf_file`` is given; ``exp_value`` (1.0 without ``gtf_file``);
+        ``opening_energy`` (the accessibility penalty, kcal/mol; 0.0 without
+        a profile source); ``dG_total`` (``energy + opening_energy``);
+        ``is_on_target``; ``P_off_target`` (baseline alpha=gamma=theta=1);
+        and ``energy``, ``dG_total`` and ``P_off_target`` again with a
+        ``:alpha=X,gamma=Y`` or ``:theta=T`` suffix per extra parameter
+        value. With ``detailed_report`` the ``E_min``, ``boltzmann_weight*``
+        and ``Z_sirna*`` intermediates are kept too.
 
     Raises
     ------
     ValueError
-        When no predictions source is given; when ``predictions`` is combined
-        with ``risearch_file``; when ``accessibility`` is combined with
-        ``accessibility_dir`` or with a directory of predictions; when
-        ``sirna_fasta`` is given without ``target_fasta``; when ``predictions``
-        lacks one of its required columns; when ``sirna_fasta`` contains
-        duplicate IDs; or when ``on_target_ids_file`` cannot be parsed.
+        When no predictions source is given; when an argument would go
+        unused: ``predictions`` with ``risearch_file``; ``sirna_fasta``,
+        ``target_fasta`` or ``target_index`` with ``risearch_file`` or
+        ``predictions``; ``accessibility`` with ``accessibility_dir``;
+        ``genome_file`` with ``accessibility`` or ``accessibility_dir``;
+        ``accessibility_cache_dir`` with ``accessibility`` or ``genome_file``.
+        Also when ``sirna_fasta`` is given without ``target_fasta``; when
+        ``predictions`` lacks one of its required columns; when
+        ``sirna_fasta`` contains duplicate IDs; when ``sirna_table`` cannot
+        be read; when a ``sirna_id`` occurs in two input files; and when an
+        alpha/gamma pair other than (1, 1) is computed and a siRNA with
+        predictions has no row in ``sirna_table`` (or there is no table).
     FileNotFoundError
-        When ``risearch_file``, ``gtf_file``, ``genome_file``, ``sirna_fasta``
-        or ``target_fasta`` does not exist, or a directory ``risearch_file``
-        contains no prediction files.
+        When ``risearch_file``, ``gtf_file``, ``genome_file``, ``sirna_fasta``,
+        ``target_fasta`` or ``target_index`` does not exist, or a directory
+        ``risearch_file`` contains no prediction files.
     RIsearchError
         `sioff.services.risearch_service.RIsearchError`, when the
         in-process RIsearch run (``sirna_fasta`` form) fails, including when the
@@ -297,6 +331,10 @@ def off_targets(
         ``genome_file`` fails, an accessibility profile is missing or
         malformed, ``accessibility_dir`` holds no profile, or the cache
         cannot be written.
+    WorkerFailureError
+        `sioff.core.off_targets.WorkerFailureError`, when an input file
+        could not be split or a siRNA could not be scored; with
+        ``stream=True`` it is raised after the last siRNA that succeeded.
 
     See Also
     --------
@@ -305,14 +343,15 @@ def off_targets(
 
     Examples
     --------
-    Single predictions file with annotation, pre-computed accessibility and an
-    alpha sweep:
+    A predictions file with annotation, pre-computed accessibility, a siRNA
+    table and an alpha sweep:
 
     >>> import sioff
     >>> df = sioff.off_targets(
     ...     risearch_file="predictions.tsv",
     ...     gtf_file="annotation.gtf",
     ...     accessibility_dir="accessibility/",
+    ...     sirna_table="sirna_table.tsv",
     ...     alpha="0.8;1.0",
     ...     gamma="1.0",
     ... )
@@ -321,47 +360,14 @@ def off_targets(
     A directory of per-siRNA files, consumed as a stream and torn down promptly:
 
     >>> import contextlib
-    >>> gen = sioff.off_targets(risearch_file="predictions/", n_workers=8)
+    >>> gen = sioff.off_targets(risearch_file="predictions/", n_workers=8, stream=True)
     >>> with contextlib.closing(gen) as frames:
     ...     for frame in frames:
     ...         print(frame["sirna_id"][0], frame.height)
     """
-    rf = _p(risearch_file)
-
-    if rf is not None and rf.is_dir():
-        if accessibility is not None:
-            raise ValueError(
-                "a directory of predictions cannot take in-memory accessibility "
-                "profiles; write them to Parquet and pass accessibility_dir"
-            )
-        core_gen = _off_targets.compute_off_targets_directory(
-            input_dir=rf,
-            sirna_fasta=_p(sirna_fasta),
-            gtf_file=_p(gtf_file),
-            feature_type=feature_type,
-            expression_metric=expression_metric,
-            transcriptome_format=transcriptome_format,
-            accessibility_dir=_p(accessibility_dir),
-            accessibility_cache_dir=_p(accessibility_cache_dir),
-            temperature=temperature,
-            matrix=matrix,
-            on_target_ids_file=_p(on_target_ids_file),
-            alpha=alpha,
-            gamma=gamma,
-            theta=theta,
-            sense_only=sense_only,
-            predictions_type=predictions_type,
-            n_workers=n_workers,
-            detailed_report=detailed_report,
-        )
-        # Yield bare per-siRNA DataFrames (the core yields (df, meta) tuples).
-        # Closing this generator propagates GeneratorExit to core_gen, tearing
-        # down its worker pool + temp-IPC dir.
-        return (frame for frame, _meta in core_gen)
-
-    df, _meta = _off_targets.compute_off_targets_single(
+    core_gen = _off_targets.compute_off_targets(
         predictions=predictions,
-        risearch_file=rf,
+        risearch_file=_p(risearch_file),
         sirna_fasta=_p(sirna_fasta),
         target_fasta=_p(target_fasta),
         target_index=_p(target_index),
@@ -378,7 +384,7 @@ def off_targets(
         unpaired_prob=unpaired_prob,
         temperature=temperature,
         matrix=matrix,
-        on_target_ids_file=_p(on_target_ids_file),
+        sirna_table=_p(sirna_table),
         alpha=alpha,
         gamma=gamma,
         theta=theta,
@@ -387,7 +393,35 @@ def off_targets(
         n_workers=n_workers,
         detailed_report=detailed_report,
     )
-    return df
+    if stream:
+        return _frames(core_gen)
+    frames = [frame for frame, _meta in core_gen]
+    return pl.concat(frames, how="vertical_relaxed") if frames else pl.DataFrame()
+
+
+def _frames(
+    core_gen: Generator[tuple[pl.DataFrame, dict], None, None],
+) -> Iterator[pl.DataFrame]:
+    """Yield the frames of ``core_gen`` and close it when this generator closes.
+
+    Parameters
+    ----------
+    core_gen : Generator[tuple[polars.DataFrame, dict], None, None]
+        The engine's ``(df, meta)`` generator.
+
+    Yields
+    ------
+    polars.DataFrame
+        One siRNA's frame.
+    """
+    try:
+        for frame, _meta in core_gen:
+            yield frame
+    finally:
+        # A for loop does not close what it iterates: without this, closing
+        # the stream early would leave the pool and the temporary files to
+        # garbage collection.
+        core_gen.close()
 
 
 def accessibility(

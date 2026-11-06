@@ -88,34 +88,31 @@ class TestPlumbing:
         out = plain(result.output)
         assert "--matrix" in out and "-z" in out
 
-    def test_cli_passes_the_option_to_the_directory_core(self, monkeypatch, tmp_path):
+    def test_cli_passes_the_option_to_the_engine(self, monkeypatch, tmp_path):
         seen = {}
 
-        def fake_directory(**kwargs):
+        def fake_engine(**kwargs):  # a generator, like the engine
             seen.update(kwargs)
-            return iter(())
+            yield from ()
 
-        monkeypatch.setattr(
-            "sioff.core.off_targets.compute_off_targets_directory", fake_directory
-        )
+        monkeypatch.setattr("sioff.core.off_targets.compute_off_targets", fake_engine)
         (tmp_path / "in").mkdir()
         (tmp_path / "in" / "risearch_a.out").write_text(
             (DATA / "risearch_siRNAID.out").read_text()
         )
-        runner.invoke(
+        result = runner.invoke(
             app,
             [
                 "off-targets",
                 "-r",
                 str(tmp_path / "in"),
-                "-s",
-                str(DATA / "sirnas.fa"),
                 "-z",
                 "slh04",
                 "-o",
                 str(tmp_path / "out.tsv"),
             ],
         )
+        assert result.exit_code == 0, result.output
         assert seen.get("matrix") == "slh04"
 
     def test_config_accepts_matrix_and_resolves_a_relative_table(self, tmp_path):

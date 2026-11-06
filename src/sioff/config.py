@@ -15,11 +15,15 @@ REMOVED_OFF_TARGETS_KEYS: dict[str, str] = {
         "the .summary files carry the partition-function header; "
         "--detailed-report keeps the per-interaction weights"
     ),
-    "on_target": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
-    "query": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --sirna-table",
+    "query": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_expression": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_accessibility": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_ids": (
+        "renamed to sirna_table; the table needs a header with sirna_id, "
+        "on_target_id, sequence"
+    ),
 }
 
 
@@ -28,6 +32,8 @@ class OffTargetsConfig:
     """Schema for off-targets command configuration."""
 
     risearch_file: str = MISSING  # Required
+    sirna_table: Optional[str] = None
+    sirna_fasta: Optional[str] = None
     transcriptome: Optional[str] = None
     transcriptome_format: str = "auto"
     feature: str = "exon"
@@ -104,6 +110,8 @@ def _resolve_paths(cfg: DictConfig, base_dir: Path) -> DictConfig:
     path_fields = {
         "off_targets": [
             "risearch_file",
+            "sirna_table",
+            "sirna_fasta",
             "transcriptome",
             "accessibility_dir",
             "accessibility_cache_dir",
@@ -143,6 +151,8 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
 
     for key in [
         "risearch_file",
+        "sirna_table",
+        "sirna_fasta",
         "transcriptome",
         "accessibility_dir",
         "accessibility_cache_dir",
@@ -173,11 +183,9 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
         # Typer OptionInfo objects become defaults when calling the function directly,
         # not via CLI — set these to None so callers get clean None defaults.
         for arg in (
-            "sirna_fasta",
             "target_fasta",
             "target_index",
             "workers",
-            "on_target_ids_file",
         ):
             kwargs.setdefault(arg, None)
 
