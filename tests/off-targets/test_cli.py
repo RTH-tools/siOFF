@@ -210,3 +210,93 @@ class TestCLIStartup:
         assert proc.stdout.strip() == "", (
             f"`sioff {' '.join(argv)}` imported: {proc.stdout.strip()}"
         )
+
+
+# ---------------------------------------------------------------------------
+# -o names the table; a stale table goes; errors name the flags
+# ---------------------------------------------------------------------------
+def _files(root: Path) -> list[str]:
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*") if p.is_file())
+
+
+@pytest.mark.parametrize(
+    ("output", "fmt", "table"),
+    [
+        ("results.txt", "tsv", "results.txt.tsv"),
+        ("x.tsv", "parquet", "x.parquet"),
+        ("x.parquet", "csv", "x.csv"),
+        ("out", "tsv", "out.tsv"),
+    ],
+)
+def test_output_table_keeps_the_name_given(tmp_path: Path, output, fmt, table) -> None:
+    """A table suffix is replaced by --output-format's; any other name is kept."""
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(TSV), "-o", str(tmp_path / output)]
+        + ["--output-format", fmt],
+    )
+    assert result.exit_code == 0, result.output
+    summary = "out/siRNAID.summary" if output == "out" else "siRNAID.summary"
+    assert _files(tmp_path) == sorted([table, summary])
+
+
+def test_dotted_output_names_do_not_collide(tmp_path: Path) -> None:
+    for name in ("run.v1", "run.v2"):
+        result = runner.invoke(
+            app, ["off-targets", "-r", str(TSV), "-o", str(tmp_path / name)]
+        )
+        assert result.exit_code == 0, result.output
+    assert pl.read_csv(tmp_path / "run.v1.tsv", separator="\t").height == 60
+    assert pl.read_csv(tmp_path / "run.v2.tsv", separator="\t").height == 60
+
+
+def test_run_that_scores_nothing_leaves_no_stale_table(tmp_path: Path, plain) -> None:
+    """The fixture's chromosomes (transcript_1..5) are not in the example GTF."""
+    out = tmp_path / "o.tsv"
+    out.write_text("a stale table from an earlier run\n")
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(TSV), "-t", str(EXAMPLES / "annotation.gtf")]
+        + ["-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    assert not out.exists()
+    assert "No predictions to process" in plain(result.output)
+
+
+def test_table_path_that_is_not_a_file_is_an_error(tmp_path: Path, plain) -> None:
+    (tmp_path / "o.tsv").mkdir()
+    result = runner.invoke(
+        app, ["off-targets", "-r", str(TSV), "-o", str(tmp_path / "o.tsv")]
+    )
+    assert result.exit_code == 1
+    text = " ".join(plain(result.output).split())
+    assert "exists and is not a regular file" in text
+    assert (tmp_path / "o.tsv").is_dir()
+
+
+def test_errors_name_the_cli_flags(plain) -> None:
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(TSV), "-f", str(EXAMPLES / "genome.fa")]
+        + ["-a", str(EXAMPLES / "accessibility")],
+    )
+    assert result.exit_code == 1
+    text = " ".join(plain(result.output).split())
+    assert (
+        "-f/--fasta and -a/--accessibility-dir are two sources for the same "
+        "profiles; drop -f/--fasta to use -a/--accessibility-dir" in text
+    )
+    assert "genome_file" not in text and "accessibility_dir" not in text
+
+
+def test_flag_names_are_the_options_of_the_command() -> None:
+    """Every flag an error message names is spelled as the command declares it."""
+    import typer.main
+
+    from sioff.commands.off_targets import _FLAG_NAMES
+
+    command = typer.main.get_command(app).commands["off-targets"]
+    options = {param.name: set(param.opts) for param in command.params}
+    for name, flags in _FLAG_NAMES.items():
+        assert set(flags.split("/")) <= options[name], name
