@@ -54,6 +54,12 @@ class ProbabilityService:
         With an accessibility service the opening energies are looked up;
         without one an ``opening_energy`` column already in ``df`` is used,
         and otherwise they are 0.
+
+        The Boltzmann weights (``boltzmann_weight*``), the partition
+        functions (``Z_sirna*``) and the on-target sums (``W_on*``) are raw,
+        unshifted and Float64, so a strong duplex cannot overflow them; every
+        ``P_off_target*`` column is cast to Float32 after the division. The
+        energy and dG columns keep their dtypes (Float32 from RIsearch).
         """
         if "energy" not in df.columns:
             logger.warning("No 'energy' column found. Cannot calculate probabilities.")
@@ -203,18 +209,16 @@ class ProbabilityService:
             weight_noacc_col = f"boltzmann_weight_noacc{suffix}"
             all_weight_exprs.extend(
                 [
-                    (pl.col("exp_value") * ((-pl.col(dG_col) / self._RT).exp())).alias(
-                        weight_col
+                    self._boltzmann_weight(pl.col(dG_col)).alias(weight_col),
+                    self._boltzmann_weight(pl.col(dG_noacc_col)).alias(
+                        weight_noacc_col
                     ),
-                    (
-                        pl.col("exp_value") * ((-pl.col(dG_noacc_col) / self._RT).exp())
-                    ).alias(weight_noacc_col),
                 ]
             )
             if aggregate_only:
                 dG, dG_noacc = dG_exprs[suffix]
-                w = pl.col("exp_value") * ((-dG / self._RT).exp())
-                w_noacc = pl.col("exp_value") * ((-dG_noacc / self._RT).exp())
+                w = self._boltzmann_weight(dG)
+                w_noacc = self._boltzmann_weight(dG_noacc)
             else:
                 w, w_noacc = pl.col(weight_col), pl.col(weight_noacc_col)
             z_col = f"Z_sirna{suffix}"
@@ -281,12 +285,30 @@ class ProbabilityService:
                 pl.when(pl.col(z_col) > 0)
                 .then(pl.col(weight_col) / pl.col(z_col))
                 .otherwise(0.0)
+                .cast(pl.Float32)
                 .alias(p_col)
             )
 
         df = df.with_columns(probs_exprs)
 
         return df, metadata
+
+    def _boltzmann_weight(self, dG: pl.Expr) -> pl.Expr:
+        """``exp_value * exp(-dG / RT)`` in Float64.
+
+        ``dG`` and ``exp_value`` are cast to Float64 first: in Float32,
+        whose range ends near 3.4e38, ``exp(-dG / RT)`` overflows for dG
+        below about -54.7 kcal/mol at 37 °C (sooner with ``exp_value`` > 1)
+        and the siRNA's Z with it. Float64 holds down to about -437 kcal/mol.
+
+        Returns
+        -------
+        polars.Expr
+            The row's raw Boltzmann weight, Float64.
+        """
+        return pl.col("exp_value").cast(pl.Float64) * (
+            (-dG.cast(pl.Float64) / self._RT).exp()
+        )
 
     def format_legacy_summary(
         self,

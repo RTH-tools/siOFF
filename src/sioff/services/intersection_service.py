@@ -161,10 +161,10 @@ class IntersectionService:
         _timings: Optional[dict] = None,
     ) -> pl.DataFrame:
         # maintain_order: the pairs decide the order of the concatenated result
-        # and, through it, the float32 summation order of the partition
-        # functions downstream. Without it, polars returns the pairs in a
-        # hash order that varies between runs, so P_off_target drifted by a
-        # few ULP from run to run on identical input.
+        # and, through it, the summation order of the partition functions
+        # downstream. Without it, polars returns the pairs in a hash order
+        # that varies between runs, so P_off_target drifted by a few ULP from
+        # run to run on identical input.
         chrom_strand_pairs = (
             risearch_df.select(["chrom", "strand"])
             .unique(maintain_order=True)

@@ -305,7 +305,8 @@ def off_targets(
         and ``energy``, ``dG_total`` and ``P_off_target`` again with a
         ``:alpha=X,gamma=Y`` or ``:theta=T`` suffix per extra parameter
         value. With ``detailed_report`` the ``E_min``, ``boltzmann_weight*``
-        and ``Z_sirna*`` intermediates are kept too.
+        and ``Z_sirna*`` intermediates are kept too. The weights and Z are
+        Float64; every ``P_off_target*`` column is Float32.
 
     Raises
     ------

@@ -572,6 +572,7 @@ P(off-target_i | siRNA_s) = W_i / Z_s
 - **ΔG_opening**: Accessibility penalty — cost to unfold the target region, retrieved from pre-computed `RNA.pfl_fold_up` profiles.
 - **Expression weighting**: annotation-derived RPKM/TPM values scale each site's contribution.
 - **Per-siRNA normalization**: Partition functions are computed independently per siRNA; mixing them is biologically incorrect.
+- **Precision**: the weights `W_i` and `Z_s` are computed in double precision (raw, not shifted), so a very strong duplex cannot overflow them; `P_off_target` is written as float32.
 - **E_min** (used by `--alpha`/`--gamma`): the lower of the perfect-match energy of the siRNA's table sequence and the lowest energy among the hits left after `--sense-only` and the annotation intersection. The perfect-match energy is computed with `-z/--matrix`, so pass the set the predictions were searched with. The baseline α=γ=1 and `--theta` do not depend on it. α/γ ≠ 1 results differ from siOFF 0.2.0, except for folder runs (`-r <dir>`) that passed `-s`: E_min now always includes the perfect-match energy from `--sirna-table`, which only those runs had, and folder runs without `-s` no longer take it from every hit in the file, so the hits the intersection drops and, with `--sense-only`, minus-strand hits no longer count.
 
 ### Parameter sweeps
