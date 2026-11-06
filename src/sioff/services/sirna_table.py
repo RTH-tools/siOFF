@@ -34,7 +34,8 @@ def read_sirna_table(path: Path) -> dict[str, SirnaRecord]:
     """Read and validate an siRNA table.
 
     Columns are matched by name, in any order; extra columns are ignored and
-    lines starting with ``#`` are skipped.
+    lines starting with ``#`` are skipped. Surrounding whitespace is stripped
+    from every cell, and an ``on_target_id`` left empty becomes ``None``.
 
     Parameters
     ----------
@@ -66,8 +67,12 @@ def read_sirna_table(path: Path) -> dict[str, SirnaRecord]:
         )
 
     records: dict[str, SirnaRecord] = {}
-    for sirna_id, on_target_id, raw in df.select(SIRNA_TABLE_COLUMNS).iter_rows():
-        if sirna_id is None or not sirna_id.strip():
+    for raw_id, raw_target, raw in df.select(SIRNA_TABLE_COLUMNS).iter_rows():
+        # A stray space would make the ID miss the predictions' sirna_id or
+        # every transcript_id.
+        sirna_id = (raw_id or "").strip()
+        on_target_id = (raw_target or "").strip() or None
+        if not sirna_id:
             raise ValueError(f"{path}: a row has an empty sirna_id")
         if sirna_id in records:
             raise ValueError(f"{path}: sirna_id '{sirna_id}' appears more than once")
@@ -78,5 +83,5 @@ def read_sirna_table(path: Path) -> dict[str, SirnaRecord]:
             raise ValueError(
                 f"{path}: siRNA '{sirna_id}' has a sequence outside ACGTU: {raw!r}"
             )
-        records[sirna_id] = SirnaRecord(sirna_id, on_target_id or None, sequence)
+        records[sirna_id] = SirnaRecord(sirna_id, on_target_id, sequence)
     return records

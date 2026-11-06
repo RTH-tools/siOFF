@@ -59,3 +59,23 @@ def test_non_nucleotide_sequence_is_rejected(tmp_path):
 def test_header_only_table_is_empty(tmp_path):
     path = _write(tmp_path, "sirna_id\ton_target_id\tsequence\n")
     assert read_sirna_table(path) == {}
+
+
+def test_ids_and_sequence_are_stripped(tmp_path):
+    """A stray space must not make s1 a different siRNA than the predictions'."""
+    path = _write(
+        tmp_path,
+        "sirna_id\ton_target_id\tsequence\n s1 \t ENST1 \t ACGU \ns2\t  \tACGT\n",
+    )
+    assert read_sirna_table(path) == {
+        "s1": SirnaRecord("s1", "ENST1", "ACGT"),
+        "s2": SirnaRecord("s2", None, "ACGT"),
+    }
+
+
+def test_ids_that_differ_only_in_spaces_are_duplicates(tmp_path):
+    path = _write(
+        tmp_path, "sirna_id\ton_target_id\tsequence\ns1\tE1\tACGT\ns1 \tE2\tACGA\n"
+    )
+    with pytest.raises(ValueError, match="'s1' appears more than once"):
+        read_sirna_table(path)
