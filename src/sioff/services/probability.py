@@ -43,7 +43,12 @@ class ProbabilityService:
         memory (385 columns on millions of rows for the RIsearch3 benchmark).
 
         With an ``on_target_map`` the on-target rows are already in ``df`` and
-        are tagged by ID match.
+        are tagged by ID match. The metadata's ``on_target_weights`` then
+        holds, per siRNA and parameter set, the weight sums of the on-target
+        rows (``W_on*``) and of the other rows (``W_off*``, the summary's
+        Zoff), each with and without accessibility (``_noacc``). ``W_off*``
+        is summed directly, not taken as Z - W_on, which cancels to 0 once
+        the on-target dominates.
 
         With ``e_min`` (``sirna_id -> E_min``) the clamp of every alpha/gamma
         set is anchored on that value; a siRNA missing from it raises
@@ -56,7 +61,7 @@ class ProbabilityService:
         and otherwise they are 0.
 
         The Boltzmann weights (``boltzmann_weight*``), the partition
-        functions (``Z_sirna*``) and the on-target sums (``W_on*``) are raw,
+        functions (``Z_sirna*``) and the sums ``W_on*`` and ``W_off*`` are raw,
         unshifted and Float64, so a strong duplex cannot overflow them; every
         ``P_off_target*`` column is cast to Float32 after the division. The
         energy and dG columns keep their dtypes (Float32 from RIsearch).
@@ -227,12 +232,16 @@ class ProbabilityService:
             z_col_names.extend([z_col, z_noacc_col])
 
             if in_predictions_mode:
+                on = pl.col("is_on_target")
+                # The off-target sums are added up directly: Z - W_on cancels
+                # once the on-target dominates (every digit is gone past
+                # W_on/Zoff ~ 1e15).
                 on_aggs.extend(
                     [
-                        w.filter(pl.col("is_on_target")).sum().alias(f"W_on{suffix}"),
-                        w_noacc.filter(pl.col("is_on_target"))
-                        .sum()
-                        .alias(f"W_on_noacc{suffix}"),
+                        w.filter(on).sum().alias(f"W_on{suffix}"),
+                        w_noacc.filter(on).sum().alias(f"W_on_noacc{suffix}"),
+                        w.filter(~on).sum().alias(f"W_off{suffix}"),
+                        w_noacc.filter(~on).sum().alias(f"W_off_noacc{suffix}"),
                     ]
                 )
 
@@ -318,7 +327,17 @@ class ProbabilityService:
         alpha_gamma_pairs: list[tuple[float, float]],
         theta_values: list[float],
     ) -> str:
-        """Format the aggregated metadata into the exact legacy .off header block."""
+        """Format the aggregated metadata into the exact legacy .off header block.
+
+        Zoff is ``W_off*`` from ``on_target_weights``; without an on-target
+        weight it is Z.
+
+        Returns
+        -------
+        str
+            The ``# On-target info`` block, one ``# For ...`` line per
+            parameter set.
+        """
         lines = []
         lines.append(f"# On-target info for {sirna_id} #")
 
@@ -346,8 +365,14 @@ class ProbabilityService:
             w_on = on_target_weights.get(f"W_on{suffix}", 0.0)
             w_on_noacc = on_target_weights.get(f"W_on_noacc{suffix}", 0.0)
 
-            z_off = z - w_on
-            z_off_noacc = z_noacc - w_on_noacc
+            # The off-target rows' own sum: Z - W_on cancels when the
+            # on-target dominates. With no on-target weight Zoff is Z itself.
+            z_off = on_target_weights.get(f"W_off{suffix}", z - w_on) if w_on else z
+            z_off_noacc = (
+                on_target_weights.get(f"W_off_noacc{suffix}", z_noacc - w_on_noacc)
+                if w_on_noacc
+                else z_noacc
+            )
 
             p_on = w_on / z if z > 0 else 0.0
             p_on_noacc = w_on_noacc / z_noacc if z_noacc > 0 else 0.0

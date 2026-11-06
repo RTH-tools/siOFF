@@ -100,11 +100,10 @@ def computed_meta(regression_input) -> dict:
 
 
 def get_zoff_noacc(meta: dict, sid: str, suffix: str = "") -> float:
-    z_row = meta["z_per_sirna"].get(sid, {})
-    w_on = meta["on_target_weights"].get(sid, {})
-    z_total = z_row.get(f"Z_sirna_noacc{suffix}", 0.0)
-    w_on_val = w_on.get(f"W_on_noacc{suffix}", 0.0)
-    return z_total - w_on_val
+    """Zoff_noacc as the .summary reports it: the off-target rows' own sum."""
+    z_total = meta["z_per_sirna"].get(sid, {}).get(f"Z_sirna_noacc{suffix}", 0.0)
+    w = meta["on_target_weights"].get(sid, {})
+    return w.get(f"W_off_noacc{suffix}", z_total)
 
 
 def param_key_to_suffix(param_key: str) -> str:
