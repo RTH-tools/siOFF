@@ -131,8 +131,9 @@ off_targets:
   # Path for the main output file. A .tsv, .csv or .parquet suffix is replaced
   # by the one of the output format; any other name gets the extension
   # appended (results.txt -> results.txt.tsv; "out" -> out.tsv, with the
-  # .summary files in out/). An earlier table at that path is removed before
-  # the run. Rows come in one block per siRNA, sorted by P_off_target
+  # .summary files in out/). The run overwrites an earlier table at that
+  # path, or removes it when it writes no rows; an argument error leaves it
+  # in place. Rows come in one block per siRNA, sorted by P_off_target
   # descending; one .summary file per siRNA is written next to the table.
   output: ./sioff_example_out/off_targets.tsv
 

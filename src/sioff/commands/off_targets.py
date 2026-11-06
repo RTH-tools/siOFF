@@ -366,6 +366,11 @@ def run(
     accessibility_dir = _as_path(accessibility_dir)
     accessibility_cache_dir = _as_path(accessibility_cache_dir)
     output_file = _as_path(output_file)
+    if output_file is not None:
+        # Before the guards below: ``ghost/../hits.tsv`` names ``hits.tsv``,
+        # but only once ``ghost`` exists, so exists() and samefile() miss it.
+        # The directory is resolved, not the name: -o keeps its name.
+        output_file = output_file.parent.resolve() / output_file.name
     genome_file = _as_path(genome_file)
     sirna_table = _as_path(sirna_table)
 
@@ -441,9 +446,6 @@ def run(
                 )
                 raise typer.Exit(code=1)
             out_path.parent.mkdir(parents=True, exist_ok=True)
-            # A run that scores nothing writes no table, so an earlier run's
-            # must not be left in its place.
-            out_path.unlink(missing_ok=True)
 
         # Resolve the .summary output dir. If --output is a directory path
         # (no suffix; pathlib drops a trailing slash), write there; else
@@ -589,6 +591,12 @@ def run(
                         if _pq_writer is not None:
                             _pq_writer.close()
             _stage.rows_out = total_rows
+
+        # The first frame truncates an earlier run's table. A run that wrote
+        # none (nothing scored, or every task failed) must not leave that table
+        # in its place. An argument error never gets here, so it keeps it.
+        if out_path is not None and _csv_first_batch and _pq_writer is None:
+            out_path.unlink(missing_ok=True)
 
         if profile and _drain_n > 0:
             _perf_lines = [

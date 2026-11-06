@@ -347,8 +347,9 @@ example. The table is required when `--alpha`/`--gamma` set a pair other than
 
 `-o` takes a `.tsv`, `.csv` or `.parquet` name (the suffix is replaced by the one
 of `--output-format`); any other name gets the extension appended, so
-`-o out` writes `out.tsv` with the `.summary` files in `out/`. An earlier table
-at that path is removed first.
+`-o out` writes `out.tsv` with the `.summary` files in `out/`. The run
+overwrites an earlier table at that path, or removes it when it writes no
+rows; an argument error leaves it in place.
 
 Useful knobs: `--alpha/--gamma/--theta` for parameter sweeps (semicolon-
 separated values, each combination adds a `P_off_target:...` column),

@@ -398,3 +398,80 @@ def test_output_the_folder_ignores_is_allowed(tmp_path: Path) -> None:
         )
         assert result.exit_code == 0, result.output
         assert pl.read_csv(out)["sirna_id"].n_unique() == 5
+
+
+# ---------------------------------------------------------------------------
+# An argument error keeps the previous table; -o is resolved before its guards
+# ---------------------------------------------------------------------------
+def _argument_error(case: str, tmp_path: Path) -> list[str]:
+    """off-targets arguments the engine refuses before scoring anything."""
+    if case == "-r with -s":
+        return ["-r", str(EXAMPLES / "predictions.out")] + [
+            "-s",
+            str(EXAMPLES / "sirnas.fa"),
+        ]
+    if case == "alpha/gamma without a table":
+        return ["-r", str(EXAMPLES / "predictions.out")] + [
+            "--alpha",
+            "0.8",
+            "--gamma",
+            "0.8",
+        ]
+    if case == "cache dir without -a":
+        return ["-r", str(EXAMPLES / "predictions.out")] + [
+            "--accessibility-cache-dir",
+            str(tmp_path / "cache"),
+        ]
+    # A sirna_id in two files of the folder.
+    folder = tmp_path / "dup"
+    folder.mkdir()
+    shutil.copy(EXAMPLES / "predictions.out", folder / "x.out")
+    shutil.copy(EXAMPLES / "predictions.out", folder / "y.out")
+    return ["-r", str(folder)]
+
+
+@pytest.mark.parametrize(
+    "case",
+    [
+        "-r with -s",
+        "alpha/gamma without a table",
+        "cache dir without -a",
+        "duplicate sirna_id",
+    ],
+)
+def test_an_argument_error_keeps_the_previous_table(tmp_path: Path, case) -> None:
+    out = tmp_path / "results.tsv"
+    out.write_text("a table from an earlier run\n")
+    before = out.read_bytes()
+    result = runner.invoke(
+        app, ["off-targets", *_argument_error(case, tmp_path), "-o", str(out)]
+    )
+    assert result.exit_code == 1, result.output
+    assert out.read_bytes() == before
+
+
+def test_output_through_a_missing_dir_cannot_reach_the_predictions(
+    tmp_path: Path, plain
+) -> None:
+    """``ghost/..`` exists only once -o's parent is created; resolve it first."""
+    hits = tmp_path / "hits.tsv"
+    shutil.copy(TSV, hits)
+    output = tmp_path / "ghost" / ".." / "hits.tsv"
+    result = runner.invoke(app, ["off-targets", "-r", str(hits), "-o", str(output)])
+    _refuses_to_overwrite(result, plain, "-r/--risearch-file", hits)
+    assert hits.read_bytes() == TSV.read_bytes()
+    assert not (tmp_path / "ghost").exists()
+
+
+def test_output_through_a_missing_dir_cannot_land_in_the_folder(
+    tmp_path: Path, plain
+) -> None:
+    preds = _per_sirna_folder(tmp_path)
+    before = {p.name: p.read_bytes() for p in preds.iterdir()}
+    output = preds / "ghost2" / ".." / "siRNA_1.tsv"
+    result = runner.invoke(app, ["off-targets", "-r", str(preds), "-o", str(output)])
+    assert result.exit_code == 1, result.output
+    assert "inside the -r/--risearch-file folder" in " ".join(
+        plain(result.output).split()
+    )
+    assert {p.name: p.read_bytes() for p in preds.iterdir()} == before
