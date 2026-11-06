@@ -433,7 +433,8 @@ def run(
 
         alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
         skipped_pairs = _skipped_alpha_gamma_pairs(alpha, gamma)
-        if skipped_pairs:
+        # Under sioff -v the engine's own info line already lists them.
+        if skipped_pairs and logging_level() != "DEBUG":
             shown = ", ".join(f"({a}, {g})" for a, g in skipped_pairs)
             console.print(f"[dim]Skipped α > γ pairs: {shown}[/dim]")
         theta_vals = _parse_theta(theta)
