@@ -311,7 +311,9 @@ def run(
             "--detailed-report",
             help=(
                 "Keep the raw Boltzmann weights, partition functions and E_min "
-                "for every interaction in the output table."
+                "for every interaction in the output table. E_min is the lower "
+                "of the perfect-match energy of the --sirna-table sequence and "
+                "the strongest hit left; without a table row, that hit."
             ),
         ),
     ] = False,

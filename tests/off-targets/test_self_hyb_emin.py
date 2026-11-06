@@ -50,14 +50,16 @@ def _e_min(
     tmp_path: Path,
     perfect_match: Optional[float],
     *,
+    baseline: bool = False,
     transcriptome: bool = True,
     sense_only: bool = False,
     minus: bool = False,
 ) -> float:
     """E_min of s1, read from the detailed report.
 
-    With a perfect-match energy the run computes an alpha/gamma pair and has a
-    table; without one it is a baseline run without a table.
+    With a perfect-match energy the run has a table, and computes an
+    alpha/gamma pair unless ``baseline``; without one it is a baseline run
+    without a table.
     """
     monkeypatch.setattr(
         RIsearchService,
@@ -67,6 +69,7 @@ def _e_min(
     table = tmp_path / "sirnas.tsv"
     table.write_text("sirna_id\ton_target_id\tsequence\ns1\t\tACGUACGUACGUACGUACG\n")
     with_pm = perfect_match is not None
+    clamped = with_pm and not baseline
     frames = [
         df
         for df, _ in compute_off_targets(
@@ -74,8 +77,8 @@ def _e_min(
             gtf_file=_gtf(tmp_path / "a.gtf") if transcriptome else None,
             expression_metric="TPM",
             sirna_table=table if with_pm else None,
-            alpha="0.8" if with_pm else "1.0",
-            gamma="0.9" if with_pm else "1.0",
+            alpha="0.8" if clamped else "1.0",
+            gamma="0.9" if clamped else "1.0",
             sense_only=sense_only,
             detailed_report=True,
         )
@@ -93,14 +96,26 @@ def test_a_hit_below_the_perfect_match_is_e_min(monkeypatch, tmp_path):
     assert _e_min(monkeypatch, tmp_path, -22.2) == pytest.approx(-22.5)
 
 
-@pytest.mark.parametrize(
-    "perfect_match, expected", [(-26.0, -26.0), (None, -22.5)], ids=["pm", "no-pm"]
-)
-def test_sense_only_ignores_a_stronger_minus_hit(
+@pytest.mark.parametrize("perfect_match, expected", [(-26.0, -26.0), (-22.2, -22.5)])
+def test_a_baseline_report_with_a_table_follows_the_rule(
     monkeypatch, tmp_path, perfect_match, expected
 ):
-    both = _e_min(monkeypatch, tmp_path, perfect_match, minus=True)
-    sense = _e_min(monkeypatch, tmp_path, perfect_match, minus=True, sense_only=True)
+    """The E_min column means one thing whenever the table gives a sequence."""
+    e_min = _e_min(monkeypatch, tmp_path, perfect_match, baseline=True)
+    assert e_min == pytest.approx(expected)
+
+
+@pytest.mark.parametrize(
+    "perfect_match, baseline, expected",
+    [(-26.0, False, -26.0), (-26.0, True, -26.0), (None, True, -22.5)],
+    ids=["clamped", "table-baseline", "no-table"],
+)
+def test_sense_only_ignores_a_stronger_minus_hit(
+    monkeypatch, tmp_path, perfect_match, baseline, expected
+):
+    kw = dict(baseline=baseline, minus=True)
+    both = _e_min(monkeypatch, tmp_path, perfect_match, **kw)
+    sense = _e_min(monkeypatch, tmp_path, perfect_match, sense_only=True, **kw)
     assert both == pytest.approx(-40.0), "the minus-strand hit counts without the flag"
     assert sense == pytest.approx(expected)
 

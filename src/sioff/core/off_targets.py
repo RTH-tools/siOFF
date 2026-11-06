@@ -323,8 +323,8 @@ class WorkerFailureError(RuntimeError):
         self.n_total = n_total
         name, msg = failures[0]
         super().__init__(
-            f"{len(failures)}/{n_total} siRNAs failed in {stage}; "
-            f"first error: {name}: {msg}"
+            f"{len(failures)}/{n_total} tasks failed (input files or siRNAs) in "
+            f"{stage}; first error: {name}: {msg}"
         )
 
     @property
@@ -937,9 +937,10 @@ def compute_off_targets(
     **E_min** (the reference of the alpha/gamma clamp) follows the legacy
     rule: the lower of the siRNA's perfect-match energy, computed from its
     ``sirna_table`` sequence with ``matrix``, and the strongest hit left
-    after ``sense_only`` and the intersection. It is only computed when an
-    alpha/gamma pair other than (1, 1) is, and every siRNA with predictions
-    then needs a table row. At the baseline E_min is never used.
+    after ``sense_only`` and the intersection. The perfect-match energies are
+    computed when an alpha/gamma pair other than (1, 1) is, and every siRNA
+    with predictions then needs a table row, or with ``detailed_report``.
+    The clamp alone uses E_min, and never at the baseline.
 
     **Tasks** run in a pool of spawned worker processes (``spawn`` rather
     than ``fork`` avoids Rayon/Polars thread-pool deadlocks), started only
@@ -1082,7 +1083,10 @@ def compute_off_targets(
         unchanged and carries ``"n_rows"``, the number of scored rows.
     detailed_report : bool, default False
         Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min``
-        columns in each ``df`` (CLI ``--detailed-report``).
+        columns in each ``df`` (CLI ``--detailed-report``). ``E_min`` follows
+        the rule above for a siRNA with a ``sirna_table`` row; for one
+        without (no table, or a baseline run's missing row) it is the
+        strongest hit left. Refused with ``summary_only``.
     worker_log_level : str, default "WARNING"
         The loguru level of the spawned workers' stderr sink. They do not
         inherit this process's handlers, and loguru's own default is DEBUG.
@@ -1116,7 +1120,8 @@ def compute_off_targets(
     Raises
     ------
     ValueError
-        When an argument would go unused: both ``predictions`` and
+        When ``detailed_report`` and ``summary_only`` are both set. When an
+        argument would go unused: both ``predictions`` and
         ``risearch_file``, or both ``accessibility`` and
         ``accessibility_dir``; ``sirna_fasta``, ``target_fasta`` or
         ``target_index`` with ``risearch_file`` or ``predictions``;
@@ -1151,6 +1156,11 @@ def compute_off_targets(
     sioff.off_targets : Public wrapper.
     """
     # 1. Argument combinations, the inputs and the accessibility cache.
+    if detailed_report and summary_only:
+        raise ValueError(
+            "detailed_report adds columns to the per-interaction table, which "
+            "summary_only does not build; pass one of them"
+        )
     if predictions is not None and risearch_file is not None:
         raise ValueError(
             "predictions and risearch_file are two sources for the same input; "
@@ -1314,9 +1324,11 @@ def compute_off_targets(
         if on_split is not None:
             on_split(len(parts))
 
-        # 7. Perfect-match energies (every siRNA has a table row by now).
+        # 7. Perfect-match energies: the clamp needs them (every siRNA has a
+        # table row by now), and the detailed report's E_min column follows
+        # the same rule for every siRNA with a row.
         perfect_match: dict[str, float] = {}
-        if needs_e_min:
+        if needs_e_min or detailed_report:
             service = RIsearchService()
             perfect_match = {
                 sid: service.self_hybridization_emin(
@@ -1376,7 +1388,9 @@ def compute_off_targets(
             # An input file that could not be split counts as one task: how
             # many siRNAs it held is unknown.
             raise WorkerFailureError(
-                "per-siRNA workers", executor.failures, n_split_failures + len(tasks)
+                "splitting and scoring",
+                executor.failures,
+                n_split_failures + len(tasks),
             )
     finally:
         # 10. Pool first (its workers hold the files open), then the files,

@@ -17,7 +17,8 @@ on-disk artifact, so the path (not in-memory data) is the natural result.
 ``sioff.index`` / ``sioff.search`` require the external ``risearch`` package,
 the same dependency the CLI's index/search commands need. ``off_targets``
 imports it only for the in-process search and for the perfect-match energies
-an alpha/gamma pair other than (1, 1) needs; ``accessibility`` never does.
+of E_min (an alpha/gamma pair other than (1, 1), or ``detailed_report``);
+``accessibility`` never does.
 
 Examples
 --------
@@ -277,7 +278,9 @@ def off_targets(
     detailed_report : bool, default False
         Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min`` columns
         for every interaction in the output; by default they are dropped.
-        CLI: ``--detailed-report``.
+        ``E_min`` follows the rule above for a siRNA with a ``sirna_table``
+        row; for one without (no table, or a baseline run's missing row) it
+        is the strongest hit left. CLI: ``--detailed-report``.
     stream : bool, default False
         Return a generator of one DataFrame per siRNA, in the order they are
         scored, instead of one DataFrame. The worker pool and the temporary
