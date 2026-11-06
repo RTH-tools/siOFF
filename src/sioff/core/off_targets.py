@@ -438,6 +438,9 @@ def _downcast_schema(df: pl.DataFrame) -> pl.DataFrame:
     - Strings: sirna_id, transcript_id, chrom, strand, gene_id → Categorical
     - Floats: energy, opening_energy, dG_total, P_off_target, exp_value → Float32
 
+    The ``boltzmann_weight*`` and ``Z_sirna*`` columns of ``--detailed-report``
+    stay Float64: a strong duplex's raw weight can exceed the Float32 range.
+
     Complexity: O(n) time, O(1) extra space.
 
     Returns
@@ -1170,12 +1173,18 @@ def compute_off_targets(
         and ``P_off_target`` repeated with a ``:alpha=A,gamma=G`` or
         ``:theta=T`` suffix for each extra parameter set (empty with
         ``summary_only``). With ``detailed_report`` it also holds ``E_min``,
-        ``boltzmann_weight*`` and ``Z_sirna*``. ``meta`` contains
-        ``"n_sirnas"``, ``"n_rows"``, ``"z_per_sirna"``,
-        ``"on_target_weights"``, ``"on_target_count"``, ``"n_on_target_rows"``
-        and ``"_timings"`` (per-stage wall times of the task: ``load_s``,
-        ``intersect_s``, ``prob_s``, ``serialize_s``, ``total_s`` and the
-        intersection sub-timings).
+        ``boltzmann_weight*`` and ``Z_sirna*`` (Float64; every
+        ``P_off_target*`` column is Float32). ``meta`` contains
+        ``"n_sirnas"``, ``"n_rows"``, ``"z_per_sirna"`` (``{sirna_id: row}``
+        with the ``Z_sirna*`` sums), ``"on_target_weights"``,
+        ``"on_target_count"``, ``"n_on_target_rows"`` and ``"_timings"``
+        (per-stage wall times of the task: ``load_s``, ``intersect_s``,
+        ``prob_s``, ``serialize_s``, ``total_s`` and the intersection
+        sub-timings). With ``gtf_file``, ``"on_target_weights"`` maps each
+        siRNA to its weight sums per parameter set (suffixed as the columns,
+        with and without accessibility): ``W_on``/``W_on_noacc`` over its
+        on-target rows and ``W_off``/``W_off_noacc`` over the others, the
+        .summary's Zoff, summed directly rather than taken as Z - W_on.
 
     Raises
     ------

@@ -43,7 +43,12 @@ class ProbabilityService:
         memory (385 columns on millions of rows for the RIsearch3 benchmark).
 
         With an ``on_target_map`` the on-target rows are already in ``df`` and
-        are tagged by ID match.
+        are tagged by ID match. The metadata's ``on_target_weights`` then
+        holds, per siRNA and parameter set, the weight sums of the on-target
+        rows (``W_on*``) and of the other rows (``W_off*``, the summary's
+        Zoff), each with and without accessibility (``_noacc``). ``W_off*``
+        is summed directly, not taken as Z - W_on, which cancels to 0 once
+        the on-target dominates.
 
         With ``e_min`` (``sirna_id -> E_min``) the clamp of every alpha/gamma
         set is anchored on that value; a siRNA missing from it raises
@@ -54,6 +59,12 @@ class ProbabilityService:
         With an accessibility service the opening energies are looked up;
         without one an ``opening_energy`` column already in ``df`` is used,
         and otherwise they are 0.
+
+        The Boltzmann weights (``boltzmann_weight*``), the partition
+        functions (``Z_sirna*``) and the sums ``W_on*`` and ``W_off*`` are raw,
+        unshifted and Float64, so a strong duplex cannot overflow them; every
+        ``P_off_target*`` column is cast to Float32 after the division. The
+        energy and dG columns keep their dtypes (Float32 from RIsearch).
         """
         if "energy" not in df.columns:
             logger.warning("No 'energy' column found. Cannot calculate probabilities.")
@@ -195,7 +206,6 @@ class ProbabilityService:
 
         all_weight_exprs = []
         z_aggs = []
-        on_aggs = []
         z_col_names = []
 
         for suffix, dG_col, dG_noacc_col in calc_configs:
@@ -203,18 +213,16 @@ class ProbabilityService:
             weight_noacc_col = f"boltzmann_weight_noacc{suffix}"
             all_weight_exprs.extend(
                 [
-                    (pl.col("exp_value") * ((-pl.col(dG_col) / self._RT).exp())).alias(
-                        weight_col
+                    self._boltzmann_weight(pl.col(dG_col)).alias(weight_col),
+                    self._boltzmann_weight(pl.col(dG_noacc_col)).alias(
+                        weight_noacc_col
                     ),
-                    (
-                        pl.col("exp_value") * ((-pl.col(dG_noacc_col) / self._RT).exp())
-                    ).alias(weight_noacc_col),
                 ]
             )
             if aggregate_only:
                 dG, dG_noacc = dG_exprs[suffix]
-                w = pl.col("exp_value") * ((-dG / self._RT).exp())
-                w_noacc = pl.col("exp_value") * ((-dG_noacc / self._RT).exp())
+                w = self._boltzmann_weight(dG)
+                w_noacc = self._boltzmann_weight(dG_noacc)
             else:
                 w, w_noacc = pl.col(weight_col), pl.col(weight_noacc_col)
             z_col = f"Z_sirna{suffix}"
@@ -222,40 +230,38 @@ class ProbabilityService:
             z_aggs.extend([w.sum().alias(z_col), w_noacc.sum().alias(z_noacc_col)])
             z_col_names.extend([z_col, z_noacc_col])
 
-            if in_predictions_mode:
-                on_aggs.extend(
-                    [
-                        w.filter(pl.col("is_on_target")).sum().alias(f"W_on{suffix}"),
-                        w_noacc.filter(pl.col("is_on_target"))
-                        .sum()
-                        .alias(f"W_on_noacc{suffix}"),
-                    ]
-                )
-
         if not aggregate_only:
             df = df.with_columns(all_weight_exprs)
 
-        agg_df = df.group_by("sirna_id").agg(
-            z_aggs + on_aggs + [pl.col("is_on_target").sum().alias("_n_on")]
-        )
-        n_on_target_rows = {
-            row["sirna_id"]: int(row["_n_on"])
-            for row in agg_df.select("sirna_id", "_n_on").iter_rows(named=True)
-        }
-        agg_df = agg_df.drop("_n_on")
-        z_df = agg_df.select(["sirna_id"] + z_col_names)
-
+        weights = None
+        if in_predictions_mode:
+            weights = self._on_off_weights(df, z_aggs, z_col_names, aggregate_only)
+        if aggregate_only and weights is not None:
+            # No P comes from these Z, so Z is W_on + W_off: summing the
+            # weights again would evaluate every one a second time. The
+            # .summary values can differ from a full run's in the last bit.
+            z_df = weights.select(
+                "sirna_id",
+                *[
+                    (
+                        pl.col(c.replace("Z_sirna", "W_on", 1))
+                        + pl.col(c.replace("Z_sirna", "W_off", 1))
+                    ).alias(c)
+                    for c in z_col_names
+                ],
+            )
+        else:
+            z_df = df.group_by("sirna_id").agg(z_aggs)
+        n_on_target_rows = dict.fromkeys(z_df["sirna_id"].to_list(), 0)
         on_target_weight_metadata = {}
 
-        if in_predictions_mode:
-            on_df = agg_df.drop(z_col_names)
-            for row in on_df.to_dicts():
-                sid = row["sirna_id"]
-                on_target_weight_metadata[sid] = {
-                    k: v for k, v in row.items() if k != "sirna_id"
-                }
+        if weights is not None:
+            for row in weights.to_dicts():
+                sid = row.pop("sirna_id")
+                n_on_target_rows[sid] = int(row.pop("_n_on"))
+                on_target_weight_metadata[sid] = row
             logger.info(
-                f"In-predictions mode: computed on-target weights for {on_df.height} siRNAs"
+                f"In-predictions mode: computed on-target weights for {weights.height} siRNAs"
             )
 
         z_stats_dict = {row["sirna_id"]: row for row in z_df.to_dicts()}
@@ -281,12 +287,79 @@ class ProbabilityService:
                 pl.when(pl.col(z_col) > 0)
                 .then(pl.col(weight_col) / pl.col(z_col))
                 .otherwise(0.0)
+                .cast(pl.Float32)
                 .alias(p_col)
             )
 
         df = df.with_columns(probs_exprs)
 
         return df, metadata
+
+    @staticmethod
+    def _on_off_weights(
+        df: pl.DataFrame,
+        z_aggs: list[pl.Expr],
+        z_col_names: list[str],
+        aggregate_only: bool,
+    ) -> pl.DataFrame:
+        """Each siRNA's weight sums over its on-target rows and over the others.
+
+        One sum per (siRNA, on-target flag) gives both: a filtered sum per
+        column (``w.filter(on).sum()``) costs about as much as the whole
+        probability stage again. The off-target sum is its own sum, not
+        Z - W_on, which cancels once the on-target dominates (every digit is
+        gone past W_on/Zoff ~ 1e15).
+
+        Returns
+        -------
+        polars.DataFrame
+            One row per siRNA: ``sirna_id``, ``W_on*`` and ``W_off*`` (each
+            ``Z_sirna*`` column renamed; 0.0 for a siRNA without such rows)
+            and ``_n_on``, the number of on-target rows.
+        """
+        on = pl.col("is_on_target").fill_null(False)
+        # Measured on polars 2.0, single-threaded: summing weight columns, the
+        # plain column key is ~3x faster than a computed one; summing weight
+        # expressions (aggregate_only), the computed key is ~15% faster.
+        key = on.alias("is_on_target") if aggregate_only else "is_on_target"
+        split = df.group_by("sirna_id", key).agg(z_aggs + [pl.len().alias("_n")])
+
+        def part(rows: pl.DataFrame, prefix: str, *extra: pl.Expr) -> pl.DataFrame:
+            # One row per siRNA, except a null flag (a row without IDs),
+            # which is off-target: its group is added to the False one.
+            return rows.group_by("sirna_id").agg(
+                *[
+                    pl.col(c).sum().alias(c.replace("Z_sirna", prefix, 1))
+                    for c in z_col_names
+                ],
+                *extra,
+            )
+
+        n_on = pl.col("_n").sum().alias("_n_on")
+        return (
+            split.select("sirna_id")
+            .unique(maintain_order=True)
+            .join(part(split.filter(on), "W_on", n_on), on="sirna_id", how="left")
+            .join(part(split.filter(~on), "W_off"), on="sirna_id", how="left")
+            .fill_null(0)
+        )
+
+    def _boltzmann_weight(self, dG: pl.Expr) -> pl.Expr:
+        """``exp_value * exp(-dG / RT)`` in Float64.
+
+        ``dG`` and ``exp_value`` are cast to Float64 first: in Float32,
+        whose range ends near 3.4e38, ``exp(-dG / RT)`` overflows for dG
+        below about -54.7 kcal/mol at 37 °C (sooner with ``exp_value`` > 1)
+        and the siRNA's Z with it. Float64 holds down to about -437 kcal/mol.
+
+        Returns
+        -------
+        polars.Expr
+            The row's raw Boltzmann weight, Float64.
+        """
+        return pl.col("exp_value").cast(pl.Float64) * (
+            (-dG.cast(pl.Float64) / self._RT).exp()
+        )
 
     def format_legacy_summary(
         self,
@@ -296,7 +369,17 @@ class ProbabilityService:
         alpha_gamma_pairs: list[tuple[float, float]],
         theta_values: list[float],
     ) -> str:
-        """Format the aggregated metadata into the exact legacy .off header block."""
+        """Format the aggregated metadata into the exact legacy .off header block.
+
+        Zoff is ``W_off*`` from ``on_target_weights``; without an on-target
+        weight it is Z.
+
+        Returns
+        -------
+        str
+            The ``# On-target info`` block, one ``# For ...`` line per
+            parameter set.
+        """
         lines = []
         lines.append(f"# On-target info for {sirna_id} #")
 
@@ -324,8 +407,14 @@ class ProbabilityService:
             w_on = on_target_weights.get(f"W_on{suffix}", 0.0)
             w_on_noacc = on_target_weights.get(f"W_on_noacc{suffix}", 0.0)
 
-            z_off = z - w_on
-            z_off_noacc = z_noacc - w_on_noacc
+            # The off-target rows' own sum: Z - W_on cancels when the
+            # on-target dominates. With no on-target weight Zoff is Z itself.
+            z_off = on_target_weights.get(f"W_off{suffix}", z - w_on) if w_on else z
+            z_off_noacc = (
+                on_target_weights.get(f"W_off_noacc{suffix}", z_noacc - w_on_noacc)
+                if w_on_noacc
+                else z_noacc
+            )
 
             p_on = w_on / z if z > 0 else 0.0
             p_on_noacc = w_on_noacc / z_noacc if z_noacc > 0 else 0.0

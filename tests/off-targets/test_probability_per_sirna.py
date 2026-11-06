@@ -33,12 +33,10 @@ def make_df(**cols):
 
 
 def zoff_noacc_from_meta(meta, sid, suffix=""):
-    """Extract Zoff_noacc for a siRNA from the metadata dict."""
-    z_row = meta["z_per_sirna"].get(sid, {})
-    w_on = meta["on_target_weights"].get(sid, {})
-    z_total = z_row.get(f"Z_sirna_noacc{suffix}", 0.0)
-    w_on_val = w_on.get(f"W_on_noacc{suffix}", 0.0)
-    return z_total - w_on_val
+    """Zoff_noacc for a siRNA: the off-target rows' own sum, or Z without one."""
+    z_total = meta["z_per_sirna"].get(sid, {}).get(f"Z_sirna_noacc{suffix}", 0.0)
+    w = meta["on_target_weights"].get(sid, {})
+    return w.get(f"W_off_noacc{suffix}", z_total)
 
 
 # ---------------------------------------------------------------------------
@@ -235,7 +233,7 @@ class TestThetaScaling:
 
 
 class TestOnTargetInPredictionsMode:
-    """On-target rows stay in Z but contribute to W_on; Zoff = Z - W_on."""
+    """On-target rows stay in Z and add up to W_on; the rest add up to Zoff."""
 
     def _build_df(self):
         return pl.DataFrame(

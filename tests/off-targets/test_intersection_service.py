@@ -97,9 +97,9 @@ class TestIntersectionService:
 def test_intersect_row_order_follows_input(service: IntersectionService, workers):
     """Rows come out grouped by (chrom, strand) in first-appearance order.
 
-    The row order feeds the float32 summation order of the partition
-    functions, so it must not depend on hash order or thread scheduling (it
-    used to: P_off_target drifted by a few ULP between runs on the same input).
+    The row order feeds the summation order of the partition functions, so
+    it must not depend on hash order or thread scheduling (it used to:
+    P_off_target drifted by a few ULP between runs on the same input).
     """
     preds = pl.DataFrame(
         {
