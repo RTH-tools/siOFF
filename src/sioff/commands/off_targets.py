@@ -382,6 +382,7 @@ def run(
         _build_alpha_gamma_pairs,
         _downcast_schema,
         _parse_theta,
+        _skipped_alpha_gamma_pairs,
         compute_off_targets,
     )
     from sioff.services.probability import ProbabilityService
@@ -431,6 +432,10 @@ def run(
             raise typer.Exit(code=1)
 
         alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
+        skipped_pairs = _skipped_alpha_gamma_pairs(alpha, gamma)
+        if skipped_pairs:
+            shown = ", ".join(f"({a}, {g})" for a, g in skipped_pairs)
+            console.print(f"[dim]Skipped α > γ pairs: {shown}[/dim]")
         theta_vals = _parse_theta(theta)
         # .summary formatting needs no accessibility service.
         fmt_service = ProbabilityService(None, temperature=temperature)

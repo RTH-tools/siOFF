@@ -578,6 +578,8 @@ P(off-target_i | siRNA_s) = W_i / Z_s
 
 `--alpha`/`--gamma` clamp extremely favorable energies; `--theta` scales energy differences around a −10 kcal/mol reference. All combinations are computed in a single Polars `group_by` pass, producing separate `P_off_target:alpha=X,gamma=Y` columns.
 
+Pairs with α > γ are skipped and listed before scoring. An α or γ value that no kept pair uses is an error, not silently dropped.
+
 ---
 
 ## Output

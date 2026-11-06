@@ -338,23 +338,60 @@ class WorkerFailureError(RuntimeError):
         return [name for name, _ in self.failures]
 
 
+def _alpha_gamma_values(alpha: str, gamma: str) -> tuple[list[float], list[float]]:
+    """Parse the semicolon-separated alpha and gamma strings into floats.
+
+    Returns
+    -------
+    tuple[list[float], list[float]]
+        The alpha values and the gamma values, in input order.
+    """
+    return (
+        [float(x) for x in alpha.split(";") if x.strip()],
+        [float(x) for x in gamma.split(";") if x.strip()],
+    )
+
+
+def _skipped_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]]:
+    """List the ``alpha > gamma`` combinations that are not scored.
+
+    Returns
+    -------
+    list[tuple[float, float]]
+        Deduplicated ``(alpha, gamma)`` pairs, in input order.
+    """
+    alpha_vals, gamma_vals = _alpha_gamma_values(alpha, gamma)
+    skipped = [(a, g) for a in alpha_vals for g in gamma_vals if a > g]
+    return list(dict.fromkeys(skipped))
+
+
 def _build_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]]:
     """Parse semicolon-separated alpha/gamma strings into (alpha, gamma) pairs.
 
-    Always includes the baseline (1.0, 1.0). Enforces alpha <= gamma. Deduplicates.
+    Always includes the baseline (1.0, 1.0). Skips ``alpha > gamma`` pairs (see
+    :func:`_skipped_alpha_gamma_pairs`). Deduplicates.
 
     Returns
     -------
     list[tuple[float, float]]
         Ordered, deduplicated ``(alpha, gamma)`` pairs starting with ``(1.0, 1.0)``.
+
+    Raises
+    ------
+    ValueError
+        If an alpha or gamma value is in no kept pair; the implicit baseline
+        counts for neither.
     """
-    alpha_vals = [float(x) for x in alpha.split(";") if x.strip()]
-    gamma_vals = [float(x) for x in gamma.split(";") if x.strip()]
+    alpha_vals, gamma_vals = _alpha_gamma_values(alpha, gamma)
+    for a in alpha_vals:
+        if not any(a <= g for g in gamma_vals):
+            raise ValueError(f"--alpha {a} pairs with no --gamma value >= it")
+    for g in gamma_vals:
+        if not any(a <= g for a in alpha_vals):
+            raise ValueError(f"--gamma {g} pairs with no --alpha value <= it")
     pairs: list[tuple[float, float]] = [(1.0, 1.0)]
     for a in alpha_vals:
         for g in gamma_vals:
-            if a == 1.0 and g == 1.0:
-                continue
             if a <= g:
                 pairs.append((a, g))
     return list(dict.fromkeys(pairs))
@@ -1232,6 +1269,9 @@ def compute_off_targets(
 
     # 3. Parameters.
     alpha_gamma_pairs = _build_alpha_gamma_pairs(alpha, gamma)
+    skipped_pairs = _skipped_alpha_gamma_pairs(alpha, gamma)
+    if skipped_pairs:
+        logger.info(f"Skipped alpha > gamma pairs: {skipped_pairs}")
     theta_vals = _parse_theta(theta)
     needs_e_min = any(pair != (1.0, 1.0) for pair in alpha_gamma_pairs)
 
