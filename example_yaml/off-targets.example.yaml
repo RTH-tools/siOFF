@@ -102,6 +102,8 @@ off_targets:
   # Alpha/gamma use E_min = min(perfect-match energy of the table's sequence,
   # lowest energy among the hits left after sense_only and the annotation
   # intersection). The baseline alpha = gamma = 1 does not depend on E_min.
+  # Pairs with alpha > gamma are skipped and listed; a value used by no pair
+  # is an error.
   #
   # Alpha clamping parameter. Constraint: alpha ≤ gamma. Default: "1.0"
   # Example multi-value sweep: "0.8;0.9;1.0"
