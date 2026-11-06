@@ -1,16 +1,17 @@
 """
 Unit tests for ProbabilityService.calculate_probabilities_per_sirna().
 
-This is the production code path used by the off-targets command.
-The existing test_probability*.py files only cover calculate_probabilities()
-(single partition function, no parameter sweeps).
+This is the probability model of every off-targets run: one partition
+function per siRNA, with the alpha/gamma and theta sweeps.
 
 All expected values are computed analytically so the tests do not depend on
 external data files.
 """
 
 import math
+
 import polars as pl
+import pytest
 
 from sioff.services.probability import ProbabilityService, RT
 
@@ -51,9 +52,8 @@ class TestBaseCase:
     def test_z_noacc_two_rows(self):
         energy = [-20.0, -15.0]
         exp_val = [10.0, 5.0]
-        raw_emin = [-39.41, -39.41]
 
-        df = make_df(energy=energy, exp_value=exp_val, raw_e_min=raw_emin)
+        df = make_df(energy=energy, exp_value=exp_val)
         svc = ProbabilityService(None)
         # Pass a dummy alpha/gamma to bypass the single-siRNA early-exit path
         # (which returns a different metadata structure).
@@ -74,7 +74,6 @@ class TestBaseCase:
                 "sirna_id": ["siA", "siA", "siB", "siB"],
                 "energy": [-20.0, -15.0, -10.0, -5.0],
                 "exp_value": [1.0, 1.0, 1.0, 1.0],
-                "raw_e_min": [-39.0, -39.0, -39.0, -39.0],
                 "opening_energy": [0.0, 0.0, 0.0, 0.0],
                 "gene_id": ["g1", "g1", "g2", "g2"],
                 "transcript_id": ["t1", "t1", "t2", "t2"],
@@ -103,11 +102,10 @@ class TestAlphaGammaClamping:
     def _run(self, energies, exp_vals, alpha, gamma, emin=None):
         if emin is None:
             emin = self.E_MIN
-        raw_emins = [emin] * len(energies)
-        df = make_df(energy=energies, exp_value=exp_vals, raw_e_min=raw_emins)
+        df = make_df(energy=energies, exp_value=exp_vals)
         svc = ProbabilityService(None)
         _, meta = svc.calculate_probabilities_per_sirna(
-            df, alpha_gamma_pairs=[(alpha, gamma)]
+            df, alpha_gamma_pairs=[(alpha, gamma)], e_min={"si1": emin}
         )
         suffix = f":alpha={alpha},gamma={gamma}"
         return zoff_noacc_from_meta(meta, "si1", suffix)
@@ -146,8 +144,8 @@ class TestAlphaGammaClamping:
         assert abs(got / expected - 1.0) < 1e-5
 
     def test_raw_emin_anchors_clamping(self):
-        """raw_e_min overrides energy.min() as the clamping anchor."""
-        # If raw_e_min = -35 (less negative than actual energy = -39)
+        """A passed-in E_min overrides energy.min() as the clamping anchor."""
+        # If E_min = -35 (less negative than actual energy = -39)
         # then E_min used for clamping should be -35, not -39
         # At alpha=0.9: threshold with raw=-35 → 0.9*(-35) = -31.5
         #               threshold with raw=-39 → 0.9*(-39) = -35.1
@@ -156,11 +154,11 @@ class TestAlphaGammaClamping:
         energy = -32.0  # -32 < -31.5 (threshold with raw=-35) → clamped
         # -32 > -35.1 (threshold with raw=-39) → NOT clamped
 
-        # With raw_e_min present: should clamp
-        df_with = make_df(energy=[energy], exp_value=[1.0], raw_e_min=[raw_emin])
+        # With e_min given: should clamp
+        df_with = make_df(energy=[energy], exp_value=[1.0])
         svc = ProbabilityService(None)
         _, meta = svc.calculate_probabilities_per_sirna(
-            df_with, alpha_gamma_pairs=[(alpha, gamma)]
+            df_with, alpha_gamma_pairs=[(alpha, gamma)], e_min={"si1": raw_emin}
         )
         suffix = f":alpha={alpha},gamma={gamma}"
         z_with = zoff_noacc_from_meta(meta, "si1", suffix)
@@ -168,7 +166,7 @@ class TestAlphaGammaClamping:
         expected_clamped = math.exp(-clamped_e / RT)
         assert abs(z_with / expected_clamped - 1.0) < 1e-5
 
-        # Without raw_e_min: E_min = energy.min() = -32, threshold = 0.9*(-32) = -28.8
+        # Without e_min: E_min = energy.min() = -32, threshold = 0.9*(-32) = -28.8
         # -32 < -28.8 → would be clamped to gamma * (-32) = -32 (no change since gamma=1)
         df_without = pl.DataFrame(
             {
@@ -199,7 +197,7 @@ class TestThetaScaling:
         energy = -20.0
         assigned = theta * (energy + 10.0) - 10.0  # = 0.9*(-10) - 10 = -19.0
 
-        df = make_df(energy=[energy], exp_value=[1.0], raw_e_min=[-39.41])
+        df = make_df(energy=[energy], exp_value=[1.0])
         svc = ProbabilityService(None)
         _, meta = svc.calculate_probabilities_per_sirna(df, theta_values=[theta])
 
@@ -213,7 +211,7 @@ class TestThetaScaling:
         energy = -20.0
         assigned = theta * (energy + 10.0) - 10.0  # = 0.5*(-10) - 10 = -15.0
 
-        df = make_df(energy=[energy], exp_value=[1.0], raw_e_min=[-39.41])
+        df = make_df(energy=[energy], exp_value=[1.0])
         svc = ProbabilityService(None)
         _, meta = svc.calculate_probabilities_per_sirna(df, theta_values=[theta])
 
@@ -225,7 +223,7 @@ class TestThetaScaling:
     def test_theta_1_equals_base_case(self):
         """theta=1.0 should produce same Z_noacc as the base case."""
         energy = -20.0
-        df = make_df(energy=[energy], exp_value=[1.0], raw_e_min=[-39.41])
+        df = make_df(energy=[energy], exp_value=[1.0])
         svc = ProbabilityService(None)
         _, meta = svc.calculate_probabilities_per_sirna(df, theta_values=[1.0])
 
@@ -245,7 +243,6 @@ class TestOnTargetInPredictionsMode:
                 "sirna_id": ["si1", "si1"],
                 "energy": [-25.0, -30.0],
                 "exp_value": [100.0, 10.0],
-                "raw_e_min": [-39.41, -39.41],
                 "opening_energy": [0.0, 0.0],
                 "gene_id": ["g_off", "g_on"],
                 "transcript_id": ["t_off", "t_on"],
@@ -293,3 +290,50 @@ class TestOnTargetInPredictionsMode:
         zoff = zoff_noacc_from_meta(meta, "si1")
         # Without on_target_map, no rows are tagged → Zoff == Z_total
         assert abs(zoff / z_total - 1.0) < 1e-10
+
+
+class TestEMinMapping:
+    """E_min passed as a mapping anchors the clamp; metadata counts on-target rows."""
+
+    @staticmethod
+    def _clamped(e_min):
+        df = pl.DataFrame(
+            {
+                "sirna_id": ["s1", "s1"],
+                "energy": [-20.0, -15.0],
+                "exp_value": [1.0, 1.0],
+                "opening_energy": [0.0, 0.0],
+            }
+        )
+        res, _ = ProbabilityService(None).calculate_probabilities_per_sirna(
+            df, alpha_gamma_pairs=[(0.8, 0.8)], e_min=e_min
+        )
+        return res["energy:alpha=0.8,gamma=0.8"].to_list()
+
+    def test_e_min_mapping_anchors_clamping(self):
+        assert self._clamped({"s1": -20.0}) == pytest.approx([-16.0, -15.0])
+        assert self._clamped({"s1": -30.0}) == pytest.approx([-20.0, -15.0])
+        assert self._clamped(None) == pytest.approx([-16.0, -15.0])
+
+    def test_missing_e_min_entry_is_named(self):
+        df = pl.DataFrame(
+            {"sirna_id": ["s1", "s2"], "energy": [-20.0, -15.0], "opening_energy": 0.0}
+        )
+        with pytest.raises(ValueError, match="s2"):
+            ProbabilityService(None).calculate_probabilities_per_sirna(
+                df, e_min={"s1": -20.0}
+            )
+
+    def test_metadata_counts_on_target_rows(self):
+        df = pl.DataFrame(
+            {
+                "sirna_id": ["s1", "s1", "s2"],
+                "transcript_id": ["t_on", "t_off", "t_off"],
+                "energy": [-20.0, -15.0, -10.0],
+                "opening_energy": 0.0,
+            }
+        )
+        _, meta = ProbabilityService(None).calculate_probabilities_per_sirna(
+            df, on_target_map={"s1": "t_on", "s2": "t_on"}
+        )
+        assert meta["n_on_target_rows"] == {"s1": 1, "s2": 0}

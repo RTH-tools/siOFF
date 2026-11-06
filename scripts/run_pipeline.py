@@ -46,6 +46,7 @@ Config format (YAML):
     transcriptome: data/anno.gtf    # optional
     accessibility_dir: data/accessibility/
     output: results/off_targets.tsv
+    sirna_table: data/sirna_table.tsv   # required when alpha/gamma != 1
     alpha: "0.8;1.0"
     gamma: "1.0"
     type: gw
@@ -59,6 +60,7 @@ Multi-transcriptome fan-out (Slurm-native, one transcriptome per node):
 
   off_targets:                      # shared defaults for every group
     alpha: "0.8;1.0"
+    sirna_table: data/sirna_table.tsv
     type: gw
   transcriptomes:
     - name: human
@@ -181,12 +183,28 @@ _REMOVED_OFF_TARGETS_KEYS = {
         "the .summary files carry the partition-function header; "
         "--detailed-report keeps the per-interaction weights"
     ),
-    "on_target": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
-    "query": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
-    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --sirna-table",
+    "query": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_expression": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_accessibility": "give each siRNA's on-target ID in --sirna-table",
+    "on_target_ids": (
+        "renamed to sirna_table; the table needs a header with sirna_id, "
+        "on_target_id, sequence"
+    ),
 }
+
+
+def _resolve_matrix(value: str, base: Path) -> str:
+    """A bundled matrix name, or a DSM TSV path resolved like ``sioff -c`` does.
+
+    Only a relative path that names a file next to the config is resolved;
+    anything else (``t04``, an absolute path) passes through.
+    """
+    candidate = base / value
+    if not Path(value).is_absolute() and candidate.is_file():
+        return str(candidate)
+    return value
 
 
 def _build_off_targets(cfg: dict, base: Path) -> list[str]:
@@ -207,11 +225,13 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("accessibility_cache_dir", "--accessibility-cache-dir"),
         ("output", "--output"),
         ("fasta", "--fasta"),
-        ("on_target_ids", "--on-target-ids"),
+        ("sirna_table", "--sirna-table"),
     ]:
         val = _resolve(cfg.get(key), base)
         if val is not None:
             cmd += [flag, val]
+    if cfg.get("matrix") is not None:
+        cmd += ["--matrix", _resolve_matrix(str(cfg["matrix"]), base)]
 
     # Scalar options
     for key, flag in [

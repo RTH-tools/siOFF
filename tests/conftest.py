@@ -30,3 +30,18 @@ def strip_ansi(text: str) -> str:
 def plain():
     """Return :func:`strip_ansi`, for asserting on rendered CLI output."""
     return strip_ansi
+
+
+@pytest.fixture
+def warnings_seen():
+    """WARNING messages logged in this process while the test runs.
+
+    loguru handlers do not reach spawned workers, so this sees only what the
+    parent process logs.
+    """
+    from loguru import logger
+
+    seen: list[str] = []
+    handler = logger.add(lambda m: seen.append(m.record["message"]), level="WARNING")
+    yield seen
+    logger.remove(handler)

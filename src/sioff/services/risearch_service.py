@@ -7,7 +7,7 @@ intermediate TSV files.
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, cast
+from typing import Dict, List, Optional, Union, cast
 
 import polars as pl
 from Bio import SeqIO
@@ -365,55 +365,6 @@ class RIsearchService:
             emin = float(cast(float, df["energy"].min()))
             logger.debug(f"Self-hyb E_min {sirna_id}: {emin:.4f} kcal/mol")
             return emin
-
-    def self_hybridization_emin_batch(
-        self, fasta_path: Path, matrix: Union[str, Path] = "t04"
-    ) -> Dict[str, float]:
-        """Compute self-hybridisation E_min for all siRNAs in a FASTA file.
-
-        Each siRNA is searched against itself (seed_length = len - 1, energy ≤ 0),
-        replicating the old pipeline's minimum-energy anchor for alpha/gamma
-        clamping, with energy parameter set ``matrix``.
-        """
-        if not fasta_path.exists():
-            raise FileNotFoundError(f"siRNA FASTA not found: {fasta_path}")
-
-        records = list(SeqIO.parse(fasta_path, "fasta"))
-        logger.info(
-            f"Computing self-hybridisation E_min for {len(records)} siRNA(s)..."
-        )
-        result = {
-            r.id: self.self_hybridization_emin(str(r.seq), r.id, matrix=matrix)
-            for r in records
-        }
-        logger.info(f"Self-hybridisation complete: {len(result)} siRNA(s) processed")
-        return result
-
-    def search_single_sirna(
-        self, query_path: Path, target_path: Path
-    ) -> Tuple[float, int, int, str]:
-        """Run RIsearch for a single siRNA and return (energy, start, end, strand) of the best hit.
-
-        Returns (0.0, 0, 0, "+") if no hits found or search fails.
-        """
-        with tempfile.TemporaryDirectory(prefix="risearch_") as tmpdir:
-            index_path = Path(tmpdir) / "target.idx"
-            try:
-                self.index_target(target_path, index_path)
-                df = self.run_search(query_path, index_path)
-                if df.is_empty():
-                    logger.warning("No valid hits found")
-                    return 0.0, 0, 0, "+"
-                best = df.sort("energy").row(0, named=True)
-                return (
-                    float(best["energy"]),
-                    int(best["start"]),
-                    int(best["end"]),
-                    str(best["strand"]),
-                )
-            except RIsearchError as e:
-                logger.error(f"RIsearch failed: {e}")
-                return 0.0, 0, 0, "+"
 
 
 @lru_cache(maxsize=32)

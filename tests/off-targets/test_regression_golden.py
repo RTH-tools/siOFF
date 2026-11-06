@@ -85,6 +85,11 @@ def computed_meta(regression_input) -> dict:
         alpha_gamma_pairs=ALPHA_GAMMA,
         theta_values=THETA,
         on_target_map=ON_TARGET_MAP,
+        e_min=dict(
+            regression_input.group_by("sirna_id")
+            .agg(pl.col("raw_e_min").min())
+            .iter_rows()
+        ),
     )
     return meta
 

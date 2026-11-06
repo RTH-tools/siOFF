@@ -126,29 +126,11 @@ sioff off-targets \
   -a examples/data/accessibility \
   -o example_run/off_targets.tsv
 ```
-This should produce the `example_run/off_targets.tsv` file and print a summary like
+This produces `example_run/off_targets.tsv` and prints a summary like
 
 ```
-Calculating probabilities...
-✓ Loaded 231 predictions from predictions.out
-  └─ Energy range: -42.74 to -10.01 kcal/mol
-✓ Loaded 7 features from annotation.gtf
-✓ Found 85 intersecting off-target candidates
-                             Top 10 Candidates (By P_off_target)
-┏━━━━━━━━━━┳━━━━━━━┳━━━━━━━━━┳━━━━━━━━━━━━━━━┳━━━━━━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━┳━━━━━━━━━━━┓
-┃ sirna_id ┃ chrom ┃ gene_id ┃ transcript_id ┃ energy ┃ dG_total ┃ P_off_target ┃ exp_value ┃
-┡━━━━━━━━━━╇━━━━━━━╇━━━━━━━━━╇━━━━━━━━━━━━━━━╇━━━━━━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━╇━━━━━━━━━━━┩
-│ siRNA_3  │ chr1  │ gene_4  │ transcript_4  │ -42.74 │ -36.94   │ 1            │ 2000      │
-│ siRNA_2  │ chr1  │ gene_2  │ transcript_2  │ -32.26 │ -26.66   │ 1            │ 300       │
-│ siRNA_1  │ chr1  │ gene_1  │ transcript_1  │ -38.9  │ -32.7    │ 1            │ 1500      │
-│ siRNA_5  │ chr1  │ gene_7  │ transcript_7  │ -29.43 │ -23.33   │ 0.9954       │ 1200      │
-│ siRNA_4  │ chr1  │ gene_6  │ transcript_6  │ -34.15 │ -28.35   │ 0.7272       │ 600       │
-│ siRNA_4  │ chr1  │ gene_5  │ transcript_5  │ -34.15 │ -28.85   │ 0.2728       │ 100       │
-│ siRNA_5  │ chr1  │ gene_1  │ transcript_1  │ -22.58 │ -19.88   │ 0.004587     │ 1500      │
-│ siRNA_1  │ chr1  │ gene_4  │ transcript_4  │ -29.65 │ -23.75   │ 6.553e-07    │ 2000      │
-│ siRNA_2  │ chr1  │ gene_7  │ transcript_7  │ -21.54 │ -16.04   │ 1.3e-07      │ 1200      │
-│ siRNA_5  │ chr1  │ gene_4  │ transcript_4  │ -14.65 │ -9.555   │ 3.228e-10    │ 2000      │
-└──────────┴───────┴─────────┴───────────────┴────────┴──────────┴──────────────┴───────────┘
+✓ Processed 86 predictions → example_run/off_targets.tsv
+✓ Wrote 5 .summary files to example_run
 ```
 
 The same run expressed as a YAML config (the config is the complete, commented
@@ -164,7 +146,8 @@ Both produce the same table; the YAML run writes to
 ### What you get
 
 `example_run/` contains the main table `off_targets.tsv` — one row per
-annotated binding site, ranked by off-target probability — plus one
+annotated binding site, in one block per siRNA, each ranked by off-target
+probability — plus one
 `<sirna_id>.summary` file per siRNA with its partition-function statistics.
 The key columns:
 
@@ -261,18 +244,19 @@ Standalone prediction (stage 1 by itself) is also available as
    single position with an exon overlaps it. Exons with expression ≤ 0 are
    dropped after loading: they would add weight 0 to every partition function.
 4. Either **pre-computed [RIsearch](https://github.com/RTH-tools/risearch)
-   predictions** (TSV / `.out.gz` / directory
-   of per-siRNA Parquet files) **or** a siRNA FASTA plus target FASTA so siOFF
-   can run RIsearch itself in-process.
-5. Optional: a TSV mapping `sirna_id → transcript_id` (`--on-target-ids`) so
-   each siRNA's intended target enters the partition function as the on-target
-   term.
+   predictions** (a TSV / `.out.gz` / Parquet file, or a folder of them) **or**
+   a siRNA FASTA plus target FASTA so siOFF can run RIsearch itself in-process.
+5. Optional, but required for `--alpha`/`--gamma` other than 1: the **siRNA
+   table** (`--sirna-table`), which names each siRNA's intended target (it
+   enters the partition function as the on-target term) and gives its guide
+   sequence (for the perfect-match energy `E_min` needs, see
+   [Thermodynamic Model](#thermodynamic-model)). See
+   [Step 3](#step-3--off-target-analysis).
 
 ### Step 1 — RIsearch predictions
 
 If you already have RIsearch output, skip this step and pass the file (or a
-directory of per-siRNA Parquet files, which enables parallel per-siRNA
-processing) to `-r`.
+folder of files) to `-r`.
 
 Otherwise, generate the predictions with RIsearch in two commands: build the
 target index once (suffix-array construction is the expensive part; reuse
@@ -291,7 +275,8 @@ matrix; change them with `-s`, `-E`, `-e` and `-z` (see
 
 Alternatively, skip the separate file: `off-targets` runs the same search
 in-process when given `-s/--sirna-fasta sirnas.fa --target-fasta genome.fa`
-(plus `-idx genome.idx` to reuse the index) instead of `-r`, as in the
+(plus `-idx genome.idx` to reuse the index) instead of `-r`; `-s` is only that
+search's query and cannot be combined with `-r`, as in the
 [full example](#full-example-recompute-everything-from-fasta).
 
 ### Step 2 — Accessibility profiles
@@ -337,14 +322,40 @@ sioff off-targets \
   -a accessibility/ \
   --expression-metric RPKM \
   --type gw \
-  --on-target-ids on_target_map.tsv \
+  --sirna-table sirna_table.tsv \
   -o results/off_targets.tsv
 ```
+
+`-r` takes a file or a folder (a file is a folder of one). Every input is split
+into per-siRNA parts, scored in parallel with `-j` processes, and written as one
+block of rows per siRNA, sorted by `P_off_target` descending. The split writes
+every input again under `TMPDIR`, so for large runs `TMPDIR` needs free space
+about the size of the input.
+
+`--sirna-table` is a tab-separated file with a header; columns are found by
+name, `#` lines are skipped:
+
+| Column | Meaning |
+|--------|---------|
+| `sirna_id` | The siRNA, as named in the predictions |
+| `on_target_id` | Transcript or gene ID of its intended target; may be empty (no on-target) |
+| `sequence` | Guide strand, the one that was searched (`U` or `T`) |
+
+[`examples/data/sirna_table.tsv`](examples/data/sirna_table.tsv) is a worked
+example. The table is required when `--alpha`/`--gamma` set a pair other than
+1,1; at the baseline it only supplies the on-target.
+
+`-o` takes a `.tsv`, `.csv` or `.parquet` name (the suffix is replaced by the one
+of `--output-format`); any other name gets the extension appended, so
+`-o out` writes `out.tsv` with the `.summary` files in `out/`. The run
+overwrites an earlier table at that path, or removes it when it writes no
+rows; an argument error leaves it in place.
 
 Useful knobs: `--alpha/--gamma/--theta` for parameter sweeps (semicolon-
 separated values, each combination adds a `P_off_target:...` column),
 `-j` for worker count, `--output-format parquet` for large runs,
-`--detailed-report` for the raw per-interaction weights. Prefer the YAML
+`--detailed-report` for the raw per-interaction weights, `--profile` for a
+timing and memory breakdown. Prefer the YAML
 config for reproducibility — [`example_yaml/off-targets.example.yaml`](example_yaml/off-targets.example.yaml)
 documents every option; run it with `sioff -c my-config.yaml`.
 
@@ -365,7 +376,8 @@ that holds a complete cache needs no Parquet in `-a`. `off-targets` stops
 with an error when neither `-a` nor `--accessibility-cache-dir` holds any
 profile, and when it cannot write the cache.
 A failed worker never passes silently: the successful siRNAs are written, then
-`off-targets` reports `N/M siRNAs failed ...; first error: ...` and exits 1.
+`off-targets` reports `N/M tasks failed (input files or siRNAs) ...; first
+error: ...` and exits 1.
 
 ### Orchestrated multi-step runs (local + Slurm)
 
@@ -414,8 +426,8 @@ Available on `sioff` itself, before any subcommand.
 
 | Flag | Description |
 |------|-------------|
-| `-r / --risearch-file` | Pre-computed predictions (TSV, `.out.gz`, or directory of Parquet files — directory triggers parallel per-siRNA mode) |
-| `-s / --sirna-fasta` | siRNA FASTA — runs RIsearch in-process via PyO3 bindings |
+| `-r / --risearch-file` | Pre-computed predictions: a file (TSV, `.out.gz`, Parquet) or a folder of them; either way split per siRNA and scored in parallel |
+| `-s / --sirna-fasta` | siRNA FASTA — the query of the in-process RIsearch run; cannot be combined with `-r` |
 | `--target-fasta / --genome` | Target FASTA for in-process RIsearch |
 | `-idx / --target-index` | Pre-built RIsearch index (speeds up repeated runs) |
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
@@ -425,9 +437,14 @@ Available on `sioff` itself, before any subcommand.
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
 | `--sense-only` | Keep only `+`-strand predictions (use it with profiles from `accessibility --strand +`) |
 | `--alpha / --gamma / --theta` | Parameter sweep values (semicolon-separated, e.g. `0.8;1.0`) |
-| `--on-target-ids / -oi` | TSV mapping `sirna_id → transcript_id` for on-target normalization |
+| `--sirna-table` | TSV `sirna_id`, `on_target_id`, `sequence` (header required): the on-target and the perfect-match energy for `E_min`; required for `--alpha`/`--gamma` other than 1,1 |
+| `-z / --matrix` | Energy parameter set (`t04`, `slh04`, `s95-rna-dna`, `s95-dna-rna` or a DSM TSV path) for the in-process search and the perfect-match energy of `E_min`; use the set the predictions were searched with (default: `t04`) |
+| `--detailed-report` | Add the raw weights, partition functions and `E_min` to the table |
+| `--summary-only` | Write only the `.summary` files |
+| `--output-format` | `tsv` (default), `csv` or `parquet` |
+| `--profile` | Print the run's timing and memory breakdown |
 | `-j / --workers` | Parallel worker processes (default: CPU count) |
-| `-o / --output` | Output file path (TSV by default) |
+| `-o / --output` | Output table; see [Step 3](#step-3--off-target-analysis) for how the name becomes the file name |
 
 ### `accessibility`
 
@@ -441,7 +458,6 @@ Available on `sioff` itself, before any subcommand.
 | `-L / --span` | Max base-pair span L (default: 40) |
 | `-u / --unpaired` | Unpaired probability length u (default: 30) |
 | `-T / --temperature` | Folding temperature °C (default: 37.0) |
-| `-z / --matrix` | Energy parameter set (`t04`, `slh04`, `s95-rna-dna`, `s95-dna-rna` or a DSM TSV path) for in-process searches and the self-hybridisation E_min of `-s`; use the set the predictions were searched with (default: `t04`) |
 | `-j / --workers` | Parallel folding processes; with the npy output, records are folded in batches of about 2 Mb (default: 1) |
 
 ### `index`
@@ -531,8 +547,8 @@ df = sioff.off_targets(
 
 **Notes**
 
-- `sioff.off_targets` takes its predictions from one of `predictions=` (a `polars.DataFrame` in the `sioff.search` schema: `sirna_id, chrom, start, end, strand, energy`), `risearch_file=` (a RIsearch output file) or `sirna_fasta=` + `target_fasta=` (run RIsearch in-process), and returns a `polars.DataFrame`. With a **directory** of per-siRNA files in `risearch_file=` it returns a **generator** yielding one `polars.DataFrame` per siRNA; iterate it to consume the results. No form writes files — the API layer returns results in memory, and writing output is the CLI's job.
-- `sioff.accessibility` likewise writes nothing: it returns `dict[chrom -> polars.DataFrame]`, which `sioff.off_targets(accessibility=...)` takes directly (single-frame forms only; the directory form needs `accessibility_dir=`). Use the `accessibility` CLI command (or `sioff -c <config>`) if you want profiles on disk (the packed `accessibility.*.packed.npy` cache, or one `{chrom}.accessibility.parquet` per record with `--output-format parquet`).
+- `sioff.off_targets` takes its predictions from one of `predictions=` (a `polars.DataFrame` in the `sioff.search` schema: `sirna_id, chrom, start, end, strand, energy`), `risearch_file=` (a RIsearch output file, or a folder of them) or `sirna_fasta=` + `target_fasta=` (run RIsearch in-process), and returns one `polars.DataFrame` for every input (an empty result is a frame with no columns). Pass `stream=True` for a **generator** of one `polars.DataFrame` per siRNA instead, so a large folder never sits in memory at once; argument errors surface at the first `next()`, and `.close()` stops it early. The on-target table is `sirna_table=`. No form writes files — the API layer returns results in memory, and writing output is the CLI's job.
+- `sioff.accessibility` likewise writes nothing: it returns `dict[chrom -> polars.DataFrame]`, which `sioff.off_targets(accessibility=...)` takes directly (packed like `-a`, so the opening energies are quantised to 0.1 kcal/mol). Use the `accessibility` CLI command (or `sioff -c <config>`) if you want profiles on disk (the packed `accessibility.*.packed.npy` cache, or one `{chrom}.accessibility.parquet` per record with `--output-format parquet`).
 - On bad input the API functions raise ordinary Python exceptions — `FileNotFoundError` or `ValueError` — not `typer.Exit`. `typer.Exit` is raised only by the CLI layer for its own argument validation.
 - `sioff.index` / `sioff.search` call the `risearch` bindings in-process — the same dependency the CLI's `index`/`search` commands use.
 
@@ -556,6 +572,7 @@ P(off-target_i | siRNA_s) = W_i / Z_s
 - **ΔG_opening**: Accessibility penalty — cost to unfold the target region, retrieved from pre-computed `RNA.pfl_fold_up` profiles.
 - **Expression weighting**: annotation-derived RPKM/TPM values scale each site's contribution.
 - **Per-siRNA normalization**: Partition functions are computed independently per siRNA; mixing them is biologically incorrect.
+- **E_min** (used by `--alpha`/`--gamma`): the lower of the perfect-match energy of the siRNA's table sequence and the lowest energy among the hits left after `--sense-only` and the annotation intersection. The perfect-match energy is computed with `-z/--matrix`, so pass the set the predictions were searched with. The baseline α=γ=1 and `--theta` do not depend on it. α/γ ≠ 1 results differ from siOFF 0.2.0, except for folder runs (`-r <dir>`) that passed `-s`: E_min now always includes the perfect-match energy from `--sirna-table`, which only those runs had, and folder runs without `-s` no longer take it from every hit in the file, so the hits the intersection drops and, with `--sense-only`, minus-strand hits no longer count.
 
 ### Parameter sweeps
 
@@ -579,16 +596,20 @@ P(off-target_i | siRNA_s) = W_i / Z_s
 | `P_off_target` | Off-target probability (baseline α=γ=θ=1) |
 | `P_off_target:alpha=X,gamma=Y` | Per-parameter-set probabilities |
 
-One `<sirna_id>.summary` file per siRNA is written next to the output with the
+Rows come in one block per siRNA, each sorted by `P_off_target` descending, in
+the `--output-format` you chose. One `<sirna_id>.summary` file per siRNA is written next to the output with the
 partition-function statistics (`P`, `Z`, `Zoff`, with and without
 accessibility). `--summary-only` skips the per-prediction table — the old
 pipeline's default behaviour.
 
 `--detailed-report` adds the raw per-interaction columns to the table:
-`boltzmann_weight` (and `boltzmann_weight_noacc`), `Z_sirna` (and
-`Z_sirna_noacc`) and `E_min`, each repeated with a `:alpha=X,gamma=Y` or
-`:theta=T` suffix per extra parameter set. It cannot be combined with
-`--summary-only`.
+`boltzmann_weight` (and `boltzmann_weight_noacc`) and `Z_sirna` (and
+`Z_sirna_noacc`), each repeated with a `:alpha=X,gamma=Y` or `:theta=T`
+suffix per extra parameter set, and `E_min` once. `E_min` follows the rule
+under [Thermodynamic Model](#thermodynamic-model) for a siRNA with a
+`--sirna-table` row; for one without (no table, which only the baseline
+allows, or a missing row) it is the strongest hit left. It cannot be
+combined with `--summary-only`.
 
 ---
 

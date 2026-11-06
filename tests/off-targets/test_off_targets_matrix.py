@@ -1,13 +1,13 @@
 """`off-targets -z/--matrix` reaches every RIsearch call the command makes.
 
-E_min, the reference energy of the alpha/gamma clamp, is each siRNA's
-self-hybridisation minimum (`-s/--sirna-fasta`). It used to be computed with
-the bundled `t04` table whatever the predictions had been searched with, so
-predictions from RIsearch2 (whose `t04` differs slightly from RIsearch3's)
-were clamped against a shifted threshold: in the RIsearch3 off-target
-benchmark every one of 298 checked siRNAs had a self-hybridisation E_min
-0.06-0.13 kcal/mol away from the legacy pipeline's, and with RIsearch2's
-`t04` exported to a DSM TSV all 298 matched.
+E_min, the reference energy of the alpha/gamma clamp, starts from each
+siRNA's self-hybridisation minimum (its `--sirna-table` sequence). It used to
+be computed with the bundled `t04` table whatever the predictions had been
+searched with, so predictions from RIsearch2 (whose `t04` differs slightly
+from RIsearch3's) were clamped against a shifted threshold: in the RIsearch3
+off-target benchmark every one of 298 checked siRNAs had a self-hybridisation
+E_min 0.06-0.13 kcal/mol away from the legacy pipeline's, and with
+RIsearch2's `t04` exported to a DSM TSV all 298 matched.
 """
 
 from pathlib import Path
@@ -37,16 +37,6 @@ class TestSelfHybridisationMatrix:
         assert t04 < 0 and slh04 < 0
         assert t04 != pytest.approx(slh04)
 
-    def test_batch_passes_the_matrix_to_every_siRNA(self, tmp_path):
-        sid, seq = _first_sequence()
-        fa = tmp_path / "one.fa"
-        fa.write_text(f">{sid}\n{seq}\n")
-        svc = RIsearchService()
-        batch = svc.self_hybridization_emin_batch(fa, matrix="slh04")
-        assert batch == {
-            sid: pytest.approx(svc.self_hybridization_emin(seq, sid, matrix="slh04"))
-        }
-
     def test_unknown_matrix_is_rejected(self):
         sid, seq = _first_sequence()
         with pytest.raises(Exception, match="matrix"):
@@ -54,27 +44,30 @@ class TestSelfHybridisationMatrix:
 
 
 class TestPlumbing:
-    def test_directory_mode_uses_the_matrix_for_emin(self, monkeypatch, tmp_path):
+    def test_engine_uses_the_matrix_for_emin(self, monkeypatch, tmp_path):
         seen = {}
 
-        def fake_batch(self, fasta_path, matrix="t04"):
+        def fake(self, sequence, sirna_id="query", matrix="t04"):
             seen["matrix"] = matrix
             raise RuntimeError("stop after E_min")
 
-        monkeypatch.setattr(
-            RIsearchService, "self_hybridization_emin_batch", fake_batch
-        )
-        from sioff.core.off_targets import compute_off_targets_directory
+        monkeypatch.setattr(RIsearchService, "self_hybridization_emin", fake)
+        from sioff.core.off_targets import compute_off_targets
 
         (tmp_path / "in").mkdir()
         (tmp_path / "in" / "risearch_a.out").write_text(
             (DATA / "risearch_siRNAID.out").read_text()
         )
+        _, seq = _first_sequence()
+        table = tmp_path / "sirna_table.tsv"
+        table.write_text(f"sirna_id\ton_target_id\tsequence\nsiRNAID\t\t{seq}\n")
         with pytest.raises(RuntimeError, match="stop after E_min"):
             list(
-                compute_off_targets_directory(
-                    input_dir=tmp_path / "in",
-                    sirna_fasta=DATA / "sirnas.fa",
+                compute_off_targets(
+                    risearch_file=tmp_path / "in",
+                    sirna_table=table,
+                    alpha="0.8",
+                    gamma="0.8",
                     matrix="slh04",
                 )
             )
@@ -88,34 +81,31 @@ class TestPlumbing:
         out = plain(result.output)
         assert "--matrix" in out and "-z" in out
 
-    def test_cli_passes_the_option_to_the_directory_core(self, monkeypatch, tmp_path):
+    def test_cli_passes_the_option_to_the_engine(self, monkeypatch, tmp_path):
         seen = {}
 
-        def fake_directory(**kwargs):
+        def fake_engine(**kwargs):  # a generator, like the engine
             seen.update(kwargs)
-            return iter(())
+            yield from ()
 
-        monkeypatch.setattr(
-            "sioff.core.off_targets.compute_off_targets_directory", fake_directory
-        )
+        monkeypatch.setattr("sioff.core.off_targets.compute_off_targets", fake_engine)
         (tmp_path / "in").mkdir()
         (tmp_path / "in" / "risearch_a.out").write_text(
             (DATA / "risearch_siRNAID.out").read_text()
         )
-        runner.invoke(
+        result = runner.invoke(
             app,
             [
                 "off-targets",
                 "-r",
                 str(tmp_path / "in"),
-                "-s",
-                str(DATA / "sirnas.fa"),
                 "-z",
                 "slh04",
                 "-o",
                 str(tmp_path / "out.tsv"),
             ],
         )
+        assert result.exit_code == 0, result.output
         assert seen.get("matrix") == "slh04"
 
     def test_config_accepts_matrix_and_resolves_a_relative_table(self, tmp_path):

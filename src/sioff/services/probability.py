@@ -1,4 +1,4 @@
-from typing import Optional, Tuple, Dict
+from typing import Mapping, Optional, Tuple, Dict
 
 import polars as pl
 from loguru import logger
@@ -12,25 +12,15 @@ T = 310.15
 RT = R * T
 
 
-def _require_opening_energy(df: pl.DataFrame) -> None:
-    if "opening_energy" not in df.columns:
-        raise ValueError(
-            "precomputed_opening_energy=True but the frame has no 'opening_energy' "
-            "column"
-        )
-
-
 class ProbabilityService:
     """Calculate off-target probabilities by integrating hybridization energy and accessibility."""
 
     def __init__(
         self,
         accessibility_service: Optional[GenomeAccessibilityService] = None,
-        precomputed_accessibility: Optional[pl.DataFrame] = None,
         temperature: float = 37.0,
     ):
         self.accessibility_service = accessibility_service
-        self.precomputed_accessibility = precomputed_accessibility
         self._temperature = temperature
         self._RT = R * (temperature + 273.15)
 
@@ -40,7 +30,7 @@ class ProbabilityService:
         alpha_gamma_pairs: Optional[list[tuple[float, float]]] = None,
         theta_values: Optional[list[float]] = None,
         on_target_map: Optional[dict[str, str]] = None,
-        precomputed_opening_energy: bool = False,
+        e_min: Optional[Mapping[str, float]] = None,
         aggregate_only: bool = False,
     ) -> Tuple[pl.DataFrame, Dict]:
         """Per-siRNA partition-function probabilities with optional alpha/gamma/theta sweeps.
@@ -55,9 +45,15 @@ class ProbabilityService:
         With an ``on_target_map`` the on-target rows are already in ``df`` and
         are tagged by ID match.
 
-        With ``precomputed_opening_energy`` the frame must already carry an
-        ``opening_energy`` column (e.g. gathered chromosome-major by the
-        directory core) and the accessibility service is not consulted.
+        With ``e_min`` (``sirna_id -> E_min``) the clamp of every alpha/gamma
+        set is anchored on that value; a siRNA missing from it raises
+        ``ValueError``. Without it ``E_min`` is the minimum ``energy`` of the
+        siRNA's rows in ``df``. The metadata's ``n_on_target_rows`` counts each
+        siRNA's rows tagged on-target (0 when none).
+
+        With an accessibility service the opening energies are looked up;
+        without one an ``opening_energy`` column already in ``df`` is used,
+        and otherwise they are 0.
         """
         if "energy" not in df.columns:
             logger.warning("No 'energy' column found. Cannot calculate probabilities.")
@@ -74,9 +70,7 @@ class ProbabilityService:
             f"Processing {len(unique_sirnas)} siRNAs with per-siRNA partition functions"
         )
 
-        if precomputed_opening_energy:
-            _require_opening_energy(df)
-        elif self.accessibility_service:
+        if self.accessibility_service:
             df = self._annotate_opening_energy(df)
 
         if "opening_energy" in df.columns:
@@ -129,12 +123,17 @@ class ProbabilityService:
         else:
             df = df.with_columns(pl.lit(False).alias("is_on_target"))
 
-        # Use raw_e_min (from full genome scan) when available; fall back to
-        # post-intersection minimum. raw_e_min is set by the parser when loading
-        # per-siRNA directory files.
-        if "raw_e_min" in df.columns:
-            min_energies = df.group_by("sirna_id").agg(
-                pl.col("raw_e_min").min().alias("E_min")
+        if e_min is not None:
+            missing = sorted(str(sid) for sid in unique_sirnas if sid not in e_min)
+            if missing:
+                raise ValueError(f"No E_min given for siRNA(s): {', '.join(missing)}")
+            min_energies = pl.DataFrame(
+                {
+                    "sirna_id": unique_sirnas,
+                    "E_min": pl.Series([e_min[sid] for sid in unique_sirnas]).cast(
+                        df["energy"].dtype
+                    ),
+                }
             )
         else:
             min_energies = df.group_by("sirna_id").agg(
@@ -236,7 +235,14 @@ class ProbabilityService:
         if not aggregate_only:
             df = df.with_columns(all_weight_exprs)
 
-        agg_df = df.group_by("sirna_id").agg(z_aggs + on_aggs)
+        agg_df = df.group_by("sirna_id").agg(
+            z_aggs + on_aggs + [pl.col("is_on_target").sum().alias("_n_on")]
+        )
+        n_on_target_rows = {
+            row["sirna_id"]: int(row["_n_on"])
+            for row in agg_df.select("sirna_id", "_n_on").iter_rows(named=True)
+        }
+        agg_df = agg_df.drop("_n_on")
         z_df = agg_df.select(["sirna_id"] + z_col_names)
 
         on_target_weight_metadata = {}
@@ -259,6 +265,7 @@ class ProbabilityService:
             "z_per_sirna": z_stats_dict,
             "on_target_weights": on_target_weight_metadata,
             "on_target_count": len(on_target_weight_metadata),
+            "n_on_target_rows": n_on_target_rows,
         }
         if aggregate_only:
             return df.head(0), metadata
@@ -341,22 +348,6 @@ class ProbabilityService:
                 "Missing coordinate or strand columns. Cannot lookup accessibility."
             )
             return df
-
-        if self.precomputed_accessibility is not None:
-            join_keys = ["chrom", "start", "end", "strand"]
-            result = df.join(
-                self.precomputed_accessibility.select(join_keys + ["opening_energy"]),
-                on=join_keys,
-                how="left",
-            )
-            if "opening_energy" in result.columns:
-                result = result.with_columns(pl.col("opening_energy").fill_null(10.0))
-            else:
-                result = result.with_columns(pl.lit(10.0).alias("opening_energy"))
-            logger.info(
-                f"Annotated {result.height} rows with precomputed accessibility"
-            )
-            return result
 
         if not self.accessibility_service:
             return df

@@ -28,17 +28,6 @@ def test_series_methods_forwarded_to_expr_return_a_series() -> None:
     assert sorted(s.unique().to_list()) == ["x", "y"]
 
 
-def test_parser_summary_lists_chromosomes_and_strands(tmp_path: Path) -> None:
-    path = tmp_path / "pred.out"
-    path.write_text(
-        "si1\t1\t21\tchr1\t10\t30\t+\t-20.5\nsi1\t1\t21\tchr2\t50\t70\t-\t-15.0\n"
-    )
-    parser = RIsearchParser()
-    summary = parser.summary(parser.load(path))
-    assert sorted(summary["chromosomes"]) == ["chr1", "chr2"]
-    assert sorted(summary["strands"]) == ["+", "-"]
-
-
 def test_parser_reads_risearch2_rows_wider_than_eight_columns(tmp_path: Path) -> None:
     """Columns are picked by position; trailing extra columns are ignored."""
     path = tmp_path / "pred.out"
@@ -47,16 +36,6 @@ def test_parser_reads_risearch2_rows_wider_than_eight_columns(tmp_path: Path) ->
     assert df.columns == RISEARCH_COLUMNS
     assert df.schema == pl.Schema(RISEARCH_SCHEMA)
     assert df.row(0) == ("si1", "chr1", 10, 30, "+", -20.5)
-
-
-def test_load_single_file_reads_headerless_risearch2(tmp_path: Path) -> None:
-    path = tmp_path / "si1.out"
-    path.write_text(
-        "si1\t1\t21\tchr1\t10\t30\t+\t-20.5\nsi1\t1\t21\tchr1\t50\t70\t-\t-25.0\n"
-    )
-    df = RIsearchParser().load_single_file(path)
-    assert df["raw_e_min"].to_list() == [-25.0, -25.0]
-    assert df["start"].dtype == pl.Int32
 
 
 def test_parser_reads_sioff_search_output(tmp_path: Path) -> None:
@@ -70,31 +49,33 @@ def test_parser_reads_sioff_search_output(tmp_path: Path) -> None:
     assert df.row(0) == ("si1", "chr1", 10, 30, "+", -20.5)
 
 
-def test_on_target_ids_file_is_parsed(tmp_path: Path) -> None:
-    """The headerless sirna_id -> transcript_id map was read by polars 1.x column names."""
-    kwargs = dict(
+def test_sirna_table_on_targets_are_tagged(tmp_path: Path) -> None:
+    """The siRNA table is read by column name, whatever polars calls headerless columns."""
+    table = tmp_path / "sirna_table.tsv"
+    table.write_text(
+        "sirna_id\ton_target_id\tsequence\nsiRNA_4\ttranscript_6\tACGUACGU\n"
+    )
+
+    df = sioff.off_targets(
         risearch_file=EXAMPLES / "predictions.out",
         gtf_file=EXAMPLES / "annotation.gtf",
         accessibility_dir=EXAMPLES / "accessibility",
+        sirna_table=table,
     )
-    mapping = tmp_path / "on_target.tsv"
-    mapping.write_text("siRNA_4\ttranscript_6\n")
-
-    df = sioff.off_targets(**kwargs, on_target_ids_file=mapping)
 
     tagged = df.filter(pl.col("is_on_target")).select("sirna_id", "transcript_id")
     assert tagged.height > 0
     assert set(tagged.iter_rows()) == {("siRNA_4", "transcript_6")}
 
 
-def test_malformed_on_target_ids_file_raises_value_error(tmp_path: Path) -> None:
-    mapping = tmp_path / "on_target.tsv"
-    mapping.write_text("only_one_column\n")
-    with pytest.raises(ValueError, match="on-target mapping"):
+def test_sirna_table_without_its_columns_raises_value_error(tmp_path: Path) -> None:
+    table = tmp_path / "sirna_table.tsv"
+    table.write_text("only_one_column\n")
+    with pytest.raises(ValueError, match="missing column"):
         sioff.off_targets(
             risearch_file=EXAMPLES / "predictions.out",
             gtf_file=EXAMPLES / "annotation.gtf",
-            on_target_ids_file=mapping,
+            sirna_table=table,
         )
 
 
@@ -107,13 +88,10 @@ def test_directory_mode_with_annotation(tmp_path: Path) -> None:
         rows = [line for line in lines if line.startswith(sirna + "\t")]
         (pred_dir / f"{sirna}.out").write_text("".join(rows))
 
-    frames = list(
-        sioff.off_targets(
-            risearch_file=pred_dir,
-            gtf_file=EXAMPLES / "annotation.gtf",
-            n_workers=2,
-        )
+    df = sioff.off_targets(
+        risearch_file=pred_dir,
+        gtf_file=EXAMPLES / "annotation.gtf",
+        n_workers=2,
     )
-    df = pl.concat(frames, how="diagonal_relaxed")
     assert set(df["sirna_id"]) == {"siRNA_1", "siRNA_4"}
     assert df["gene_id"].null_count() == 0

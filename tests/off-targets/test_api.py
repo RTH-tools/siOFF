@@ -7,13 +7,16 @@ defaults must be real values (e.g. ``None``, ``"1.0"``) rather than Typer
 functions with ordinary keyword arguments works without OptionInfo leakage.
 """
 
+import collections.abc
 import inspect
 from pathlib import Path
 
 import polars as pl
 import pytest
+from polars.testing import assert_frame_equal
 
 import sioff
+from sioff.services.risearch_parser import RIsearchParser
 
 DATA_DIR = Path(__file__).parent / "data"
 RISEARCH_FILE = DATA_DIR / "risearch_siRNAID.out"
@@ -126,35 +129,83 @@ def test_off_targets_accepts_str_path() -> None:
     assert df.height > 0, "Expected a non-empty result DataFrame"
 
 
-def test_off_targets_directory_mode_yields_dataframes(tmp_path: Path) -> None:
-    """A *directory* of per-siRNA prediction files returns a generator yielding
-    one in-memory DataFrame per siRNA — and writes NO files (the in-memory API).
+def _engine_dirs(root: Path) -> list[str]:
+    return sorted(p.name for p in root.iterdir() if p.name.startswith("sioff_split_"))
 
-    This is the contract change from the earlier re-export, which returned a
-    summary dict and streamed to disk. File writing is now the CLI's job.
-    """
-    in_dir = tmp_path / "in"
-    in_dir.mkdir()
-    (in_dir / RISEARCH_FILE.name).write_bytes(RISEARCH_FILE.read_bytes())
 
-    files_before = set(tmp_path.rglob("*"))
-    gen = sioff.off_targets(risearch_file=str(in_dir))
+@pytest.fixture
+def tmp_root(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Point every tempfile call (this process and spawned workers) at one dir."""
+    import tempfile
 
-    import collections.abc
+    root = tmp_path / "tmp"
+    root.mkdir()
+    monkeypatch.setenv("TMPDIR", str(root))
+    monkeypatch.setattr(tempfile, "tempdir", str(root))
+    return root
 
-    assert isinstance(gen, collections.abc.Iterator), (
-        f"Expected a generator/iterator, got {type(gen)!r}"
+
+def _example_folder(tmp_path: Path) -> Path:
+    """The example predictions (5 siRNAs) in a folder, one file per siRNA."""
+    folder = tmp_path / "in"
+    folder.mkdir()
+    lines = (EXAMPLES / "predictions.out").read_text().splitlines(keepends=True)
+    for sid in sorted({line.split("\t", 1)[0] for line in lines}):
+        rows = [line for line in lines if line.startswith(sid + "\t")]
+        (folder / f"{sid}.out").write_text("".join(rows))
+    return folder
+
+
+@pytest.mark.parametrize("form", ["file", "folder"])
+def test_stream_yields_one_frame_per_sirna(
+    tmp_path: Path, tmp_root: Path, form: str
+) -> None:
+    """``stream=True`` yields one DataFrame per siRNA, for a file and a folder,
+    writes no files, and closing it closes the run (its temp dirs go)."""
+    source = (
+        EXAMPLES / "predictions.out" if form == "file" else _example_folder(tmp_path)
     )
+    files_before = set(tmp_path.rglob("*"))
 
+    gen = sioff.off_targets(risearch_file=str(source), stream=True)
+    assert isinstance(gen, collections.abc.Iterator), type(gen)
     frames = list(gen)
-    assert frames, "Expected at least one per-siRNA DataFrame"
+    assert sorted(df["sirna_id"].unique().item() for df in frames) == [
+        f"siRNA_{i}" for i in range(1, 6)
+    ]
     for df in frames:
-        assert isinstance(df, pl.DataFrame), f"Expected pl.DataFrame, got {type(df)!r}"
-        assert df.height > 0
+        assert isinstance(df, pl.DataFrame) and df.height > 0
         assert "P_off_target" in df.columns
+    assert set(tmp_path.rglob("*")) == files_before, "the in-memory API wrote files"
 
-    # The in-memory API must not write anything to disk.
-    assert set(tmp_path.rglob("*")) == files_before, "directory mode wrote files"
+    gen = sioff.off_targets(risearch_file=source, stream=True)
+    next(gen)
+    assert len(_engine_dirs(tmp_root)) == 1, "no split dir seen mid-run"
+    gen.close()
+    assert _engine_dirs(tmp_root) == [], "closing the stream left the run open"
+
+
+def test_folder_returns_one_dataframe_by_default(tmp_path: Path) -> None:
+    """Without ``stream`` a folder gives one DataFrame, the same rows as the file."""
+    from_folder = sioff.off_targets(risearch_file=_example_folder(tmp_path))
+    from_file = sioff.off_targets(risearch_file=EXAMPLES / "predictions.out")
+    assert isinstance(from_folder, pl.DataFrame)
+    assert from_folder["sirna_id"].n_unique() == 5
+    keys = ["sirna_id", "chrom", "start", "end", "strand", "energy"]
+    assert_frame_equal(from_folder.sort(keys), from_file.sort(keys))
+
+
+def test_no_frames_give_an_empty_dataframe() -> None:
+    """A run with nothing to score still returns a DataFrame, not a generator."""
+    df = sioff.off_targets(predictions=RIsearchParser().load(RISEARCH_FILE).head(0))
+    assert isinstance(df, pl.DataFrame) and df.is_empty()
+
+
+def test_on_target_ids_file_parameter_is_gone() -> None:
+    params = inspect.signature(sioff.off_targets).parameters
+    assert "on_target_ids_file" not in params
+    assert params["sirna_table"].default is None
+    assert params["stream"].default is False
 
 
 def test_off_targets_no_input_raises_value_error() -> None:
@@ -266,19 +317,6 @@ def test_off_targets_accessibility_and_dir_together_raise(tmp_path: Path) -> Non
             accessibility=profiles,
             accessibility_dir=tmp_path,
         )
-
-
-def test_off_targets_directory_mode_rejects_in_memory_accessibility(
-    tmp_path: Path,
-) -> None:
-    """Directory mode streams per-siRNA files through worker processes that
-    read profiles from disk; in-memory profiles are a single-frame feature."""
-    in_dir = tmp_path / "in"
-    in_dir.mkdir()
-    (in_dir / RISEARCH_FILE.name).write_bytes(RISEARCH_FILE.read_bytes())
-    profiles = {"chr1": pl.DataFrame({"position": [1], "strand": ["+"], "u1": [1.0]})}
-    with pytest.raises(ValueError, match="accessibility_dir"):
-        sioff.off_targets(risearch_file=in_dir, accessibility=profiles)
 
 
 def test_search_output_feeds_off_targets_in_memory(tmp_path: Path) -> None:

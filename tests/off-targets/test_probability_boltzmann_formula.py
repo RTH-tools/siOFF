@@ -1,3 +1,12 @@
+"""The per-siRNA model's weights and probabilities follow the Boltzmann formula.
+
+W_i = exp_value_i * exp(-(energy_i + opening_energy_i) / RT) and
+P_i = W_i / sum(W): checked against a direct computation with no expression,
+with a missing expression (weight 0) and with accessibility looked up through
+the service. The file used to compare the deleted single-siRNA model with
+the per-siRNA one; the formula is what is left to pin.
+"""
+
 from unittest.mock import MagicMock
 
 import polars as pl

@@ -63,6 +63,24 @@ def test_step1_commands_feed_off_targets(clone_root: Path) -> None:
     assert set(out["sirna_id"]) <= {f"siRNA_{i}" for i in range(1, 6)}
 
 
+def test_quick_start_with_sirna_table(clone_root: Path) -> None:
+    """Step 3's command with the bundled siRNA table and a non-baseline alpha/gamma."""
+    data = "examples/data"
+    result = CliRunner().invoke(
+        app,
+        ["off-targets", "-r", f"{data}/predictions.out", "-t", f"{data}/annotation.gtf",
+         "-a", f"{data}/accessibility", "--sirna-table", f"{data}/sirna_table.tsv",
+         "--alpha", "0.8", "--gamma", "0.8", "-o", "out/off_targets.tsv"],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+    assert "no on-target row" not in result.output
+    summaries = {p.stem for p in (clone_root / "out").glob("*.summary")}
+    assert summaries == {f"siRNA_{i}" for i in range(1, 6)}
+    out = pl.read_csv(clone_root / "out" / "off_targets.tsv", separator="\t")
+    swept = out["P_off_target:alpha=0.8,gamma=0.8"]
+    assert out.height > 0 and swept.null_count() == 0
+
+
 def _slug(heading: str) -> str:
     """GitHub's heading anchor: lowercase, punctuation dropped, spaces to dashes."""
     text = heading.strip().lower().replace("`", "")
