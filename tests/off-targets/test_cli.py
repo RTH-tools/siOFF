@@ -306,10 +306,15 @@ def test_flag_names_are_the_options_of_the_command() -> None:
 # ---------------------------------------------------------------------------
 # -o never resolves to an input: removing a stale table must not delete it
 # ---------------------------------------------------------------------------
+def _squash(text: str) -> str:
+    """No whitespace at all: Rich wraps long paths, even inside a word."""
+    return "".join(text.split())
+
+
 def _refuses_to_overwrite(result, plain, flag: str, path: Path) -> None:
     assert result.exit_code == 1, result.output
-    text = " ".join(plain(result.output).split())
-    assert f"-o/--output resolves to the {flag} input {path}" in text, text
+    text = _squash(plain(result.output))
+    assert _squash(f"-o/--output resolves to the {flag} input {path}") in text, text
 
 
 def test_output_equal_to_the_predictions_is_refused(tmp_path: Path, plain) -> None:
@@ -349,3 +354,47 @@ def test_output_spelling_the_predictions_differently_is_refused(
     _refuses_to_overwrite(result, plain, "-r/--risearch-file", hits)
     assert hits.read_bytes() == TSV.read_bytes()
     assert output.exists()
+
+
+def _per_sirna_folder(tmp_path: Path) -> Path:
+    """The example predictions as one RIsearch2 .tsv per siRNA."""
+    preds = tmp_path / "preds"
+    preds.mkdir()
+    lines = (EXAMPLES / "predictions.out").read_text().splitlines(keepends=True)
+    for sid in sorted({line.split("\t", 1)[0] for line in lines}):
+        rows = [line for line in lines if line.startswith(sid + "\t")]
+        (preds / f"{sid}.tsv").write_text("".join(rows))
+    return preds
+
+
+@pytest.mark.parametrize("name", ["siRNA_1.tsv", "new.tsv"])
+def test_output_the_folder_would_read_is_refused(
+    tmp_path: Path, plain, name: str
+) -> None:
+    """A table in the -r folder would be an input: now (siRNA_1) or next run."""
+    preds = _per_sirna_folder(tmp_path)
+    before = {p.name: p.read_bytes() for p in preds.iterdir()}
+    result = runner.invoke(
+        app, ["off-targets", "-r", str(preds), "-o", str(preds / name)]
+    )
+    assert result.exit_code == 1, result.output
+    expected = (
+        f"-o/--output resolves to {preds / name} inside the -r/--risearch-file "
+        f"folder {preds}, which would be read as input"
+    )
+    assert _squash(expected) in _squash(plain(result.output)), result.output
+    assert {p.name: p.read_bytes() for p in preds.iterdir()} == before
+
+
+def test_output_the_folder_ignores_is_allowed(tmp_path: Path) -> None:
+    """The folder reader skips .csv, so a rerun does not read the table back."""
+    preds = _per_sirna_folder(tmp_path)
+    out = preds / "out.csv"
+    for _ in range(2):
+        result = runner.invoke(
+            app,
+            ["off-targets", "-r", str(preds), "-o", str(out)]
+            + ["--output-format", "csv"],
+        )
+        assert result.exit_code == 0, result.output
+        assert pl.read_csv(out)["sirna_id"].n_unique() == 5
