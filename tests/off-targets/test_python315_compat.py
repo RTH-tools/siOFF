@@ -28,17 +28,6 @@ def test_series_methods_forwarded_to_expr_return_a_series() -> None:
     assert sorted(s.unique().to_list()) == ["x", "y"]
 
 
-def test_parser_summary_lists_chromosomes_and_strands(tmp_path: Path) -> None:
-    path = tmp_path / "pred.out"
-    path.write_text(
-        "si1\t1\t21\tchr1\t10\t30\t+\t-20.5\nsi1\t1\t21\tchr2\t50\t70\t-\t-15.0\n"
-    )
-    parser = RIsearchParser()
-    summary = parser.summary(parser.load(path))
-    assert sorted(summary["chromosomes"]) == ["chr1", "chr2"]
-    assert sorted(summary["strands"]) == ["+", "-"]
-
-
 def test_parser_reads_risearch2_rows_wider_than_eight_columns(tmp_path: Path) -> None:
     """Columns are picked by position; trailing extra columns are ignored."""
     path = tmp_path / "pred.out"

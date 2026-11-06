@@ -53,16 +53,6 @@ class RIsearchParser:
             pl.col("sirna_id").is_not_null()
         )
 
-    def summary(self, df: pl.DataFrame) -> dict:
-        """Generate summary statistics for loaded predictions."""
-        return {
-            "row_count": df.height,
-            "energy_min": df["energy"].min(),
-            "energy_max": df["energy"].max(),
-            "chromosomes": df["chrom"].unique().to_list(),
-            "strands": df["strand"].unique().to_list(),
-        }
-
     def list_directory_files(self, directory: Path) -> list[Path]:
         """List all RIsearch output files in a directory (*.gz, *.tsv, *.out, *.parquet)."""
         if not directory.exists():

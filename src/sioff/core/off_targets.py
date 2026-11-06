@@ -77,7 +77,6 @@ _WORKER_DF_TRANS: Optional[pl.DataFrame] = None
 _WORKER_INTERSECTOR: Optional[object] = None
 _WORKER_PROB_SERVICE: Optional[object] = None
 _WORKER_ON_TARGET_MAP: dict = {}
-_WORKER_SELF_HYB_EMIN: dict = {}
 # --summary-only: score per siRNA with ProbabilityService(aggregate_only=True)
 # and return only the metadata, no per-site table.
 _WORKER_SUMMARY_ONLY: bool = False
@@ -89,7 +88,6 @@ _WORKER_STATE_DEFAULTS: dict[str, Any] = {
     "_WORKER_INTERSECTOR": None,
     "_WORKER_PROB_SERVICE": None,
     "_WORKER_ON_TARGET_MAP": {},
-    "_WORKER_SELF_HYB_EMIN": {},
     "_WORKER_SUMMARY_ONLY": False,
     "_WORKER_DETAILED_REPORT": False,
 }
@@ -236,7 +234,6 @@ def _init_worker(
     accessibility_dir: str,
     polars_max_threads: int,
     on_target_map: dict,
-    self_hyb_emin: dict,
     temperature: float = 37.0,
     accessibility_cache_dir: Optional[str] = None,
     summary_only: bool = False,
@@ -264,8 +261,7 @@ def _init_worker(
         pa.set_cpu_count(max(1, polars_max_threads))
 
     global _WORKER_DF_TRANS, _WORKER_INTERSECTOR, _WORKER_PROB_SERVICE
-    global _WORKER_ON_TARGET_MAP, _WORKER_SELF_HYB_EMIN, _WORKER_SUMMARY_ONLY
-    global _WORKER_DETAILED_REPORT
+    global _WORKER_ON_TARGET_MAP, _WORKER_SUMMARY_ONLY, _WORKER_DETAILED_REPORT
 
     if ipc_path:
         # Memory-map the transcriptome the parent wrote (sorted, uncompressed,
@@ -299,7 +295,6 @@ def _init_worker(
 
     # Store per-run constants so they don't need to be pickled per task.
     _WORKER_ON_TARGET_MAP = on_target_map
-    _WORKER_SELF_HYB_EMIN = self_hyb_emin
     _WORKER_SUMMARY_ONLY = summary_only
     _WORKER_DETAILED_REPORT = detailed_report
 
@@ -319,10 +314,9 @@ class WorkerFailureError(RuntimeError):
         self.stage = stage
         self.failures = failures
         self.n_total = n_total
-        unit = "contigs" if stage.startswith("pass 2") else "siRNAs"
         name, msg = failures[0]
         super().__init__(
-            f"{len(failures)}/{n_total} {unit} failed in {stage}; "
+            f"{len(failures)}/{n_total} siRNAs failed in {stage}; "
             f"first error: {name}: {msg}"
         )
 
@@ -1274,7 +1268,6 @@ def compute_off_targets(
                 "ipc_path": ipc_path,
                 "accessibility_dir": str(acc_dir) if acc_dir is not None else "",
                 "on_target_map": on_target_map,
-                "self_hyb_emin": {},
                 "temperature": temperature,
                 "accessibility_cache_dir": (
                     str(cache_dir) if cache_dir is not None else None

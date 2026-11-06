@@ -366,29 +366,6 @@ class RIsearchService:
             logger.debug(f"Self-hyb E_min {sirna_id}: {emin:.4f} kcal/mol")
             return emin
 
-    def self_hybridization_emin_batch(
-        self, fasta_path: Path, matrix: Union[str, Path] = "t04"
-    ) -> Dict[str, float]:
-        """Compute self-hybridisation E_min for all siRNAs in a FASTA file.
-
-        Each siRNA is searched against itself (seed_length = len - 1, energy ≤ 0),
-        replicating the old pipeline's minimum-energy anchor for alpha/gamma
-        clamping, with energy parameter set ``matrix``.
-        """
-        if not fasta_path.exists():
-            raise FileNotFoundError(f"siRNA FASTA not found: {fasta_path}")
-
-        records = list(SeqIO.parse(fasta_path, "fasta"))
-        logger.info(
-            f"Computing self-hybridisation E_min for {len(records)} siRNA(s)..."
-        )
-        result = {
-            r.id: self.self_hybridization_emin(str(r.seq), r.id, matrix=matrix)
-            for r in records
-        }
-        logger.info(f"Self-hybridisation complete: {len(result)} siRNA(s) processed")
-        return result
-
 
 @lru_cache(maxsize=32)
 def _fasta_names(path_str: str) -> tuple:
