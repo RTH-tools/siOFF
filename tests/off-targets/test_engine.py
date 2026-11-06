@@ -421,7 +421,9 @@ def test_failure_mid_split_leaves_no_temp_dirs(tmp_path, tmp_root):
     assert not list(tmp_root.glob("risearch_ipc_*"))
 
 
-@pytest.mark.parametrize("ending", ["success", "duplicate", "closed early"])
+@pytest.mark.parametrize(
+    "ending", ["success", "duplicate", "closed early", "interrupted"]
+)
 def test_temp_dirs_are_removed_on_every_path(tmp_path, tmp_root, ending):
     d = tmp_path / "in"
     d.mkdir()
@@ -438,6 +440,13 @@ def test_temp_dirs_are_removed_on_every_path(tmp_path, tmp_root, ending):
         next(gen)
         assert len(_engine_dirs(tmp_root)) == 2
         gen.close()
+    elif ending == "interrupted":
+        # Ctrl-C while the caller holds a frame: not an Exception, so the
+        # engine must not swallow it, and its finally must still run.
+        next(gen)
+        assert len(_engine_dirs(tmp_root)) == 2
+        with pytest.raises(KeyboardInterrupt):
+            gen.throw(KeyboardInterrupt)
     else:
         assert len(list(gen)) == len(SIRNAS)
     assert _engine_dirs(tmp_root) == []

@@ -15,6 +15,7 @@ runner = CliRunner()
 
 EX = Path(__file__).parents[2] / "examples" / "data"
 SUFFIX = ":alpha=0.8,gamma=0.8"
+THETA = ":theta=0.7"
 
 
 def _sirna_table(tmp_path: Path) -> Path:
@@ -44,6 +45,7 @@ def _run(form: str, tmp_path: Path, detailed_report: bool) -> pl.DataFrame:
         sirna_table=_sirna_table(tmp_path),
         alpha="0.8",
         gamma="0.8",
+        theta="0.7",
         detailed_report=detailed_report,
     )
 
@@ -51,7 +53,7 @@ def _run(form: str, tmp_path: Path, detailed_report: bool) -> pl.DataFrame:
 @pytest.mark.parametrize("form", ["file", "directory"])
 def test_detailed_report_keeps_weights_and_z(tmp_path, form):
     df = _run(form, tmp_path, detailed_report=True)
-    for sfx in ("", SUFFIX):
+    for sfx in ("", SUFFIX, THETA):
         for col in (
             f"boltzmann_weight{sfx}",
             f"boltzmann_weight_noacc{sfx}",
@@ -60,12 +62,12 @@ def test_detailed_report_keeps_weights_and_z(tmp_path, form):
         ):
             assert col in df.columns
     assert "E_min" in df.columns
-    sums = df.group_by("sirna_id").agg(
-        pl.col("boltzmann_weight").sum(), pl.col("Z_sirna").first()
-    )
-    assert sums["boltzmann_weight"].to_list() == pytest.approx(
-        sums["Z_sirna"].to_list(), rel=1e-5
-    )
+    # No on-targets, so each siRNA's weights sum to its partition function.
+    for sfx in ("", SUFFIX, THETA):
+        for acc in ("", "_noacc"):
+            w, z = f"boltzmann_weight{acc}{sfx}", f"Z_sirna{acc}{sfx}"
+            sums = df.group_by("sirna_id").agg(pl.col(w).sum(), pl.col(z).first())
+            assert sums[w].to_list() == pytest.approx(sums[z].to_list(), rel=1e-5), w
 
 
 @pytest.mark.parametrize("form", ["file", "directory"])
