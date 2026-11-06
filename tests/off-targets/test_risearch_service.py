@@ -126,25 +126,6 @@ class TestRunSearch:
             ).issubset(set(result.columns))
 
 
-class TestSearchSingleSirna:
-    """Tests for search_single_sirna()."""
-
-    def test_returns_best_hit(
-        self,
-        service: RIsearchService,
-        sirna_single_path: Path,
-        genome_path: Path,
-    ) -> None:
-        """Returns tuple with energy, start, end, strand."""
-        energy, start, end, strand = service.search_single_sirna(
-            sirna_single_path, genome_path
-        )
-
-        # Should find some hits with negative energy
-        assert energy <= 0 or energy == 0.0
-        assert strand in ["+", "-"]
-
-
 def test_search_accepts_a_custom_dsm_tsv_table(tmp_path):
     """End-to-end through risearch: a long-form DSM TSV replaces a bundled id.
 

@@ -7,7 +7,7 @@ intermediate TSV files.
 import tempfile
 from functools import lru_cache
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union, cast
+from typing import Dict, List, Optional, Union, cast
 
 import polars as pl
 from Bio import SeqIO
@@ -388,32 +388,6 @@ class RIsearchService:
         }
         logger.info(f"Self-hybridisation complete: {len(result)} siRNA(s) processed")
         return result
-
-    def search_single_sirna(
-        self, query_path: Path, target_path: Path
-    ) -> Tuple[float, int, int, str]:
-        """Run RIsearch for a single siRNA and return (energy, start, end, strand) of the best hit.
-
-        Returns (0.0, 0, 0, "+") if no hits found or search fails.
-        """
-        with tempfile.TemporaryDirectory(prefix="risearch_") as tmpdir:
-            index_path = Path(tmpdir) / "target.idx"
-            try:
-                self.index_target(target_path, index_path)
-                df = self.run_search(query_path, index_path)
-                if df.is_empty():
-                    logger.warning("No valid hits found")
-                    return 0.0, 0, 0, "+"
-                best = df.sort("energy").row(0, named=True)
-                return (
-                    float(best["energy"]),
-                    int(best["start"]),
-                    int(best["end"]),
-                    str(best["strand"]),
-                )
-            except RIsearchError as e:
-                logger.error(f"RIsearch failed: {e}")
-                return 0.0, 0, 0, "+"
 
 
 @lru_cache(maxsize=32)

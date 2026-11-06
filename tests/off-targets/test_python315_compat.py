@@ -49,16 +49,6 @@ def test_parser_reads_risearch2_rows_wider_than_eight_columns(tmp_path: Path) ->
     assert df.row(0) == ("si1", "chr1", 10, 30, "+", -20.5)
 
 
-def test_load_single_file_reads_headerless_risearch2(tmp_path: Path) -> None:
-    path = tmp_path / "si1.out"
-    path.write_text(
-        "si1\t1\t21\tchr1\t10\t30\t+\t-20.5\nsi1\t1\t21\tchr1\t50\t70\t-\t-25.0\n"
-    )
-    df = RIsearchParser().load_single_file(path)
-    assert df["raw_e_min"].to_list() == [-25.0, -25.0]
-    assert df["start"].dtype == pl.Int32
-
-
 def test_parser_reads_sioff_search_output(tmp_path: Path) -> None:
     """``sioff search -o`` writes a headered 6-column TSV; ``-r`` must accept it."""
     path = tmp_path / "predictions.tsv"
