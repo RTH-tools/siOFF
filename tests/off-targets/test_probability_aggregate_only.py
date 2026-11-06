@@ -46,7 +46,6 @@ def test_aggregate_only_reports_the_same_sums(on_target_map):
         alpha_gamma_pairs=AG,
         theta_values=THETA,
         on_target_map=on_target_map,
-        precomputed_opening_energy=True,
         e_min={"s1": -31.0, "s2": -31.0, "s3": -31.0},
     )
     full_df, full = svc.calculate_probabilities_per_sirna(_frame(), **kw)
