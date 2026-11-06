@@ -26,9 +26,21 @@ off_targets:
   # Input — choose ONE of the two mutually exclusive input modes
   # ---------------------------------------------------------------------------
 
-  # [REQUIRED] Pre-computed RIsearch2 output: a single .tsv/.out.gz file, or a
-  # directory of per-siRNA .parquet files (auto-detected; enables parallel mode).
+  # [REQUIRED] Pre-computed RIsearch output: a .tsv/.out.gz/.parquet file, or a
+  # folder of them (a file is treated as a folder of one). Every input is split
+  # into per-siRNA parts and scored in parallel. The split writes each input
+  # again under TMPDIR, so for large runs TMPDIR needs free space about the
+  # size of the input.
   risearch_file: ../examples/data/predictions.out
+
+  # The siRNA table: a tab-separated file with the header
+  #   sirna_id <TAB> on_target_id <TAB> sequence
+  # on_target_id (a transcript or gene ID) may be empty; lines starting with #
+  # are skipped. It names each siRNA's on-target and supplies the guide
+  # sequence for the perfect-match energy E_min. Required when alpha/gamma set
+  # a pair other than 1,1; optional otherwise (without it there is no
+  # on-target). Replaces the old on_target_ids key, which is now an error.
+  # sirna_table: ../examples/data/sirna_table.tsv
 
   # ---------------------------------------------------------------------------
   # Transcriptome annotation (optional)
@@ -87,6 +99,10 @@ off_targets:
   # All (alpha, gamma) pairs where alpha ≤ gamma are computed in one Polars pass.
   # ---------------------------------------------------------------------------
 
+  # Alpha/gamma use E_min = min(perfect-match energy of the table's sequence,
+  # lowest energy among the hits left after sense_only and the annotation
+  # intersection). The baseline alpha = gamma = 1 does not depend on E_min.
+  #
   # Alpha clamping parameter. Constraint: alpha ≤ gamma. Default: "1.0"
   # Example multi-value sweep: "0.8;0.9;1.0"
   alpha: "1.0"
@@ -112,12 +128,17 @@ off_targets:
   # Output
   # ---------------------------------------------------------------------------
 
-  # Path for the main output file (TSV by default; extension depends on output_format).
+  # Path for the main output file. A .tsv, .csv or .parquet suffix is replaced
+  # by the one of the output format; any other name gets the extension
+  # appended (results.txt -> results.txt.tsv; "out" -> out.tsv, with the
+  # .summary files in out/). An earlier table at that path is removed before
+  # the run. Rows come in one block per siRNA, sorted by P_off_target
+  # descending; one .summary file per siRNA is written next to the table.
   output: ./sioff_example_out/off_targets.tsv
 
-  # Keep the raw Boltzmann weights (boltzmann_weight*), partition functions
-  # (Z_sirna*) and E_min for every interaction in the output table. Default: false
-  # Not compatible with summary_only.
+  # Add boltzmann_weight*, boltzmann_weight_noacc*, Z_sirna*, Z_sirna_noacc*
+  # and E_min to every row of the output table. Default: false
+  # Not compatible with the CLI's --summary-only.
   detailed_report: false
 
   # ---------------------------------------------------------------------------
@@ -131,20 +152,21 @@ off_targets:
   # Performance
   # ---------------------------------------------------------------------------
 
-  # Verbose output: print sample DataFrames and extra stats. Default: false
+  # Verbose output: DEBUG-level log lines (per-siRNA steps). Default: false
   verbose: false
 
   # ---------------------------------------------------------------------------
   # CLI-ONLY parameters (cannot be set in YAML — use the command line)
   # ---------------------------------------------------------------------------
-  # --sirna-fasta / -s       siRNA FASTA; runs RIsearch in-process (requires --target-fasta)
+  # --sirna-fasta / -s       siRNA FASTA, the query of the in-process search (requires
+  #                          --target-fasta; cannot be combined with risearch_file)
   # --target-fasta / --genome  Target FASTA for integrated RIsearch execution
   # --target-index / -idx    Pre-built RIsearch index (speeds up repeated runs)
-  # --on-target-ids / -oi    TSV mapping siRNA IDs to on-target transcript IDs (sirna_id\ttranscript_id)
   # --workers / -j           Number of parallel worker processes (default: CPU count)
-  # --output-format          Output format: "tsv" | "csv" | "parquet" (default: tsv)
+  # --output-format          Output format: "tsv" | "csv" | "parquet" (default: tsv); applies to every input
   # --summary-only           Write only .summary files; skip per-prediction output
-  # --profile                Print per-stage timing/memory table at run end
+  # --profile                Print the timing/memory table (one stage, "Split, score and write")
+  #                          and the per-siRNA breakdown at run end
 
 # =============================================================================
 # ACCESSIBILITY COMMAND

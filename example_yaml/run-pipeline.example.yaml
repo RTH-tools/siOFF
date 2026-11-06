@@ -82,6 +82,10 @@ off_targets:
   # the cache on node-local disk.
   # accessibility_cache_dir: ./sioff_example_out/accessibility_cache/
   output: ./sioff_example_out/off_targets.tsv
+  # siRNA table (header: sirna_id, on_target_id, sequence): each siRNA's
+  # on-target and guide sequence. Required when alpha/gamma set a pair other
+  # than 1,1; optional otherwise.
+  # sirna_table: ../examples/data/sirna_table.tsv
   type: gw
   alpha: "1.0"
   gamma: "1.0"
@@ -99,7 +103,7 @@ off_targets:
 # The top-level off_targets/accessibility blocks above act as SHARED
 # DEFAULTS; each group overrides only its per-group fields:
 #   off_targets:            <- shared defaults (alpha/gamma/theta, window/span,
-#     alpha: "0.8;1.0"         temperature, on-target config, type, ...)
+#     alpha: "0.8;1.0"         temperature, siRNA table, type, ...)
 #     type: gw
 #   transcriptomes:         <- one job (pair) per entry; `index` never fans out
 #     - name: human           # required — used for job names, logs, default output
