@@ -90,6 +90,10 @@ off_targets:
   alpha: "1.0"
   gamma: "1.0"
   theta: ""
+  # Energy parameter set for the perfect-match energies of E_min: a bundled
+  # name (t04, slh04, s95-rna-dna, s95-dna-rna) or a DSM TSV path relative to
+  # this file. Use the set the predictions were searched with.
+  matrix: t04
 
 # =============================================================================
 # Multi-transcriptome fan-out (optional)
@@ -104,6 +108,7 @@ off_targets:
 # DEFAULTS; each group overrides only its per-group fields:
 #   off_targets:            <- shared defaults (alpha/gamma/theta, window/span,
 #     alpha: "0.8;1.0"         temperature, siRNA table, type, ...)
+#     sirna_table: ../data/sirna_table.tsv   # alpha/gamma != 1 needs it
 #     type: gw
 #   transcriptomes:         <- one job (pair) per entry; `index` never fans out
 #     - name: human           # required — used for job names, logs, default output
