@@ -167,3 +167,27 @@ def test_example_data_zoff_agrees_with_z_minus_w_on_where_that_is_exact() -> Non
         compared,
         skipped,
     )
+
+
+@pytest.mark.parametrize("aggregate_only", [False, True])
+def test_a_row_without_ids_counts_as_off_target(aggregate_only: bool) -> None:
+    # A null transcript_id leaves is_on_target null for the mapped siRNA.
+    df = _frame().with_columns(
+        pl.Series("transcript_id", ["t_on", "t1", None, "t3"], dtype=pl.Utf8)
+    )
+    kw = dict(on_target_map={"si": "t_on"}, e_min={"si": -40.0})
+    svc = ProbabilityService(None)
+    out, _ = svc.calculate_probabilities_per_sirna(df, **kw)
+    _, meta = svc.calculate_probabilities_per_sirna(
+        df, aggregate_only=aggregate_only, **kw
+    )
+
+    assert out["is_on_target"].null_count() == 1
+    off = out.filter(~pl.col("is_on_target").fill_null(False))
+    w = meta["on_target_weights"]["si"]
+    for kind in ("", "_noacc"):
+        expected = math.fsum(off[f"boltzmann_weight{kind}"].to_list())
+        assert w[f"W_off{kind}"] == pytest.approx(expected, rel=1e-12), kind
+        z = meta["z_per_sirna"]["si"][f"Z_sirna{kind}"]
+        assert w[f"W_on{kind}"] + w[f"W_off{kind}"] == pytest.approx(z, rel=1e-12)
+    assert meta["n_on_target_rows"] == {"si": 1}
