@@ -376,7 +376,8 @@ that holds a complete cache needs no Parquet in `-a`. `off-targets` stops
 with an error when neither `-a` nor `--accessibility-cache-dir` holds any
 profile, and when it cannot write the cache.
 A failed worker never passes silently: the successful siRNAs are written, then
-`off-targets` reports `N/M siRNAs failed ...; first error: ...` and exits 1.
+`off-targets` reports `N/M tasks failed (input files or siRNAs) ...; first
+error: ...` and exits 1.
 
 ### Orchestrated multi-step runs (local + Slurm)
 
@@ -602,10 +603,13 @@ accessibility). `--summary-only` skips the per-prediction table — the old
 pipeline's default behaviour.
 
 `--detailed-report` adds the raw per-interaction columns to the table:
-`boltzmann_weight` (and `boltzmann_weight_noacc`), `Z_sirna` (and
-`Z_sirna_noacc`) and `E_min`, each repeated with a `:alpha=X,gamma=Y` or
-`:theta=T` suffix per extra parameter set. It cannot be combined with
-`--summary-only`.
+`boltzmann_weight` (and `boltzmann_weight_noacc`) and `Z_sirna` (and
+`Z_sirna_noacc`), each repeated with a `:alpha=X,gamma=Y` or `:theta=T`
+suffix per extra parameter set, and `E_min` once. `E_min` follows the rule
+under [Thermodynamic Model](#thermodynamic-model) for a siRNA with a
+`--sirna-table` row; for one without (no table, which only the baseline
+allows, or a missing row) it is the strongest hit left. It cannot be
+combined with `--summary-only`.
 
 ---
 

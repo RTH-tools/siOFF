@@ -9,6 +9,7 @@ from typer.testing import CliRunner
 
 import sioff
 from sioff.cli import app
+from sioff.core.off_targets import compute_off_targets
 
 runner = CliRunner()
 
@@ -89,3 +90,15 @@ def test_detailed_report_with_summary_only_is_an_error(tmp_path, plain):
     )
     assert result.exit_code == 1
     assert "--detailed-report needs the per-interaction table" in plain(result.stdout)
+
+
+def test_core_refuses_detailed_report_with_summary_only():
+    """The engine refuses the pair the CLI refuses."""
+    with pytest.raises(ValueError, match="detailed_report.*summary_only"):
+        list(
+            compute_off_targets(
+                risearch_file=EX / "predictions.out",
+                detailed_report=True,
+                summary_only=True,
+            )
+        )

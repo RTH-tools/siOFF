@@ -54,8 +54,11 @@ def test_core_yields_successes_then_raises(mixed_dir: Path) -> None:
 
 
 def test_core_raises_when_every_file_fails(broken_dir: Path) -> None:
-    with pytest.raises(WorkerFailureError, match="1/1"):
+    """The failed task is an input file, so the count does not say siRNAs."""
+    with pytest.raises(WorkerFailureError, match="1/1") as exc_info:
         list(compute_off_targets(risearch_file=broken_dir, n_workers=1))
+    assert "1/1 tasks failed (input files or siRNAs)" in str(exc_info.value)
+    assert "siRNAs failed" not in str(exc_info.value)
 
 
 def test_cli_exits_non_zero_when_workers_fail(
