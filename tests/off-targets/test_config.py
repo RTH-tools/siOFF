@@ -64,20 +64,31 @@ class TestLoadConfig:
         ):
             load_config(cfg)
 
-    def test_sirna_table_and_sirna_fasta_are_config_keys(self, tmp_path):
+    def test_sirna_table_is_a_config_key(self, tmp_path):
         config_file = tmp_path / "config.yaml"
         config_file.write_text(
             "command: off-targets\noff_targets:\n  risearch_file: hits.out\n"
-            "  sirna_table: tables/sirnas.tsv\n  sirna_fasta: sirnas.fa\n"
+            "  sirna_table: tables/sirnas.tsv\n"
         )
         cfg = load_config(config_file)
         assert cfg.off_targets.sirna_table == str(tmp_path / "tables" / "sirnas.tsv")
-        assert cfg.off_targets.sirna_fasta == str(tmp_path / "sirnas.fa")
 
         kwargs = config_to_kwargs(cfg, "off-targets")
         assert kwargs["sirna_table"] == tmp_path / "tables" / "sirnas.tsv"
-        assert kwargs["sirna_fasta"] == tmp_path / "sirnas.fa"
+        assert kwargs["sirna_fasta"] is None  # CLI-only, set for the direct call
         inspect.signature(off_targets_run).bind_partial(**kwargs)
+
+    def test_sirna_fasta_is_not_a_config_key(self, tmp_path):
+        """-s is only the search query, and a config run has a required -r."""
+        from omegaconf.errors import ConfigKeyError
+
+        config_file = tmp_path / "config.yaml"
+        config_file.write_text(
+            "command: off-targets\noff_targets:\n  risearch_file: hits.out\n"
+            "  sirna_fasta: sirnas.fa\n"
+        )
+        with pytest.raises(ConfigKeyError, match="sirna_fasta"):
+            load_config(config_file)
 
     def test_load_off_targets_config(self, tmp_path):
         config_file = tmp_path / "config.yaml"

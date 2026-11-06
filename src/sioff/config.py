@@ -33,7 +33,6 @@ class OffTargetsConfig:
 
     risearch_file: str = MISSING  # Required
     sirna_table: Optional[str] = None
-    sirna_fasta: Optional[str] = None
     transcriptome: Optional[str] = None
     transcriptome_format: str = "auto"
     feature: str = "exon"
@@ -111,7 +110,6 @@ def _resolve_paths(cfg: DictConfig, base_dir: Path) -> DictConfig:
         "off_targets": [
             "risearch_file",
             "sirna_table",
-            "sirna_fasta",
             "transcriptome",
             "accessibility_dir",
             "accessibility_cache_dir",
@@ -152,7 +150,6 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
     for key in [
         "risearch_file",
         "sirna_table",
-        "sirna_fasta",
         "transcriptome",
         "accessibility_dir",
         "accessibility_cache_dir",
@@ -183,6 +180,7 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
         # Typer OptionInfo objects become defaults when calling the function directly,
         # not via CLI — set these to None so callers get clean None defaults.
         for arg in (
+            "sirna_fasta",
             "target_fasta",
             "target_index",
             "workers",

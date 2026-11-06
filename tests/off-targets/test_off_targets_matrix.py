@@ -37,16 +37,6 @@ class TestSelfHybridisationMatrix:
         assert t04 < 0 and slh04 < 0
         assert t04 != pytest.approx(slh04)
 
-    def test_batch_passes_the_matrix_to_every_siRNA(self, tmp_path):
-        sid, seq = _first_sequence()
-        fa = tmp_path / "one.fa"
-        fa.write_text(f">{sid}\n{seq}\n")
-        svc = RIsearchService()
-        batch = svc.self_hybridization_emin_batch(fa, matrix="slh04")
-        assert batch == {
-            sid: pytest.approx(svc.self_hybridization_emin(seq, sid, matrix="slh04"))
-        }
-
     def test_unknown_matrix_is_rejected(self):
         sid, seq = _first_sequence()
         with pytest.raises(Exception, match="matrix"):

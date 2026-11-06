@@ -370,7 +370,6 @@ def test_a_broken_pool_fails_the_later_phase_too():
             "ipc_path": "",
             "accessibility_dir": "",
             "on_target_map": {},
-            "self_hyb_emin": {},
         },
     )
     kw = {"threads_per_worker": 1, "uses_worker_state": False}

@@ -1058,17 +1058,13 @@ def test_worker_service_trusts_the_parent_check(pq_copy, monkeypatch):
         "_pack_is_current",
         lambda *a: pytest.fail("a worker re-ran the pack check"),
     )
-    for name in (
-        "_WORKER_PROB_SERVICE",
-        "_WORKER_ON_TARGET_MAP",
-        "_WORKER_SELF_HYB_EMIN",
-    ):
+    for name in ("_WORKER_PROB_SERVICE", "_WORKER_ON_TARGET_MAP"):
         monkeypatch.setattr(ot, name, getattr(ot, name))
     monkeypatch.setattr(ot, "_WORKER_SUMMARY_ONLY", ot._WORKER_SUMMARY_ONLY)
     monkeypatch.setenv("POLARS_MAX_THREADS", os.environ.get("POLARS_MAX_THREADS", "1"))
     cpus = pa.cpu_count()
     try:
-        ot._init_worker("", str(d), 1, {}, {}, 37.0, None, False)
+        ot._init_worker("", str(d), 1, {}, 37.0, None, False)
         service = ot._WORKER_PROB_SERVICE.accessibility_service
         assert service._packed_dir() == d
     finally:
