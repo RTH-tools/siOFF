@@ -365,6 +365,29 @@ def _skipped_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, floa
     return list(dict.fromkeys(skipped))
 
 
+# The --alpha/--gamma default (CLI, API and YAML alike).
+_ALPHA_GAMMA_DEFAULT = "1.0"
+
+
+def _unpaired(name: str, typed: str, value: float, other: str, cmp: str) -> str:
+    """Word the error for an alpha or gamma ``value`` that no kept pair uses.
+
+    It says so when ``value`` is the default, which the user may not have
+    typed (``--gamma 0.8`` alone pairs the default alpha 1.0 with nothing).
+
+    Returns
+    -------
+    str
+        The message.
+    """
+    message = f"--{name} {value} pairs with no --{other} value {cmp} it"
+    if typed.strip() == _ALPHA_GAMMA_DEFAULT and value == float(_ALPHA_GAMMA_DEFAULT):
+        message += (
+            f" ({_ALPHA_GAMMA_DEFAULT} is the default when --{name} is not given)"
+        )
+    return message
+
+
 def _build_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]]:
     """Parse semicolon-separated alpha/gamma strings into (alpha, gamma) pairs.
 
@@ -385,10 +408,10 @@ def _build_alpha_gamma_pairs(alpha: str, gamma: str) -> list[tuple[float, float]
     alpha_vals, gamma_vals = _alpha_gamma_values(alpha, gamma)
     for a in alpha_vals:
         if not any(a <= g for g in gamma_vals):
-            raise ValueError(f"--alpha {a} pairs with no --gamma value >= it")
+            raise ValueError(_unpaired("alpha", alpha, a, "gamma", ">="))
     for g in gamma_vals:
         if not any(a <= g for a in alpha_vals):
-            raise ValueError(f"--gamma {g} pairs with no --alpha value <= it")
+            raise ValueError(_unpaired("gamma", gamma, g, "alpha", "<="))
     pairs: list[tuple[float, float]] = [(1.0, 1.0)]
     for a in alpha_vals:
         for g in gamma_vals:

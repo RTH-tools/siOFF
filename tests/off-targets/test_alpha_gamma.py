@@ -6,6 +6,7 @@ import pytest
 from loguru import logger
 from typer.testing import CliRunner
 
+from sioff._logging import setup_logging
 from sioff.cli import app
 from sioff.core.off_targets import (
     _build_alpha_gamma_pairs,
@@ -58,21 +59,53 @@ def test_baseline_uses_no_value():
         _build_alpha_gamma_pairs("1.0", "0.9")
 
 
-def _cli(*extra: str):
+def test_a_default_value_says_it_is_the_default():
+    """--gamma 0.8 alone: the user never typed the 1.0 the error names."""
+    with pytest.raises(ValueError) as info:
+        _build_alpha_gamma_pairs("1.0", "0.8")
+    assert str(info.value) == (
+        "--alpha 1.0 pairs with no --gamma value >= it "
+        "(1.0 is the default when --alpha is not given)"
+    )
+
+
+def test_a_typed_value_is_not_called_the_default():
+    with pytest.raises(ValueError) as info:
+        _build_alpha_gamma_pairs("0.95", "0.9")
+    assert "default" not in str(info.value)
+
+
+def _cli(*extra: str, global_opts: tuple[str, ...] = ()):
     return runner.invoke(
         app,
-        ["off-targets", "-r", str(EX / "predictions.out")]
+        [*global_opts, "off-targets", "-r", str(EX / "predictions.out")]
         + ["-t", str(EX / "annotation.gtf")]
         + ["--sirna-table", str(EX / "sirna_table.tsv")]
         + list(extra),
     )
 
 
-def test_cli_prints_skipped_pairs_once(plain):
-    result = _cli("--alpha", "0.8;0.9", "--gamma", "0.85;0.95")
+@pytest.mark.parametrize("global_opts", [(), ("-v",)], ids=["plain", "verbose"])
+def test_cli_prints_skipped_pairs_once(plain, global_opts):
+    """Once in any form: the console line, or under sioff -v the engine's."""
+    try:
+        result = _cli(
+            "--alpha", "0.8;0.9", "--gamma", "0.85;0.95", global_opts=global_opts
+        )
+    finally:
+        setup_logging(False)  # leave no DEBUG handler on CliRunner's stream
     assert result.exit_code == 0, result.output
     out = plain(result.output)
-    assert out.count("Skipped α > γ pairs: (0.9, 0.85)") == 1
+    assert out.count("Skipped") == 1, out
+    assert "(0.9, 0.85)" in out
+
+
+def test_cli_names_the_default_it_pairs(plain):
+    result = _cli("--gamma", "0.8")
+    assert result.exit_code == 1
+    assert "(1.0 is the default when --alpha is not given)" in " ".join(
+        plain(result.output).split()
+    )
 
 
 def test_cli_prints_nothing_when_nothing_is_skipped(plain):
