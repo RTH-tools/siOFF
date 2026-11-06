@@ -1,9 +1,8 @@
 """
 Unit tests for ProbabilityService.calculate_probabilities_per_sirna().
 
-This is the production code path used by the off-targets command.
-The existing test_probability*.py files only cover calculate_probabilities()
-(single partition function, no parameter sweeps).
+This is the probability model of every off-targets run: one partition
+function per siRNA, with the alpha/gamma and theta sweeps.
 
 All expected values are computed analytically so the tests do not depend on
 external data files.

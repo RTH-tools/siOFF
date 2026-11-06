@@ -76,6 +76,9 @@ def test_quick_start_with_sirna_table(clone_root: Path) -> None:
     assert "no on-target row" not in result.output
     summaries = {p.stem for p in (clone_root / "out").glob("*.summary")}
     assert summaries == {f"siRNA_{i}" for i in range(1, 6)}
+    out = pl.read_csv(clone_root / "out" / "off_targets.tsv", separator="\t")
+    swept = out["P_off_target:alpha=0.8,gamma=0.8"]
+    assert out.height > 0 and swept.null_count() == 0
 
 
 def _slug(heading: str) -> str:
