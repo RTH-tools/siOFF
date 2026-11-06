@@ -473,11 +473,15 @@ Available on `sioff` itself, before any subcommand.
 | `--no-dedup` | Report every seed's hit instead of one best hit per duplex |
 | `--alignment` | Add the columns `q_start`, `q_end` and `alignment` (pairing string, query 5′→3′: `P` pair, `W` G:U, `U` mismatch, `T`/`Q` extra target/query base) |
 | `-j / --threads` | Worker threads (default: `RAYON_NUM_THREADS`, else every core) |
+| `--sense-only` | Keep only `+`-strand hits, for a target already in sense orientation (a transcriptome) |
 | `-o / --output` | Output TSV file (default: stdout) |
 
 Every option is passed to `risearch.search` explicitly with siOFF's default, so
 a change of upstream default cannot move the results; the defaults give the
-same hits as before these options existed.
+same hits as before these options existed. `--sense-only` is siOFF's own: risearch
+indexes and searches both strands and has no option to search one, so the `-`
+hits are dropped after the search. The output shrinks; the search's time and
+peak memory do not.
 
 ---
 

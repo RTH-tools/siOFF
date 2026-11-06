@@ -185,6 +185,17 @@ def search(
             help="Worker threads (default: RAYON_NUM_THREADS, else every core).",
         ),
     ] = None,
+    sense_only: Annotated[
+        bool,
+        typer.Option(
+            "--sense-only",
+            help=(
+                "Keep only +-strand hits (target already in sense orientation, "
+                "e.g. a transcriptome). Filters after the search: risearch still "
+                "searches both strands."
+            ),
+        ),
+    ] = False,
     verbose: Annotated[
         bool, typer.Option("--verbose", "-v", help="Enable verbose logging.")
     ] = False,
@@ -224,6 +235,7 @@ def search(
             no_dedup=no_dedup,
             alignment=alignment,
             threads=threads,
+            sense_only=sense_only,
         )
     except RIsearchError as e:
         typer.secho(f"Error: {e}", fg=typer.colors.RED, err=True)
