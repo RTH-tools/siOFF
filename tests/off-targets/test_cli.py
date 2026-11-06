@@ -1,5 +1,6 @@
 """Tests for the CLI module."""
 
+import shutil
 import subprocess
 import sys
 from pathlib import Path
@@ -300,3 +301,51 @@ def test_flag_names_are_the_options_of_the_command() -> None:
     options = {param.name: set(param.opts) for param in command.params}
     for name, flags in _FLAG_NAMES.items():
         assert set(flags.split("/")) <= options[name], name
+
+
+# ---------------------------------------------------------------------------
+# -o never resolves to an input: removing a stale table must not delete it
+# ---------------------------------------------------------------------------
+def _refuses_to_overwrite(result, plain, flag: str, path: Path) -> None:
+    assert result.exit_code == 1, result.output
+    text = " ".join(plain(result.output).split())
+    assert f"-o/--output resolves to the {flag} input {path}" in text, text
+
+
+def test_output_equal_to_the_predictions_is_refused(tmp_path: Path, plain) -> None:
+    hits = tmp_path / "hits.tsv"
+    shutil.copy(TSV, hits)
+    result = runner.invoke(app, ["off-targets", "-r", str(hits), "-o", str(hits)])
+    _refuses_to_overwrite(result, plain, "-r/--risearch-file", hits)
+    assert hits.read_bytes() == TSV.read_bytes()
+
+
+def test_output_equal_to_the_sirna_table_is_refused(tmp_path: Path, plain) -> None:
+    table = tmp_path / "table.tsv"
+    table.write_text("sirna_id\ton_target_id\tsequence\nsiRNAID\t\tACGU\n")
+    before = table.read_bytes()
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(TSV), "--sirna-table", str(table)]
+        + ["-o", str(table)],
+    )
+    _refuses_to_overwrite(result, plain, "--sirna-table", table)
+    assert table.read_bytes() == before
+
+
+@pytest.mark.parametrize("spelling", ["dot-dot", "symlink"])
+def test_output_spelling_the_predictions_differently_is_refused(
+    tmp_path: Path, plain, spelling: str
+) -> None:
+    hits = tmp_path / "hits.tsv"
+    shutil.copy(TSV, hits)
+    if spelling == "dot-dot":
+        (tmp_path / "x").mkdir()
+        output = tmp_path / "x" / ".." / "hits.tsv"
+    else:
+        output = tmp_path / "link.tsv"
+        output.symlink_to(hits)
+    result = runner.invoke(app, ["off-targets", "-r", str(hits), "-o", str(output)])
+    _refuses_to_overwrite(result, plain, "-r/--risearch-file", hits)
+    assert hits.read_bytes() == TSV.read_bytes()
+    assert output.exists()
