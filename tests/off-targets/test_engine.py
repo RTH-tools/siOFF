@@ -8,6 +8,7 @@ starts a pool, and the temporary directories never outlive the run.
 """
 
 import os
+import re
 import shutil
 import tempfile
 from pathlib import Path
@@ -570,6 +571,110 @@ def test_sirna_fasta_is_only_the_search_query(tmp_root, scored, source):
         next(gen)
     assert str(info.value) == SIRNA_FASTA_ERROR
     assert scored == [] and _engine_dirs(tmp_root) == []
+
+
+# ---------------------------------------------------------------------------
+# Arguments the run would ignore, and missing files, fail before any work
+# ---------------------------------------------------------------------------
+def _refused(tmp_root, scored, **kwargs) -> str:
+    """The ValueError of the first ``next()``, after checking nothing ran."""
+    with pytest.raises(ValueError) as info:
+        next(compute_off_targets(**kwargs))
+    assert scored == [] and _engine_dirs(tmp_root) == []
+    return str(info.value)
+
+
+@pytest.mark.parametrize("given", ["accessibility", "accessibility_dir"])
+def test_genome_file_with_profiles_is_refused(tmp_root, scored, profiles, given):
+    source = profiles if given == "accessibility" else EX / "accessibility"
+    message = _refused(
+        tmp_root,
+        scored,
+        risearch_file=PREDICTIONS,
+        genome_file=GENOME,
+        **{given: source},
+    )
+    assert message == (
+        f"genome_file and {given} are two sources for the same profiles; drop "
+        f"genome_file to use {given}, or drop {given} to fold the genome"
+    )
+
+
+@pytest.mark.parametrize("given", ["accessibility", "genome_file"])
+def test_cache_dir_without_accessibility_dir_is_refused(
+    tmp_path, tmp_root, scored, profiles, given
+):
+    source = profiles if given == "accessibility" else GENOME
+    message = _refused(
+        tmp_root,
+        scored,
+        risearch_file=PREDICTIONS,
+        accessibility_cache_dir=tmp_path / "cache",
+        **{given: source},
+    )
+    done = "packed" if given == "accessibility" else "folded"
+    assert message == (
+        "accessibility_cache_dir only holds the cache of accessibility_dir; "
+        f"{given} is {done} in a temporary directory, so drop accessibility_cache_dir"
+    )
+    assert not (tmp_path / "cache").exists()
+
+
+@pytest.mark.parametrize("target", ["target_fasta", "target_index"])
+@pytest.mark.parametrize("source", ["risearch_file", "predictions"])
+def test_search_target_with_predictions_is_refused(tmp_root, scored, target, source):
+    given = (
+        {"risearch_file": PREDICTIONS}
+        if source == "risearch_file"
+        else {"predictions": RIsearchParser().load(PREDICTIONS)}
+    )
+    message = _refused(tmp_root, scored, **given, **{target: GENOME})
+    assert message == (
+        f"{target} is only used by the in-process search (sirna_fasta) and "
+        f"cannot be combined with {source}; drop {target}"
+    )
+
+
+@pytest.mark.parametrize("missing", ["gtf_file", "target_fasta", "target_index"])
+def test_missing_file_fails_before_the_fold(tmp_path, tmp_root, missing):
+    ghost = tmp_path / "missing"
+    given = {
+        "gtf_file": {"risearch_file": PREDICTIONS, "gtf_file": ghost},
+        "target_fasta": {"sirna_fasta": EX / "sirnas.fa", "target_fasta": ghost},
+        "target_index": {
+            "sirna_fasta": EX / "sirnas.fa",
+            "target_fasta": GENOME,
+            "target_index": ghost,
+        },
+    }[missing]
+    progress: list[dict] = []
+    with pytest.raises(FileNotFoundError, match=re.escape(str(ghost))):
+        next(
+            compute_off_targets(
+                genome_file=GENOME,
+                accessibility_progress_callback=lambda **kw: progress.append(kw),
+                **given,
+            )
+        )
+    assert progress == [], "the genome was folded first"
+    assert _engine_dirs(tmp_root) == []
+
+
+def test_transcriptome_is_read_before_the_fold(tmp_path, tmp_root):
+    bed = tmp_path / "annotation.bed"
+    bed.write_text("chr1\t100\t200\tt1\t0\t+\n")
+    progress: list[dict] = []
+    with pytest.raises(ValueError, match="BED annotations are not supported"):
+        next(
+            compute_off_targets(
+                risearch_file=PREDICTIONS,
+                gtf_file=bed,
+                genome_file=GENOME,
+                accessibility_progress_callback=lambda **kw: progress.append(kw),
+            )
+        )
+    assert progress == [], "the genome was folded first"
+    assert _engine_dirs(tmp_root) == []
 
 
 @pytest.mark.parametrize("n_workers", [1, 2])
