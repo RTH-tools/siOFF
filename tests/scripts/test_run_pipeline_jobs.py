@@ -144,6 +144,20 @@ class TestBuildOffTargets:
         ):
             rp._build_off_targets({"on_target_ids": "m.tsv"}, tmp_path)
 
+    def test_matrix_is_forwarded(self, tmp_path):
+        """E_min's perfect-match energy uses -z; YAML must reach it."""
+        assert "--matrix" not in rp._build_off_targets({}, tmp_path)
+        # A bundled name passes through.
+        cmd = rp._build_off_targets({"matrix": "slh04"}, tmp_path)
+        assert _flag(cmd, "--matrix") == "slh04"
+        # A table next to the config resolves against it, as sioff -c does.
+        (tmp_path / "dsm").mkdir()
+        (tmp_path / "dsm" / "custom.tsv").write_text("q1\tq2\tt1\tt2\tdg\n")
+        cmd = rp._build_off_targets({"matrix": "dsm/custom.tsv"}, tmp_path)
+        assert _flag(cmd, "--matrix") == str(tmp_path / "dsm" / "custom.tsv")
+        cmd = rp._build_off_targets({"matrix": "/abs/custom.tsv"}, tmp_path)
+        assert _flag(cmd, "--matrix") == "/abs/custom.tsv"
+
     def test_boolean_flags_are_bare_and_opt_in(self, tmp_path):
         assert "--sense-only" not in rp._build_off_targets({}, tmp_path)
 

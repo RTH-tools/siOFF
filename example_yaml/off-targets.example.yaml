@@ -115,6 +115,12 @@ off_targets:
   # Example: "0.5;0.7"
   theta: ""
 
+  # Energy parameter set for the perfect-match energies of E_min: "t04",
+  # "slh04", "s95-rna-dna", "s95-dna-rna", or the path of a DSM TSV table
+  # (relative to this file). Use the set the predictions were searched with.
+  # Default: "t04"
+  matrix: t04
+
   # ---------------------------------------------------------------------------
   # Predictions mode
   # ---------------------------------------------------------------------------
