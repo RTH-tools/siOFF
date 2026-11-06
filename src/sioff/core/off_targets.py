@@ -15,10 +15,12 @@ exceptions):
   files; a generator yielding ``(pl.DataFrame, meta)`` per siRNA. Being
   replaced by `compute_off_targets`.
 
-The core writes no output files. The one exception is temporary files: the
-Arrow-IPC copy of the transcriptome that every task memory-maps, the
-per-siRNA split parts, and accessibility profiles spilled to disk so workers
-can memory-map them. They live inside the generator's ``try/finally`` and are
+The core writes no output files, with two exceptions. The in-process search
+builds the RIsearch index ``<target>.idx`` next to ``target_fasta`` when no
+``target_index`` is given (and reuses it later). And there are temporary
+files: the Arrow-IPC copy of the transcriptome that every task memory-maps,
+the per-siRNA split parts, and accessibility profiles spilled to disk so
+workers can memory-map them. They live inside the generator's ``try/finally`` and are
 removed when the run ends, on error too, so callers should consume the
 generator fully (or close it) for deterministic cleanup. The accessibility
 cache built next to ``-a`` profiles is kept: it is reused by later runs.
@@ -1547,6 +1549,72 @@ def _input_files(path: Path) -> list[Path]:
     return [path]
 
 
+def _check_ignored_arguments(
+    *,
+    risearch_file: Optional[Path],
+    predictions: Optional[pl.DataFrame],
+    target_fasta: Optional[Path],
+    target_index: Optional[Path],
+    accessibility: Optional[Mapping[str, pl.DataFrame]],
+    accessibility_dir: Optional[Path],
+    accessibility_cache_dir: Optional[Path],
+    genome_file: Optional[Path],
+) -> None:
+    """Refuse argument combinations in which one argument would go unused.
+
+    Raises
+    ------
+    ValueError
+        When both ``accessibility`` and ``accessibility_dir`` are given; when
+        ``genome_file`` is given with either of them; when
+        ``accessibility_cache_dir`` is given with ``accessibility`` or
+        ``genome_file`` but without ``accessibility_dir``; and when
+        ``target_fasta`` or ``target_index`` is given with ``risearch_file``
+        or ``predictions``. The message names both arguments and what to drop.
+    """
+    if accessibility is not None and accessibility_dir is not None:
+        raise ValueError(
+            "accessibility and accessibility_dir are two sources for the same "
+            "input; pass one of them"
+        )
+    profiles = "accessibility" if accessibility is not None else "accessibility_dir"
+    if genome_file is not None and (
+        accessibility is not None or accessibility_dir is not None
+    ):
+        raise ValueError(
+            f"genome_file and {profiles} are two sources for the same profiles; "
+            f"drop genome_file to use {profiles}, or drop {profiles} to fold the "
+            "genome"
+        )
+    if accessibility_cache_dir is not None and accessibility_dir is None:
+        spilled = None
+        if accessibility is not None:
+            spilled = "accessibility is packed"
+        elif genome_file is not None:
+            spilled = "genome_file is folded"
+        if spilled is not None:
+            raise ValueError(
+                "accessibility_cache_dir only holds the cache of accessibility_dir; "
+                f"{spilled} in a temporary directory, so drop accessibility_cache_dir"
+            )
+    targets = [
+        name
+        for name, value in (
+            ("target_fasta", target_fasta),
+            ("target_index", target_index),
+        )
+        if value is not None
+    ]
+    source = "risearch_file" if risearch_file is not None else "predictions"
+    if targets and (risearch_file is not None or predictions is not None):
+        names = " and ".join(targets)
+        raise ValueError(
+            f"{names} {'is' if len(targets) == 1 else 'are'} only used by the "
+            f"in-process search (sirna_fasta) and cannot be combined with "
+            f"{source}; drop {names}"
+        )
+
+
 def _check_profile_names(profiles: Mapping[str, pl.DataFrame]) -> None:
     """Refuse in-memory profiles that cannot be spilled one file per chromosome.
 
@@ -1770,16 +1838,18 @@ def compute_off_targets(
         perfect-match energies come from ``sirna_table``.
     target_fasta : pathlib.Path, optional
         Target FASTA (genome or transcriptome) for the in-process search
-        (CLI ``--target-fasta``/``--genome``); required with ``sirna_fasta``.
+        (CLI ``--target-fasta``/``--genome``); required with ``sirna_fasta``
+        and refused with ``risearch_file`` or ``predictions``.
     target_index : pathlib.Path, optional
         Pre-built RIsearch index for ``target_fasta`` (CLI
-        ``-idx/--target-index``). When omitted the index is built (or reused)
-        next to ``target_fasta``.
+        ``-idx/--target-index``); refused with ``risearch_file`` or
+        ``predictions``. When omitted the index is built (or reused) next to
+        ``target_fasta``.
     gtf_file : pathlib.Path, optional
         Transcriptome annotation, GTF or GFF3 (CLI ``-t/--transcriptome``).
         Rows with expression <= 0 are dropped; predictions are intersected
         with the rest and annotated with ``transcript_id``, ``gene_id`` and
-        ``exp_value``.
+        ``exp_value``. Read before ``genome_file`` is folded.
     feature_type : str, default "exon"
         Feature type to select from a GTF/GFF3 annotation (CLI ``--feature``).
     expression_metric : str, default "RPKM"
@@ -1803,13 +1873,14 @@ def compute_off_targets(
         ``accessibility_cache_dir`` first, before anything else is read.
         Mutually exclusive with ``accessibility``.
     accessibility_cache_dir : pathlib.Path, optional
-        Where the cache is read from and built; default ``accessibility_dir``
-        (CLI ``--accessibility-cache-dir``). Created if absent.
+        Where the cache of ``accessibility_dir`` is read from and built;
+        default ``accessibility_dir`` (CLI ``--accessibility-cache-dir``).
+        Created if absent. Refused with ``accessibility`` or ``genome_file``,
+        whose cache lives in a temporary directory.
     genome_file : pathlib.Path, optional
         Genome FASTA to fold during the run (CLI ``-f/--fasta``), straight
-        into a packed cache in a temporary directory. Only folded when
-        neither ``accessibility`` nor ``accessibility_dir`` is given; those
-        profiles are used instead.
+        into a packed cache in a temporary directory. Refused with
+        ``accessibility`` or ``accessibility_dir``.
     window_size : int, default 80
         RNAplfold window size for folding ``genome_file`` (CLI
         ``-W/--window``).
@@ -1888,21 +1959,25 @@ def compute_off_targets(
     Raises
     ------
     ValueError
-        When both ``predictions`` and ``risearch_file``, or both
-        ``accessibility`` and ``accessibility_dir``, are given; when
-        ``sirna_fasta`` is given with ``risearch_file`` or ``predictions``;
-        when ``accessibility`` is empty or has a key that cannot be a file
-        name; when no prediction source is given; when ``sirna_fasta`` is given
-        without ``target_fasta``; when ``predictions`` lacks a required
-        column; when ``sirna_fasta`` holds a duplicate ID; when the siRNA
-        table cannot be read; when a ``sirna_id`` occurs in two input files;
-        and when an alpha/gamma pair other than (1, 1) is computed and a
-        siRNA with predictions has no row in ``sirna_table`` (or there is no
-        table).
+        When an argument would go unused: both ``predictions`` and
+        ``risearch_file``, or both ``accessibility`` and
+        ``accessibility_dir``; ``sirna_fasta``, ``target_fasta`` or
+        ``target_index`` with ``risearch_file`` or ``predictions``;
+        ``genome_file`` with ``accessibility`` or ``accessibility_dir``;
+        ``accessibility_cache_dir`` with ``accessibility`` or ``genome_file``.
+        Also when ``accessibility`` is empty or has a key that cannot be a
+        file name; when no prediction source is given; when ``sirna_fasta``
+        is given without ``target_fasta``; when ``predictions`` lacks a
+        required column; when ``sirna_fasta`` holds a duplicate ID; when the
+        siRNA table cannot be read; when a ``sirna_id`` occurs in two input
+        files; and when an alpha/gamma pair other than (1, 1) is computed and
+        a siRNA with predictions has no row in ``sirna_table`` (or there is
+        no table).
     FileNotFoundError
         When ``risearch_file`` does not exist, or is a directory without
-        prediction files; when ``sirna_fasta``, ``target_fasta`` or
-        ``target_index`` does not exist.
+        prediction files; when ``sirna_fasta``, ``target_fasta``,
+        ``target_index`` or ``gtf_file`` does not exist. All of these are
+        checked before any profile is packed or folded.
     RIsearchError
         `sioff.services.risearch_service.RIsearchError`, when the in-process
         search or indexing ``target_fasta`` fails.
@@ -1932,11 +2007,16 @@ def compute_off_targets(
             "combined with risearch_file or predictions; the perfect-match energy "
             "for E_min now comes from the siRNA table"
         )
-    if accessibility is not None and accessibility_dir is not None:
-        raise ValueError(
-            "accessibility and accessibility_dir are two sources for the same "
-            "input; pass one of them"
-        )
+    _check_ignored_arguments(
+        risearch_file=risearch_file,
+        predictions=predictions,
+        target_fasta=target_fasta,
+        target_index=target_index,
+        accessibility=accessibility,
+        accessibility_dir=accessibility_dir,
+        accessibility_cache_dir=accessibility_cache_dir,
+        genome_file=genome_file,
+    )
     if accessibility is not None:
         _check_profile_names(accessibility)
     input_files: list[Path] = []
@@ -1957,6 +2037,14 @@ def compute_off_targets(
     else:
         # The search itself runs in step 5; duplicate query IDs fail now.
         RIsearchService().validate_sirna_fasta(Path(sirna_fasta))
+    # Cheap, so a typo fails before a long genome fold or cache build.
+    for path, what in (
+        (gtf_file, "Transcriptome file"),
+        (target_fasta, "Target FASTA"),
+        (target_index, "Index"),
+    ):
+        if path is not None and not Path(path).exists():
+            raise FileNotFoundError(f"{what} not found: {path}")
     # Workers only ever memory-map the finished cache. In-memory profiles and
     # a fold get theirs in step 4, inside the try, so its temporary directory
     # is always removed.
@@ -1984,33 +2072,11 @@ def compute_off_targets(
     split_root: Optional[str] = None
     executor: Optional[_Executor] = None
     try:
-        # 4. The worker inputs. Profiles held in memory are written out as
-        # Parquet and packed; a genome is folded straight into a packed
-        # cache. -a (and so -f with -a) needs neither.
-        if accessibility is not None:
-            spill_dir = tempfile.mkdtemp(prefix="sioff_acc_")
-            for chrom, profile in accessibility.items():
-                profile.write_parquet(
-                    Path(spill_dir) / f"{chrom}{PARQUET_SUFFIX}", compression="lz4"
-                )
-            acc_dir = Path(spill_dir)
-            cache_dir = _prepare_accessibility_cache(acc_dir, None, n_workers)
-        elif genome_file is not None and accessibility_dir is None:
-            spill_dir = tempfile.mkdtemp(prefix="sioff_fold_")
-            acc_dir = Path(spill_dir)
-            GenomeAccessibilityService(acc_dir).compute_genome_accessibility(
-                Path(genome_file),
-                window_size=window_size,
-                max_span=max_span,
-                unpaired_prob=unpaired_prob,
-                temperature=temperature,
-                output_format="npy",
-                progress_callback=accessibility_progress_callback,
-            )
-        # The transcriptome, sorted by (chrom, strand, start) so each task's
-        # partitions are zero-copy slices of the memory-mapped file, and
-        # uncompressed so it can be memory-mapped at all; see
-        # preload_transcriptome.
+        # 4. The worker inputs. The transcriptome first: it is quick next to
+        # a fold, so a bad annotation fails before the genome is folded. It
+        # is sorted by (chrom, strand, start) so each task's partitions are
+        # zero-copy slices of the memory-mapped file, and uncompressed so it
+        # can be memory-mapped at all; see preload_transcriptome.
         ipc_path = ""
         if gtf_file is not None:
             df_trans = AnnotationParser().load_gtf(
@@ -2028,6 +2094,29 @@ def compute_off_targets(
                 compat_level=pl.CompatLevel.oldest(),
             )
             del df_trans
+        # Then the profiles: held in memory, they are written out as Parquet
+        # and packed; a genome is folded straight into a packed cache. -a
+        # needs neither.
+        if accessibility is not None:
+            spill_dir = tempfile.mkdtemp(prefix="sioff_acc_")
+            for chrom, profile in accessibility.items():
+                profile.write_parquet(
+                    Path(spill_dir) / f"{chrom}{PARQUET_SUFFIX}", compression="lz4"
+                )
+            acc_dir = Path(spill_dir)
+            cache_dir = _prepare_accessibility_cache(acc_dir, None, n_workers)
+        elif genome_file is not None:
+            spill_dir = tempfile.mkdtemp(prefix="sioff_fold_")
+            acc_dir = Path(spill_dir)
+            GenomeAccessibilityService(acc_dir).compute_genome_accessibility(
+                Path(genome_file),
+                window_size=window_size,
+                max_span=max_span,
+                unpaired_prob=unpaired_prob,
+                temperature=temperature,
+                output_format="npy",
+                progress_callback=accessibility_progress_callback,
+            )
         executor = _Executor(
             n_workers,
             {
