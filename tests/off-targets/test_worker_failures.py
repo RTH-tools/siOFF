@@ -81,3 +81,15 @@ def test_cli_still_writes_successful_sirnas(
     assert result.exit_code != 0
     assert out.exists() and pl.read_csv(out, separator="\t").height > 0
     assert "1/2" in plain(result.output)
+
+
+def test_cli_run_where_every_task_fails_leaves_no_stale_table(
+    broken_dir: Path, tmp_path: Path
+) -> None:
+    out = tmp_path / "out.tsv"
+    out.write_text("a table from an earlier run\n")
+    result = runner.invoke(
+        app, ["off-targets", "-r", str(broken_dir), "-j", "1", "-o", str(out)]
+    )
+    assert result.exit_code == 1
+    assert not out.exists()
