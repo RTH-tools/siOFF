@@ -252,3 +252,34 @@ def test_cli_table_and_summary_have_finite_numbers(tmp_path: Path) -> None:
     for v in values:
         assert v.lower() not in {"inf", "-inf", "nan"}, summary
         assert math.isfinite(float(v)), summary
+
+
+def test_cli_detailed_parquet_keeps_double_weights(tmp_path: Path) -> None:
+    rows = _predictions().iter_rows()
+    tsv = tmp_path / "predictions.out"
+    tsv.write_text(
+        "".join(
+            f"{sid}\t1\t21\t{chrom}\t{s}\t{e}\t{strand}\t{energy}\n"
+            for sid, chrom, s, e, strand, energy in rows
+        )
+    )
+    out = tmp_path / "out" / "off_targets.parquet"
+    result = CliRunner().invoke(
+        app,
+        ["off-targets", "-r", str(tsv), "--theta", "1.2", "--detailed-report",
+         "--output-format", "parquet", "-j", "1", "-o", str(out)],
+    )  # fmt: skip
+    assert result.exit_code == 0, result.output
+
+    table = pl.read_parquet(out)
+    sums = [c for c in table.columns if c.startswith(SUMS)]
+    probs = [c for c in table.columns if c.startswith("P_off_target")]
+    assert len(sums) == 8 and len(probs) == 2
+    for c in sums:
+        assert table[c].dtype == pl.Float64, c
+        assert table[c].is_finite().all(), (c, table[c].to_list())
+    for c in probs:
+        assert table[c].dtype == pl.Float32, c
+        assert table[c].is_finite().all(), (c, table[c].to_list())
+    strong = table.filter(pl.col("energy") == pl.col("energy").min())
+    assert strong["P_off_target"].item() == pytest.approx(1.0, rel=1e-6)
