@@ -119,10 +119,11 @@ def run(
         typer.Option(
             "--accessibility-cache-dir",
             help=(
-                "Where the packed accessibility cache is read from and built "
-                "(default: the accessibility dir itself). Use it when the "
-                "accessibility dir is read-only or to stage the cache on local "
-                "disk; it may also hold a complete cache without any Parquet."
+                "Where the packed accessibility cache of --accessibility-dir is "
+                "read from and built (default: the accessibility dir itself); "
+                "only with --accessibility-dir. Use it when the accessibility dir "
+                "is read-only or to stage the cache on local disk; it may also "
+                "hold a complete cache without any Parquet."
             ),
             file_okay=False,
         ),

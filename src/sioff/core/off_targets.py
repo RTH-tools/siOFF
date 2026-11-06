@@ -713,8 +713,8 @@ def _check_ignored_arguments(
     ValueError
         When both ``accessibility`` and ``accessibility_dir`` are given; when
         ``genome_file`` is given with either of them; when
-        ``accessibility_cache_dir`` is given with ``accessibility`` or
-        ``genome_file`` but without ``accessibility_dir``; and when
+        ``accessibility_cache_dir`` is given without ``accessibility_dir``
+        (alone, or with ``accessibility`` or ``genome_file``); and when
         ``target_fasta`` or ``target_index`` is given with ``risearch_file``
         or ``predictions``. The message names both arguments and what to drop.
     """
@@ -733,16 +733,19 @@ def _check_ignored_arguments(
             "genome"
         )
     if accessibility_cache_dir is not None and accessibility_dir is None:
-        spilled = None
         if accessibility is not None:
-            spilled = "accessibility is packed"
+            why = "accessibility is packed in a temporary directory, so drop"
         elif genome_file is not None:
-            spilled = "genome_file is folded"
-        if spilled is not None:
-            raise ValueError(
-                "accessibility_cache_dir only holds the cache of accessibility_dir; "
-                f"{spilled} in a temporary directory, so drop accessibility_cache_dir"
+            why = "genome_file is folded in a temporary directory, so drop"
+        else:
+            why = (
+                "without accessibility_dir it is unused, so pass "
+                "accessibility_dir or drop"
             )
+        raise ValueError(
+            "accessibility_cache_dir only holds the cache of accessibility_dir; "
+            f"{why} accessibility_cache_dir"
+        )
     targets = [
         name
         for name, value in (
@@ -1021,8 +1024,9 @@ def compute_off_targets(
     accessibility_cache_dir : pathlib.Path, optional
         Where the cache of ``accessibility_dir`` is read from and built;
         default ``accessibility_dir`` (CLI ``--accessibility-cache-dir``).
-        Created if absent. Refused with ``accessibility`` or ``genome_file``,
-        whose cache lives in a temporary directory.
+        Created if absent. Refused without ``accessibility_dir``: alone it
+        would be unused, and the cache of ``accessibility`` or
+        ``genome_file`` lives in a temporary directory.
     genome_file : pathlib.Path, optional
         Genome FASTA to fold during the run (CLI ``-f/--fasta``), straight
         into a packed cache in a temporary directory. Refused with
@@ -1110,7 +1114,7 @@ def compute_off_targets(
         ``accessibility_dir``; ``sirna_fasta``, ``target_fasta`` or
         ``target_index`` with ``risearch_file`` or ``predictions``;
         ``genome_file`` with ``accessibility`` or ``accessibility_dir``;
-        ``accessibility_cache_dir`` with ``accessibility`` or ``genome_file``.
+        ``accessibility_cache_dir`` without ``accessibility_dir``.
         Also when ``accessibility`` is empty or has a key that cannot be a
         file name; when no prediction source is given; when ``sirna_fasta``
         is given without ``target_fasta``; when ``predictions`` lacks a
@@ -1121,9 +1125,9 @@ def compute_off_targets(
         no table).
     FileNotFoundError
         When ``risearch_file`` does not exist, or is a directory without
-        prediction files; when ``sirna_fasta``, ``target_fasta``,
-        ``target_index`` or ``gtf_file`` does not exist. All of these are
-        checked before any profile is packed or folded.
+        prediction files; when ``sirna_fasta``, ``sirna_table``,
+        ``target_fasta``, ``target_index`` or ``gtf_file`` does not exist. All
+        of these are checked before any profile is packed or folded.
     RIsearchError
         `sioff.services.risearch_service.RIsearchError`, when the in-process
         search or indexing ``target_fasta`` fails.
@@ -1185,6 +1189,7 @@ def compute_off_targets(
         RIsearchService().validate_sirna_fasta(Path(sirna_fasta))
     # Cheap, so a typo fails before a long genome fold or cache build.
     for path, what in (
+        (sirna_table, "siRNA table"),
         (gtf_file, "Transcriptome file"),
         (target_fasta, "Target FASTA"),
         (target_index, "Index"),
