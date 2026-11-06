@@ -438,6 +438,9 @@ def _downcast_schema(df: pl.DataFrame) -> pl.DataFrame:
     - Strings: sirna_id, transcript_id, chrom, strand, gene_id → Categorical
     - Floats: energy, opening_energy, dG_total, P_off_target, exp_value → Float32
 
+    The ``boltzmann_weight*`` and ``Z_sirna*`` columns of ``--detailed-report``
+    stay Float64: a strong duplex's raw weight can exceed the Float32 range.
+
     Complexity: O(n) time, O(1) extra space.
 
     Returns
@@ -1170,7 +1173,8 @@ def compute_off_targets(
         and ``P_off_target`` repeated with a ``:alpha=A,gamma=G`` or
         ``:theta=T`` suffix for each extra parameter set (empty with
         ``summary_only``). With ``detailed_report`` it also holds ``E_min``,
-        ``boltzmann_weight*`` and ``Z_sirna*``. ``meta`` contains
+        ``boltzmann_weight*`` and ``Z_sirna*`` (Float64; every
+        ``P_off_target*`` column is Float32). ``meta`` contains
         ``"n_sirnas"``, ``"n_rows"``, ``"z_per_sirna"``,
         ``"on_target_weights"``, ``"on_target_count"``, ``"n_on_target_rows"``
         and ``"_timings"`` (per-stage wall times of the task: ``load_s``,
