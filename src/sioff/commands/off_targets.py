@@ -1,8 +1,10 @@
 import contextlib
 import os
 import re
+import signal
+import threading
 from pathlib import Path
-from typing import Annotated, Any, Optional
+from typing import Annotated, Any, Callable, Optional
 
 import typer
 from rich.console import Console
@@ -86,6 +88,32 @@ def _read_from_folder(path: Path, folder: Optional[Path], suffixes) -> bool:
         and path.parent.exists()
         and path.parent.samefile(folder)
     )
+
+
+def _exit_on_sigterm() -> Callable[[], None]:
+    """Make SIGTERM raise ``SystemExit(143)`` until the returned call restores it.
+
+    Slurm sends SIGTERM on a timeout or ``scancel``. Its default action kills
+    the process at once, so no ``finally`` runs and the input-sized
+    ``sioff_split_*`` copy stays in TMPDIR; as an exception it unwinds through
+    them. Spawned workers start with the default action. Only the main thread
+    can install a handler; elsewhere this changes nothing.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    def _exit(signum: int, frame: object) -> None:
+        raise SystemExit(128 + signum)
+
+    previous = signal.signal(signal.SIGTERM, _exit)
+
+    def _restore() -> None:
+        # None: a handler not installed from Python, which cannot be put back.
+        signal.signal(
+            signal.SIGTERM, previous if previous is not None else signal.SIG_DFL
+        )
+
+    return _restore
 
 
 def _as_path(value: Optional[Path | str]) -> Optional[Path]:
@@ -380,6 +408,7 @@ def run(
     profiler = PipelineProfiler(enabled=profile)
     n_workers: int = workers if workers is not None else os.cpu_count() or 1
 
+    restore_sigterm = _exit_on_sigterm()
     try:
         # Friendly CLI pre-checks (the core re-validates and raises ValueError).
         if detailed_report and summary_only:
@@ -653,3 +682,5 @@ def run(
         if verbose:
             console.print_exception()
         raise typer.Exit(code=1)
+    finally:
+        restore_sigterm()
