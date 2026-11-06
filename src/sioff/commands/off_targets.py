@@ -177,51 +177,6 @@ def run(
             ),
         ),
     ] = "t04",
-    on_target_file: Annotated[
-        Optional[Path],
-        typer.Option(
-            "-on",
-            "--on-target",
-            help="Path to On-Target sequence FASTA (for Partition Function).",
-            exists=True,
-            readable=True,
-        ),
-    ] = None,
-    on_target_risearch_file: Annotated[
-        Optional[Path],
-        typer.Option(
-            "--on-target-risearch-file",
-            "-on-ris",
-            help="Path to pre-computed RIsearch output file for On-Target (skips on-the-fly calculation).",
-            exists=True,
-            readable=True,
-        ),
-    ] = None,
-    query_file: Annotated[
-        Optional[Path],
-        typer.Option(
-            "-q",
-            "--query",
-            help="Path to siRNA query FASTA (required if --on-target is used).",
-            exists=True,
-            readable=True,
-        ),
-    ] = None,
-    on_target_expression: Annotated[
-        float,
-        typer.Option(
-            "--on-target-expression",
-            "-oexp",
-            help="Expression level for On-Target (default: 1000.0).",
-        ),
-    ] = 1000.0,
-    on_target_accessibility: Annotated[
-        Optional[Path],
-        typer.Option(
-            "--on-target-accessibility",
-            help="Accessibility Parquet for the on-target (same schema as accessibility command output). Falls back to on-the-fly computation if omitted.",
-        ),
-    ] = None,
     on_target_ids_file: Annotated[
         Optional[Path],
         typer.Option(
@@ -253,18 +208,14 @@ def run(
             help="Theta scaling parameter(s). Separate multiple values with ';' (e.g., '0.5;0.7').",
         ),
     ] = "",
-    legacy_format: Annotated[
-        bool,
-        typer.Option(
-            "--legacy-format",
-            help="Output in legacy format (gw.results style, aggregated by transcript).",
-        ),
-    ] = False,
     detailed_report: Annotated[
         bool,
         typer.Option(
             "--detailed-report",
-            help="Report off-target probabilities for individual transcripts (Legacy Format).",
+            help=(
+                "Keep the raw Boltzmann weights, partition functions and E_min "
+                "for every interaction in the output table."
+            ),
         ),
     ] = False,
     sense_only: Annotated[
@@ -348,10 +299,6 @@ def run(
     accessibility_cache_dir = _as_path(accessibility_cache_dir)
     output_file = _as_path(output_file)
     genome_file = _as_path(genome_file)
-    on_target_file = _as_path(on_target_file)
-    on_target_risearch_file = _as_path(on_target_risearch_file)
-    query_file = _as_path(query_file)
-    on_target_accessibility = _as_path(on_target_accessibility)
     on_target_ids_file = _as_path(on_target_ids_file)
 
     console.print(Panel("siOFF", style="bold cyan"))
@@ -367,6 +314,12 @@ def run(
             risearch_file = None
 
         # Friendly CLI pre-checks (the core re-validates and raises ValueError).
+        if detailed_report and summary_only:
+            console.print(
+                "[bold red]Error:[/bold red] --detailed-report needs the "
+                "per-interaction table; drop --summary-only"
+            )
+            raise typer.Exit(code=1)
         if risearch_file is None and sirna_fasta is None and input_dir is None:
             console.print(
                 "[bold red]Error:[/bold red] Must provide either --risearch-file (file or directory) OR --sirna-fasta"
@@ -448,7 +401,6 @@ def run(
                 temperature=temperature,
                 matrix=matrix,
                 on_target_ids_file=on_target_ids_file,
-                on_target_expression=on_target_expression,
                 alpha=alpha,
                 gamma=gamma,
                 theta=theta,
@@ -458,6 +410,7 @@ def run(
                 # --summary-only writes the .summary files from the per-siRNA
                 # metadata alone; workers then send back no per-site table.
                 summary_only=summary_only,
+                detailed_report=detailed_report,
             )
 
             _drain_stage_totals: dict[str, float] = {}
@@ -631,18 +584,12 @@ def run(
                 unpaired_prob=unpaired_prob,
                 temperature=temperature,
                 matrix=matrix,
-                on_target_file=on_target_file,
-                on_target_risearch_file=on_target_risearch_file,
-                query_file=query_file,
-                on_target_expression=on_target_expression,
-                on_target_accessibility=on_target_accessibility,
                 on_target_ids_file=on_target_ids_file,
                 alpha=alpha,
                 gamma=gamma,
                 theta=theta,
                 sense_only=sense_only,
                 predictions_type=predictions_type,
-                legacy_format=legacy_format,
                 detailed_report=detailed_report,
                 n_workers=n_workers,
                 profiler=profiler,
@@ -695,33 +642,6 @@ def run(
                     theta_vals,
                 )
                 (out_dir / f"{sid}.summary").write_text(summary_text)
-
-        # On-target details (single-siRNA mode only).
-        if meta.get("has_on_target", False):
-            console.print(
-                f"  └─ On-Target: ΔG_total={meta['dG_on_target']:.2f} kcal/mol, "
-                f"P(on)={meta.get('p_on_target', 0.0):.10f}"
-            )
-
-        # Legacy format: write .results + detailed_results.tsv, then return early
-        # (skips the preview table and the standard TSV write).
-        if legacy_format:
-            legacy_output = meta.get("legacy_text", "")
-            if output_file:
-                legacy_path = output_file.with_suffix(".results")
-                with open(legacy_path, "w") as f:
-                    f.write(legacy_output)
-                console.print(
-                    f"[green]✓[/green] Legacy format results saved to {legacy_path}"
-                )
-                detailed_path = output_file.parent / "detailed_results.tsv"
-                df.write_csv(detailed_path, separator="\t")
-                console.print(
-                    f"[green]✓[/green] Detailed results saved to {detailed_path}"
-                )
-            else:
-                console.print(legacy_output)
-            return df
 
         # Results preview table (sorts df by P_off_target — preserved so the saved
         # TSV is ordered identically to the pre-refactor output).

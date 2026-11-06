@@ -21,6 +21,33 @@ class TestLoadConfig:
         with pytest.raises(ConfigKeyError, match="accessibility_strategy"):
             load_config(cfg)
 
+    def test_removed_legacy_format_key_names_the_key(self, tmp_path):
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text(
+            "command: off-targets\noff_targets:\n  risearch_file: x.out\n"
+            "  legacy_format: true\n"
+        )
+        with pytest.raises(ValueError, match="'legacy_format' was removed"):
+            load_config(cfg)
+
+    @pytest.mark.parametrize(
+        "key",
+        [
+            "on_target",
+            "on_target_risearch_file",
+            "query",
+            "on_target_expression",
+            "on_target_accessibility",
+        ],
+    )
+    def test_removed_on_target_keys_name_the_key(self, tmp_path, key):
+        cfg = tmp_path / "c.yaml"
+        cfg.write_text(
+            f"command: off-targets\noff_targets:\n  risearch_file: x.out\n  {key}: x\n"
+        )
+        with pytest.raises(ValueError, match=f"'{key}' was removed"):
+            load_config(cfg)
+
     def test_load_off_targets_config(self, tmp_path):
         config_file = tmp_path / "config.yaml"
         # Create dummy path for risearch_file

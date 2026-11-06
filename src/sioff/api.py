@@ -93,11 +93,6 @@ def off_targets(
     unpaired_prob: int = 30,
     temperature: float = 37.0,
     matrix: Union[str, Path] = "t04",
-    on_target_file: Optional[Union[str, Path]] = None,
-    on_target_risearch_file: Optional[Union[str, Path]] = None,
-    query_file: Optional[Union[str, Path]] = None,
-    on_target_expression: float = 1000.0,
-    on_target_accessibility: Optional[Union[str, Path]] = None,
     on_target_ids_file: Optional[Union[str, Path]] = None,
     alpha: str = "1.0",
     gamma: str = "1.0",
@@ -105,6 +100,7 @@ def off_targets(
     sense_only: bool = False,
     predictions_type: str = "gw",
     n_workers: int = 1,
+    detailed_report: bool = False,
 ) -> Union[pl.DataFrame, Iterator[pl.DataFrame]]:
     """Analyse siRNA off-target predictions, returning results in memory.
 
@@ -221,24 +217,6 @@ def off_targets(
         self-hybridisation E_min of ``sirna_fasta``: a bundled id or the path of
         a DSM TSV table. Use the set the predictions were searched with; E_min
         is the reference energy of the alpha/gamma clamp. CLI: ``-z/--matrix``.
-    on_target_file : str or pathlib.Path, optional
-        On-target sequence FASTA for the single-siRNA partition function; its
-        hybridisation energy against ``query_file`` is computed in-process with
-        RIsearch and enters the partition function as the on-target term.
-        Requires ``query_file``. CLI: ``-on/--on-target``.
-    on_target_risearch_file : str or pathlib.Path, optional
-        Pre-computed RIsearch output for the on-target, skipping the
-        on-the-fly on-target search. CLI: ``-on-ris/--on-target-risearch-file``.
-    query_file : str or pathlib.Path, optional
-        siRNA query FASTA used together with ``on_target_file``. CLI:
-        ``-q/--query``.
-    on_target_expression : float, default 1000.0
-        Expression level assigned to the on-target transcript in the partition
-        function. CLI: ``-oexp/--on-target-expression``.
-    on_target_accessibility : str or pathlib.Path, optional
-        Accessibility Parquet for the on-target sequence (same schema as the
-        ``sioff accessibility`` output). Computed on the fly when omitted.
-        CLI: ``--on-target-accessibility``.
     on_target_ids_file : str or pathlib.Path, optional
         Two-column tab-separated file mapping ``sirna_id`` to the ID of its
         on-target transcript or gene (multi-siRNA form). Predictions of a siRNA
@@ -274,6 +252,10 @@ def off_targets(
         single-frame forms, and the number of spawned worker processes (one
         siRNA file at a time each) for the directory form. CLI:
         ``-j/--workers``, whose default is the CPU count.
+    detailed_report : bool, default False
+        Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min`` columns
+        for every interaction in the output; by default they are dropped.
+        CLI: ``--detailed-report``.
 
     Returns
     -------
@@ -289,9 +271,9 @@ def off_targets(
         alpha=gamma=theta=1); and one ``P_off_target:alpha=X,gamma=Y`` or
         ``P_off_target:theta=T`` column per extra parameter value. Multi-siRNA
         and swept runs also carry ``is_on_target`` and the per-parameter
-        ``dG_total:...`` columns; the single-frame forms additionally keep the
-        ``E_min``, Boltzmann-weight and ``Z_sirna`` intermediates, which the
-        directory form drops before yielding.
+        ``dG_total:...`` columns. With ``detailed_report`` every form also
+        keeps the ``E_min``, ``boltzmann_weight*`` and ``Z_sirna*``
+        intermediates.
 
     Raises
     ------
@@ -308,8 +290,8 @@ def off_targets(
         contains no prediction files.
     RIsearchError
         `sioff.services.risearch_service.RIsearchError`, when the
-        in-process RIsearch run (``sirna_fasta`` form or on-target search)
-        fails, including when the ``risearch`` package is not installed.
+        in-process RIsearch run (``sirna_fasta`` form) fails, including when the
+        ``risearch`` package is not installed.
     AccessibilityError
         `sioff.services.accessibility.AccessibilityError`, when folding
         ``genome_file`` fails, an accessibility profile is missing or
@@ -364,13 +346,13 @@ def off_targets(
             temperature=temperature,
             matrix=matrix,
             on_target_ids_file=_p(on_target_ids_file),
-            on_target_expression=on_target_expression,
             alpha=alpha,
             gamma=gamma,
             theta=theta,
             sense_only=sense_only,
             predictions_type=predictions_type,
             n_workers=n_workers,
+            detailed_report=detailed_report,
         )
         # Yield bare per-siRNA DataFrames (the core yields (df, meta) tuples).
         # Closing this generator propagates GeneratorExit to core_gen, tearing
@@ -396,11 +378,6 @@ def off_targets(
         unpaired_prob=unpaired_prob,
         temperature=temperature,
         matrix=matrix,
-        on_target_file=_p(on_target_file),
-        on_target_risearch_file=_p(on_target_risearch_file),
-        query_file=_p(query_file),
-        on_target_expression=on_target_expression,
-        on_target_accessibility=_p(on_target_accessibility),
         on_target_ids_file=_p(on_target_ids_file),
         alpha=alpha,
         gamma=gamma,
@@ -408,6 +385,7 @@ def off_targets(
         sense_only=sense_only,
         predictions_type=predictions_type,
         n_workers=n_workers,
+        detailed_report=detailed_report,
     )
     return df
 

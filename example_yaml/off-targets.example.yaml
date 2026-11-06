@@ -82,28 +82,6 @@ off_targets:
   unpaired: 30
 
   # ---------------------------------------------------------------------------
-  # On-target configuration — for partition-function P(OT)
-  # Only ONE method needed; pre-computed RIsearch file is faster.
-  # ---------------------------------------------------------------------------
-
-  # FASTA of on-target transcript sequence (triggers on-the-fly RIsearch search).
-  # on_target: ../tests/off-targets/data/onTarget.fa
-
-  # siRNA FASTA (required when on_target is set for in-process RIsearch).
-  # query: ../examples/data/sirnas.fa
-
-  # Expression level for the on-target gene. Default: 1000.0
-  on_target_expression: 1000.0
-
-  # Pre-computed RIsearch output for the on-target (skips on-the-fly search).
-  # on_target_risearch_file: ../tests/off-targets/data/risearch_siRNAID_only.out
-
-  # Accessibility Parquet for the on-target transcript (same schema as the files
-  # produced by the accessibility command: columns position, strand, u1..u30).
-  # If omitted, accessibility is computed on-the-fly from the on-target FASTA.
-  on_target_accessibility: null
-
-  # ---------------------------------------------------------------------------
   # Partition-function parameters
   # Multiple values separated by ";" generate one P_off_target column each.
   # All (alpha, gamma) pairs where alpha ≤ gamma are computed in one Polars pass.
@@ -137,11 +115,9 @@ off_targets:
   # Path for the main output file (TSV by default; extension depends on output_format).
   output: ./sioff_example_out/off_targets.tsv
 
-  # Write in legacy .results format aggregated by transcript (old pipeline). Default: false
-  legacy_format: false
-
-  # Write per-transcript probability breakdown alongside .results. Default: false
-  # Only effective when legacy_format is true.
+  # Keep the raw Boltzmann weights (boltzmann_weight*), partition functions
+  # (Z_sirna*) and E_min for every interaction in the output table. Default: false
+  # Not compatible with summary_only.
   detailed_report: false
 
   # ---------------------------------------------------------------------------

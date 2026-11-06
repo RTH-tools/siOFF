@@ -86,7 +86,6 @@ off_targets:
   alpha: "1.0"
   gamma: "1.0"
   theta: ""
-  on_target_expression: 1000.0
 
 # =============================================================================
 # Multi-transcriptome fan-out (optional)

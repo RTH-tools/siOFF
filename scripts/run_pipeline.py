@@ -173,7 +173,27 @@ def _build_accessibility(cfg: dict, base: Path) -> list[str]:
     return cmd
 
 
+# Keys removed from off_targets; each maps to what to do instead. Kept here
+# (not imported from sioff.config) because this script only needs the
+# standard library and PyYAML.
+_REMOVED_OFF_TARGETS_KEYS = {
+    "legacy_format": (
+        "the .summary files carry the partition-function header; "
+        "--detailed-report keeps the per-interaction weights"
+    ),
+    "on_target": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
+    "query": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
+}
+
+
 def _build_off_targets(cfg: dict, base: Path) -> list[str]:
+    for key, hint in _REMOVED_OFF_TARGETS_KEYS.items():
+        if key in cfg:
+            raise ValueError(f"'{key}' was removed from off_targets: {hint}")
+
     cmd = ["sioff", "off-targets"]
 
     # Path options
@@ -187,10 +207,6 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("accessibility_cache_dir", "--accessibility-cache-dir"),
         ("output", "--output"),
         ("fasta", "--fasta"),
-        ("on_target", "--on-target"),
-        ("on_target_risearch_file", "--on-target-risearch-file"),
-        ("query", "--query"),
-        ("on_target_accessibility", "--on-target-accessibility"),
         ("on_target_ids", "--on-target-ids"),
     ]:
         val = _resolve(cfg.get(key), base)
@@ -207,7 +223,6 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
         ("span", "--span"),
         ("unpaired", "--unpaired"),
         ("temperature", "--temperature"),
-        ("on_target_expression", "--on-target-expression"),
         ("alpha", "--alpha"),
         ("gamma", "--gamma"),
         ("theta", "--theta"),
@@ -219,7 +234,6 @@ def _build_off_targets(cfg: dict, base: Path) -> list[str]:
 
     # Boolean flags
     for key, flag in [
-        ("legacy_format", "--legacy-format"),
         ("detailed_report", "--detailed-report"),
         ("sense_only", "--sense-only"),
         ("verbose", "--verbose"),

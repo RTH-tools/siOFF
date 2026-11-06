@@ -9,6 +9,20 @@ from omegaconf import MISSING, OmegaConf, DictConfig
 from sioff.models import PredictionsMode
 
 
+# off_targets keys that were removed; each maps to what to do instead.
+REMOVED_OFF_TARGETS_KEYS: dict[str, str] = {
+    "legacy_format": (
+        "the .summary files carry the partition-function header; "
+        "--detailed-report keeps the per-interaction weights"
+    ),
+    "on_target": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_risearch_file": "give each siRNA's on-target ID in --on-target-ids",
+    "query": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_expression": "give each siRNA's on-target ID in --on-target-ids",
+    "on_target_accessibility": "give each siRNA's on-target ID in --on-target-ids",
+}
+
+
 @dataclass
 class OffTargetsConfig:
     """Schema for off-targets command configuration."""
@@ -25,11 +39,6 @@ class OffTargetsConfig:
     window: int = 80
     span: int = 40
     unpaired: int = 30
-    on_target: Optional[str] = None
-    on_target_risearch_file: Optional[str] = None
-    query: Optional[str] = None
-    on_target_expression: float = 1000.0
-    on_target_accessibility: Optional[str] = None
     temperature: float = 37.0
     matrix: str = (
         "t04"  # bundled DSM id, or a DSM TSV path (resolved like the other paths)
@@ -37,7 +46,6 @@ class OffTargetsConfig:
     alpha: str = "1.0"
     gamma: str = "1.0"
     theta: str = ""
-    legacy_format: bool = False
     detailed_report: bool = False
     sense_only: bool = False
     type: str = PredictionsMode.GW
@@ -71,10 +79,17 @@ class PipelineConfig:
 
 def load_config(config_path: Path) -> DictConfig:
     """Load and validate a YAML config file, resolving relative paths."""
+    raw = cast(DictConfig, OmegaConf.load(config_path))
+    off_targets_raw = raw.get("off_targets")
+    if isinstance(off_targets_raw, DictConfig):
+        for key, hint in REMOVED_OFF_TARGETS_KEYS.items():
+            if key in off_targets_raw:
+                raise ValueError(f"'{key}' was removed from off_targets: {hint}")
+
     schema = OmegaConf.structured(PipelineConfig)
     # merge() is typed DictConfig | ListConfig; merging into a structured
     # (dict) schema always yields a DictConfig.
-    cfg = cast(DictConfig, OmegaConf.merge(schema, OmegaConf.load(config_path)))
+    cfg = cast(DictConfig, OmegaConf.merge(schema, raw))
 
     if cfg.command not in ("off-targets", "accessibility"):
         raise ValueError(
@@ -94,10 +109,6 @@ def _resolve_paths(cfg: DictConfig, base_dir: Path) -> DictConfig:
             "accessibility_cache_dir",
             "output",
             "fasta",
-            "on_target",
-            "on_target_risearch_file",
-            "query",
-            "on_target_accessibility",
         ],
         "accessibility": ["fasta", "output"],
     }
@@ -137,10 +148,6 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
         "accessibility_cache_dir",
         "output",
         "fasta",
-        "on_target",
-        "on_target_risearch_file",
-        "query",
-        "on_target_accessibility",
     ]:
         if key in kwargs and kwargs[key] is not None:
             kwargs[key] = Path(kwargs[key])
@@ -161,8 +168,6 @@ def config_to_kwargs(cfg: DictConfig, command: str) -> dict:
                 "feature": "feature_type",
                 "output": "output_file",
                 "fasta": "genome_file",
-                "on_target": "on_target_file",
-                "query": "query_file",
             }
         )
         # Typer OptionInfo objects become defaults when calling the function directly,

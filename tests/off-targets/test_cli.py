@@ -23,6 +23,23 @@ def test_accessibility_strategy_option_is_gone(plain) -> None:
     assert "No such option" in plain(result.output)
 
 
+@pytest.mark.parametrize(
+    "flag",
+    [
+        "--on-target",
+        "--on-target-risearch-file",
+        "--query",
+        "--on-target-expression",
+        "--on-target-accessibility",
+    ],
+)
+def test_fasta_on_target_options_are_gone(plain, flag) -> None:
+    tsv_path = Path(__file__).parent / "data" / "risearch_siRNAID.out"
+    result = runner.invoke(app, ["off-targets", "-r", str(tsv_path), flag, "x"])
+    assert result.exit_code == 2
+    assert "No such option" in plain(result.output)
+
+
 class TestCLIMain:
     """Tests for the main command."""
 

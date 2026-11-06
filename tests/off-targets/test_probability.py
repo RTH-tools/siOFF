@@ -10,9 +10,9 @@ class TestProbabilityService(unittest.TestCase):
         """Test calculation without accessibility."""
         service = ProbabilityService(None)
 
-        df = pl.DataFrame({"energy": [-10.0, -5.0, 0.0]})
+        df = pl.DataFrame({"sirna_id": ["s1"] * 3, "energy": [-10.0, -5.0, 0.0]})
 
-        res, _ = service.calculate_probabilities(df)
+        res, _ = service.calculate_probabilities_per_sirna(df)
 
         self.assertIn("dG_total", res.columns)
         self.assertIn("P_off_target", res.columns)
@@ -22,9 +22,9 @@ class TestProbabilityService(unittest.TestCase):
     def test_formula_correction(self):
         """Verify the formula correction."""
         service = ProbabilityService(None)
-        df = pl.DataFrame({"energy": [-10.0]})
+        df = pl.DataFrame({"sirna_id": ["s1"], "energy": [-10.0]})
 
-        res, _ = service.calculate_probabilities(df)
+        res, _ = service.calculate_probabilities_per_sirna(df)
         p = res["P_off_target"][0]
 
         self.assertGreater(p, 0.9)
@@ -41,6 +41,7 @@ class TestProbabilityService(unittest.TestCase):
 
         df = pl.DataFrame(
             {
+                "sirna_id": ["s1"],
                 "energy": [-10.0],
                 "chrom": ["chr1"],
                 "start": [10],
@@ -49,7 +50,7 @@ class TestProbabilityService(unittest.TestCase):
             }
         )
 
-        res, _ = service.calculate_probabilities(df)
+        res, _ = service.calculate_probabilities_per_sirna(df)
 
         self.assertIn("opening_energy", res.columns)
         dG_open = res["opening_energy"][0]
@@ -58,13 +59,13 @@ class TestProbabilityService(unittest.TestCase):
 
     def test_temperature_default_matches_37(self):
         """ProbabilityService() default must be identical to temperature=37.0."""
-        df = pl.DataFrame({"energy": [-10.0, -5.0, -2.0]})
+        df = pl.DataFrame({"sirna_id": ["s1"] * 3, "energy": [-10.0, -5.0, -2.0]})
 
         svc_default = ProbabilityService(None)
         svc_37 = ProbabilityService(None, temperature=37.0)
 
-        res_default, _ = svc_default.calculate_probabilities(df)
-        res_37, _ = svc_37.calculate_probabilities(df)
+        res_default, _ = svc_default.calculate_probabilities_per_sirna(df)
+        res_37, _ = svc_37.calculate_probabilities_per_sirna(df)
 
         np.testing.assert_array_almost_equal(
             res_default["P_off_target"].to_numpy(),
@@ -75,13 +76,13 @@ class TestProbabilityService(unittest.TestCase):
 
     def test_temperature_alters_boltzmann_weights(self):
         """Higher temperature produces different (closer-to-uniform) probabilities."""
-        df = pl.DataFrame({"energy": [-10.0, -5.0, -2.0]})
+        df = pl.DataFrame({"sirna_id": ["s1"] * 3, "energy": [-10.0, -5.0, -2.0]})
 
         svc_37 = ProbabilityService(None, temperature=37.0)
         svc_80 = ProbabilityService(None, temperature=80.0)
 
-        res_37, _ = svc_37.calculate_probabilities(df)
-        res_80, _ = svc_80.calculate_probabilities(df)
+        res_37, _ = svc_37.calculate_probabilities_per_sirna(df)
+        res_80, _ = svc_80.calculate_probabilities_per_sirna(df)
 
         p_37 = res_37["P_off_target"].to_numpy()
         p_80 = res_80["P_off_target"].to_numpy()
@@ -117,6 +118,13 @@ class TestProbabilityService(unittest.TestCase):
             np.allclose(p_37, p_80),
             "Per-siRNA probabilities must differ between temperature=37 and temperature=80",
         )
+
+    def test_frame_without_sirna_id_is_rejected(self):
+        service = ProbabilityService(None)
+        df = pl.DataFrame({"energy": [-10.0, -5.0]})
+
+        with self.assertRaisesRegex(ValueError, "sirna_id"):
+            service.calculate_probabilities_per_sirna(df)
 
     def test_module_level_RT_still_exported(self):
         """Module-level RT constant is still importable for backward compat."""

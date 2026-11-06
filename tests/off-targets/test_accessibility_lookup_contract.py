@@ -27,7 +27,6 @@ from __future__ import annotations
 
 import math
 import random
-from pathlib import Path
 
 import numpy as np
 import polars as pl
@@ -290,42 +289,6 @@ def test_oracle_sees_what_the_writer_wrote(folded):
         i = row["position"]
         for u in (1, 10, 20, 30):
             assert row[f"u{u}"] == pytest.approx(_energy(up_rc, i, u), abs=1e-4)
-
-
-# --------------------------------------------------------------------------
-# On-target opening energy: same contract, through ProbabilityService, from a
-# precomputed Parquet and from an on-the-fly fold of the on-target sequence.
-# --------------------------------------------------------------------------
-
-
-def _write_risearch_line(path: Path, strand: str, s: int, e: int) -> None:
-    # RIsearch2 -p2 columns: query, qstart, qend, target, tstart, tend, strand, energy
-    path.write_text(f"siR\t1\t21\t{CHROM}\t{s}\t{e}\t{strand}\t-20.0\n")
-
-
-@pytest.mark.parametrize("source", ["parquet", "on_the_fly"])
-@pytest.mark.parametrize("strand", ["+", "-"])
-def test_on_target_opening_energy_matches_rnaplfold(folded, tmp_path, source, strand):
-    from sioff.services.probability import ProbabilityService
-
-    fasta = tmp_path / "on_target.fa"
-    fasta.write_text(f">{CHROM}\n{_random_rna(SEQ_LEN).replace('U', 'T')}\n")
-    service = ProbabilityService(None, temperature=TEMP)
-    for s, e in SITES:
-        ris = tmp_path / f"hit_{strand}_{s}.out"
-        _write_risearch_line(ris, strand, s, e)
-        _, dg_open = service._calculate_on_target_components(
-            fasta,
-            fasta,
-            accessibility_path=folded["ppath"] if source == "parquet" else None,
-            risearch_path=ris,
-        )
-        # The Parquet holds 0.1-quantised values; the on-the-fly fold returns
-        # the raw energy, so allow the quantisation step there.
-        tol = 1e-4 if source == "parquet" else 0.051
-        assert dg_open == pytest.approx(_oracle(folded, strand, s, e), abs=tol), (
-            f"{source} {strand} [{s},{e}]"
-        )
 
 
 # --------------------------------------------------------------------------

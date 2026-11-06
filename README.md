@@ -22,8 +22,7 @@ Python package built on Polars, adds in-process bindings for
 [RIsearch 3](https://github.com/RTH-tools/risearch) (Rust/PyO3, on
 [PyPI](https://pypi.org/project/risearch/) and
 [crates.io](https://crates.io/crates/risearch)),
-Parquet-based accessibility profiles, and a Slurm-aware orchestrator. A
-compatibility mode (`--legacy-format`) reproduces the old `.results` output.
+Parquet-based accessibility profiles, and a Slurm-aware orchestrator.
 
 The pipeline has three stages, mapped one-to-one onto CLI commands:
 
@@ -345,7 +344,7 @@ sioff off-targets \
 Useful knobs: `--alpha/--gamma/--theta` for parameter sweeps (semicolon-
 separated values, each combination adds a `P_off_target:...` column),
 `-j` for worker count, `--output-format parquet` for large runs,
-`--legacy-format` for the old pipeline's `.results` output. Prefer the YAML
+`--detailed-report` for the raw per-interaction weights. Prefer the YAML
 config for reproducibility — [`example_yaml/off-targets.example.yaml`](example_yaml/off-targets.example.yaml)
 documents every option; run it with `sioff -c my-config.yaml`.
 
@@ -585,8 +584,11 @@ partition-function statistics (`P`, `Z`, `Zoff`, with and without
 accessibility). `--summary-only` skips the per-prediction table — the old
 pipeline's default behaviour.
 
-`--legacy-format` additionally writes the RIsearch2 pipeline's `.results`
-files, for byte-level comparison with old runs.
+`--detailed-report` adds the raw per-interaction columns to the table:
+`boltzmann_weight` (and `boltzmann_weight_noacc`), `Z_sirna` (and
+`Z_sirna_noacc`) and `E_min`, each repeated with a `:alpha=X,gamma=Y` or
+`:theta=T` suffix per extra parameter set. It cannot be combined with
+`--summary-only`.
 
 ---
 
