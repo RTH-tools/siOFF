@@ -1,4 +1,4 @@
-"""Directory mode looks opening energies up in the memory-mapped cache.
+"""A folder of per-siRNA files looks opening energies up in the memory-mapped cache.
 
 Every worker memory-maps the uint8 packed cache the parent built
 before starting the pool (chr1: 30 GB dense per strand would be the cost of
@@ -24,17 +24,16 @@ import pyarrow.parquet as pq
 import pytest
 from polars.testing import assert_frame_equal
 
-from sioff.core.off_targets import (
-    WorkerFailureError,
-    compute_off_targets_directory,
-)
+from sioff.core.off_targets import WorkerFailureError, compute_off_targets
 from sioff.services.accessibility import (
     GenomeAccessibilityService,
     ensure_accessibility_cache,
     packed_paths,
 )
+from sioff.services.risearch_service import RIsearchService
 
 N_U = 30
+N_SIRNAS = 5
 # Small row groups so a contig spans several of them and the row-group walk
 # (statistics -> needed row groups only) is exercised, not just a single read.
 ROW_GROUP_ROWS = 500
@@ -84,7 +83,7 @@ def acc_dir(tmp_path_factory) -> Path:
     return d
 
 
-def _synthetic_hits(rng, n_sirnas: int = 5, n_rows: int = 300) -> pl.DataFrame:
+def _synthetic_hits(rng, n_sirnas: int = N_SIRNAS, n_rows: int = 300) -> pl.DataFrame:
     frames = []
     for i in range(n_sirnas):
         chroms = rng.choice(["chrA", "chrA", "chrA", "chrB", "chrC"], n_rows)
@@ -120,7 +119,6 @@ def _synthetic_hits(rng, n_sirnas: int = 5, n_rows: int = 300) -> pl.DataFrame:
                     "end": list(ends) + [e[3] for e in extra],
                     "strand": list(strands) + [e[1] for e in extra],
                     "energy": rng.uniform(-30.0, -8.0, n_rows + len(extra)),
-                    "raw_e_min": [-30.0 - i] * (n_rows + len(extra)),
                 },
                 schema={
                     "sirna_id": pl.Utf8,
@@ -129,11 +127,34 @@ def _synthetic_hits(rng, n_sirnas: int = 5, n_rows: int = 300) -> pl.DataFrame:
                     "end": pl.Int32,
                     "strand": pl.Utf8,
                     "energy": pl.Float32,
-                    "raw_e_min": pl.Float32,
                 },
             )
         )
     return pl.concat(frames)
+
+
+@pytest.fixture(scope="module")
+def sirna_table(tmp_path_factory) -> Path:
+    """alpha/gamma needs a table row (and a perfect-match energy) per siRNA."""
+    path = tmp_path_factory.mktemp("table") / "sirna_table.tsv"
+    path.write_text(
+        "sirna_id\ton_target_id\tsequence\n"
+        + "".join(f"siRNA{i}\t\tACGUACGUACGUACGUACG\n" for i in range(N_SIRNAS))
+    )
+    return path
+
+
+@pytest.fixture(autouse=True)
+def perfect_match(monkeypatch):
+    """E_min's perfect-match energy, below every hit (-30 - i); no risearch.
+
+    Computed in the parent, so the fake holds with worker processes too.
+    """
+
+    def fake(self, sequence, sirna_id="query", matrix="t04"):
+        return -30.0 - int(sirna_id.removeprefix("siRNA"))
+
+    monkeypatch.setattr(RIsearchService, "self_hybridization_emin", fake)
 
 
 @pytest.fixture(scope="module")
@@ -158,11 +179,13 @@ def _run(
     acc_dir: Path,
     n_workers: int,
     cache_dir: Path | None,
+    sirna_table: Path,
 ):
-    gen = compute_off_targets_directory(
-        input_dir=hits_dir,
+    gen = compute_off_targets(
+        risearch_file=hits_dir,
         accessibility_dir=acc_dir,
         accessibility_cache_dir=cache_dir,
+        sirna_table=sirna_table,
         alpha="0.8;1",
         gamma="0.9;1",
         theta="0.7",
@@ -182,10 +205,16 @@ def _dense_oracle(acc_dir: Path, all_hits: pl.DataFrame) -> pl.DataFrame:
     return service.annotate_opening_energy_vectorized(all_hits).sort(SORT_KEYS)
 
 
-def test_directory_mode_matches_the_dense_lookup(hits, acc_dir, tmp_path):
+def test_folder_matches_the_dense_lookup(hits, acc_dir, sirna_table, tmp_path):
     """Independent oracle: the dense lookup on the concatenated hits."""
     hits_dir, all_hits = hits
-    result, _ = _run(hits_dir, acc_dir, n_workers=3, cache_dir=tmp_path / "cache")
+    result, _ = _run(
+        hits_dir,
+        acc_dir,
+        n_workers=3,
+        cache_dir=tmp_path / "cache",
+        sirna_table=sirna_table,
+    )
     expected = _dense_oracle(acc_dir, all_hits)
     assert result.height == all_hits.height
     np.testing.assert_array_equal(
@@ -212,12 +241,16 @@ def _cache_files(d: Path) -> list[str]:
     return sorted(p.name for p in d.iterdir() if ".packed." in p.name)
 
 
-def test_cache_goes_to_cache_dir_or_next_to_the_profiles(hits, acc_dir, tmp_path):
+def test_cache_goes_to_cache_dir_or_next_to_the_profiles(
+    hits, acc_dir, sirna_table, tmp_path
+):
     """The cache is built in ``cache_dir``, or next to the Parquet without one."""
     hits_dir, all_hits = hits
     assert _cache_files(acc_dir) == []
     cache_dir = tmp_path / "cache"
-    first, first_z = _run(hits_dir, acc_dir, n_workers=2, cache_dir=cache_dir)
+    first, first_z = _run(
+        hits_dir, acc_dir, n_workers=2, cache_dir=cache_dir, sirna_table=sirna_table
+    )
     assert first.height == all_hits.height
     assert _cache_files(acc_dir) == [], "wrote into the accessibility dir"
     assert _cache_files(cache_dir) == sorted(
@@ -229,13 +262,17 @@ def test_cache_goes_to_cache_dir_or_next_to_the_profiles(hits, acc_dir, tmp_path
     acc_copy.mkdir()
     for f in acc_dir.iterdir():
         (acc_copy / f.name).write_bytes(f.read_bytes())
-    default, default_z = _run(hits_dir, acc_copy, n_workers=1, cache_dir=None)
+    default, default_z = _run(
+        hits_dir, acc_copy, n_workers=1, cache_dir=None, sirna_table=sirna_table
+    )
     assert_frame_equal(default, first, check_exact=True)
     assert default_z == first_z
     assert _cache_files(acc_copy) == _cache_files(cache_dir)
 
 
-def test_memmap_serves_a_cache_only_dir_without_parquet(hits, acc_dir, tmp_path):
+def test_memmap_serves_a_cache_only_dir_without_parquet(
+    hits, acc_dir, sirna_table, tmp_path
+):
     """A complete cache in --accessibility-cache-dir needs no Parquet at all."""
     hits_dir, all_hits = hits
     cache_only = tmp_path / "cache_only"
@@ -245,7 +282,9 @@ def test_memmap_serves_a_cache_only_dir_without_parquet(hits, acc_dir, tmp_path)
     ]
     no_parquet = tmp_path / "no_parquet"
     no_parquet.mkdir()
-    result, _ = _run(hits_dir, no_parquet, n_workers=2, cache_dir=cache_only)
+    result, _ = _run(
+        hits_dir, no_parquet, n_workers=2, cache_dir=cache_only, sirna_table=sirna_table
+    )
     expected = _dense_oracle(acc_dir, all_hits)
     np.testing.assert_array_equal(
         result["opening_energy"].to_numpy(), expected["opening_energy"].to_numpy()
@@ -253,7 +292,7 @@ def test_memmap_serves_a_cache_only_dir_without_parquet(hits, acc_dir, tmp_path)
     assert not list(no_parquet.iterdir())
 
 
-def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path):
+def test_failed_worker_raises_after_good_results(hits, acc_dir, sirna_table, tmp_path):
     """A worker failure must surface as an error, never as a silent skip."""
     hits_dir, _ = hits
     broken = tmp_path / "broken"
@@ -262,10 +301,11 @@ def test_failed_worker_raises_after_good_results(hits, acc_dir, tmp_path):
         (broken / f.name).write_bytes(f.read_bytes())
     (broken / "risearch_corrupt.parquet").write_bytes(b"this is not parquet")
 
-    gen = compute_off_targets_directory(
-        input_dir=broken,
+    gen = compute_off_targets(
+        risearch_file=broken,
         accessibility_dir=acc_dir,
         accessibility_cache_dir=tmp_path / "cache",
+        sirna_table=sirna_table,
         alpha="0.8;1",
         n_workers=2,
     )
@@ -316,17 +356,18 @@ def test_failed_worker_exits_nonzero_from_cli(hits, acc_dir, tmp_path, plain):
     assert out["sirna_id"].n_unique() == 5
 
 
-def test_summary_only_returns_sums_without_rows(hits, acc_dir, tmp_path):
+def test_summary_only_returns_sums_without_rows(hits, acc_dir, sirna_table, tmp_path):
     """--summary-only: no per-site rows leave the workers, the sums are unchanged."""
     hits_dir, _ = hits
     cache = tmp_path / "cache"
 
     def run(summary_only):
         metas, n_rows, n_frames = {}, 0, 0
-        for df, meta in compute_off_targets_directory(
-            input_dir=hits_dir,
+        for df, meta in compute_off_targets(
+            risearch_file=hits_dir,
             accessibility_dir=acc_dir,
             accessibility_cache_dir=cache,
+            sirna_table=sirna_table,
             alpha="0.8;1",
             gamma="0.9;1",
             theta="0.7",

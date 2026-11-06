@@ -1,11 +1,11 @@
-"""Directory mode must fail loudly when worker tasks fail.
+"""A run must fail loudly when worker tasks fail.
 
 A run whose every worker was OOM-killed used to print "Warning: No predictions
-to process" and exit 0. The core generator now raises `WorkerFailureError`
-once all files have been attempted (successful siRNAs are still yielded
-first), and the CLI turns that into a non-zero exit with a summary. These runs
-have no accessibility directory, so they exercise the per-siRNA pool; runs with
-an accessibility directory are covered in test_accessibility_directory_mode.py.
+to process" and exit 0. The engine now raises `WorkerFailureError` once every
+task has been attempted (successful siRNAs are still yielded first), and the
+CLI turns that into a non-zero exit with a summary. These runs have no
+accessibility directory; runs with one are covered in
+test_accessibility_directory_mode.py.
 """
 
 from pathlib import Path
@@ -15,7 +15,7 @@ import pytest
 from typer.testing import CliRunner
 
 from sioff.cli import app
-from sioff.core.off_targets import WorkerFailureError, compute_off_targets_directory
+from sioff.core.off_targets import WorkerFailureError, compute_off_targets
 
 DATA_DIR = Path(__file__).parent / "data"
 RISEARCH_FILE = DATA_DIR / "risearch_siRNAID.out"
@@ -41,7 +41,7 @@ def broken_dir(tmp_path: Path) -> Path:
 
 
 def test_core_yields_successes_then_raises(mixed_dir: Path) -> None:
-    gen = compute_off_targets_directory(input_dir=mixed_dir, n_workers=1)
+    gen = compute_off_targets(risearch_file=mixed_dir, n_workers=1)
     frames = []
     with pytest.raises(WorkerFailureError) as exc_info:
         for df, _meta in gen:
@@ -55,7 +55,7 @@ def test_core_yields_successes_then_raises(mixed_dir: Path) -> None:
 
 def test_core_raises_when_every_file_fails(broken_dir: Path) -> None:
     with pytest.raises(WorkerFailureError, match="1/1"):
-        list(compute_off_targets_directory(input_dir=broken_dir, n_workers=1))
+        list(compute_off_targets(risearch_file=broken_dir, n_workers=1))
 
 
 def test_cli_exits_non_zero_when_workers_fail(

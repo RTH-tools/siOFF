@@ -12,7 +12,8 @@ from pathlib import Path
 import polars as pl
 import pytest
 
-from sioff.core.off_targets import _drop_unexpressed, compute_off_targets_directory
+from sioff.core.off_targets import _drop_unexpressed, compute_off_targets
+from sioff.services.risearch_service import RIsearchService
 
 
 def test_drop_unexpressed_keeps_only_positive_expression():
@@ -50,12 +51,22 @@ def _hits(d: Path) -> Path:
     return d
 
 
-def _run(hits: Path, gtf: Path):
+def _table(path: Path) -> Path:
+    path.write_text(
+        "sirna_id\ton_target_id\tsequence\n"
+        "s1\t\tACGUACGUACGUACGUACG\n"
+        "s2\t\tUGCAUGCAUGCAUGCAUGC\n"
+    )
+    return path
+
+
+def _run(hits: Path, gtf: Path, table: Path):
     metas, rows = {}, 0
-    for df, meta in compute_off_targets_directory(
-        input_dir=hits,
+    for df, meta in compute_off_targets(
+        risearch_file=hits,
         gtf_file=gtf,
         expression_metric="TPM",
+        sirna_table=table,
         alpha="0.8;1",
         gamma="0.9;1",
     ):
@@ -64,10 +75,15 @@ def _run(hits: Path, gtf: Path):
     return metas, rows
 
 
-def test_zero_tpm_transcripts_change_no_partition_function(tmp_path):
+def test_zero_tpm_transcripts_change_no_partition_function(tmp_path, monkeypatch):
+    # E_min's perfect-match energy, below every hit; no risearch needed.
+    monkeypatch.setattr(
+        RIsearchService, "self_hybridization_emin", lambda *a, **k: -30.0
+    )
     hits = _hits(tmp_path / "hits")
-    with_zero, rows_with = _run(hits, _gtf(tmp_path / "a.gtf", with_zero=True))
-    without, rows_without = _run(hits, _gtf(tmp_path / "b.gtf", with_zero=False))
+    table = _table(tmp_path / "sirna_table.tsv")
+    with_zero, rows_with = _run(hits, _gtf(tmp_path / "a.gtf", True), table)
+    without, rows_without = _run(hits, _gtf(tmp_path / "b.gtf", False), table)
     assert rows_with == rows_without  # the zero-TPM rows never reach scoring
     assert set(with_zero) == set(without) == {"s1", "s2"}
     for sid in without:

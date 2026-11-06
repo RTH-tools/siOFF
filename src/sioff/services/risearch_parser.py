@@ -29,7 +29,8 @@ class RIsearchParser:
         """Load RIsearch2 output, ``sioff search -o`` output or Parquet into a validated DataFrame."""
         _check_file(path)
         if path.suffix == ".parquet":
-            # Stored extras (e.g. raw_e_min) are dropped; E_min is passed in.
+            # Only the six prediction columns are read: a stored E_min column
+            # from older converters is dropped, since E_min is passed in.
             df = pl.read_parquet(path).select(RISEARCH_COLUMNS)
         elif _has_search_header(path):
             df = pl.read_csv(path, separator="\t", infer_schema=False).select(
@@ -61,21 +62,6 @@ class RIsearchParser:
             "chromosomes": df["chrom"].unique().to_list(),
             "strands": df["strand"].unique().to_list(),
         }
-
-    def load_single_file(self, file_path: Path) -> pl.DataFrame:
-        """Load one per-siRNA RIsearch file and attach raw_e_min.
-
-        Parquet files from convert_risearch_to_parquet.py already contain
-        named columns and pre-computed raw_e_min — returned directly.
-        """
-        if file_path.suffix == ".parquet":
-            return pl.read_parquet(file_path)
-
-        df = self.load(file_path)
-        raw_emin = df.group_by("sirna_id").agg(
-            pl.col("energy").min().alias("raw_e_min")
-        )
-        return df.join(raw_emin, on="sirna_id", how="left")
 
     def list_directory_files(self, directory: Path) -> list[Path]:
         """List all RIsearch output files in a directory (*.gz, *.tsv, *.out, *.parquet)."""

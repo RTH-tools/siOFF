@@ -693,9 +693,9 @@ def _record_calls(monkeypatch, targets, called: list[str]) -> None:
         monkeypatch.setattr(cls, name, spy)
 
 
-def test_directory_mode_checks_profiles_before_the_transcriptome(tmp_path, monkeypatch):
-    """An empty -a fails before the GTF parse and self-hybridisation, and leaves
-    no transcriptome IPC temp dir behind."""
+def test_empty_profiles_fail_before_the_transcriptome(tmp_path, monkeypatch):
+    """An empty -a fails before the GTF parse and the perfect-match energies,
+    and leaves no transcriptome IPC temp dir behind."""
     import tempfile
 
     import sioff.core.off_targets as core
@@ -708,17 +708,21 @@ def test_directory_mode_checks_profiles_before_the_transcriptome(tmp_path, monke
         monkeypatch,
         [
             (core.AnnotationParser, "load_gtf"),
-            (core.RIsearchService, "self_hybridization_emin_batch"),
+            (core.RIsearchService, "self_hybridization_emin"),
         ],
         called,
     )
     empty = tmp_path / "empty"
     empty.mkdir()
+    table = tmp_path / "sirna_table.tsv"
+    table.write_text("sirna_id\ton_target_id\tsequence\nsiRNA_1\t\tACGU\n")
     with pytest.raises(AccessibilityError, match="No accessibility profiles in"):
         list(
-            core.compute_off_targets_directory(
-                input_dir=_in_dir(tmp_path, PREDICTIONS),
-                sirna_fasta=EXAMPLES / "sirnas.fa",
+            core.compute_off_targets(
+                risearch_file=_in_dir(tmp_path, PREDICTIONS),
+                sirna_table=table,
+                alpha="0.8",
+                gamma="0.8",
                 gtf_file=EXAMPLES / "annotation.gtf",
                 accessibility_dir=empty,
                 n_workers=1,
@@ -728,7 +732,7 @@ def test_directory_mode_checks_profiles_before_the_transcriptome(tmp_path, monke
     assert called == []
 
 
-def test_directory_mode_leaves_no_ipc_dir_when_setup_fails(tmp_path, monkeypatch):
+def test_setup_failure_leaves_no_ipc_dir(tmp_path, monkeypatch):
     """Any failure before the pool starts (here a bad --alpha) cleans up too."""
     import tempfile
 
@@ -739,8 +743,8 @@ def test_directory_mode_leaves_no_ipc_dir_when_setup_fails(tmp_path, monkeypatch
     monkeypatch.setattr(tempfile, "tempdir", str(scratch))
     with pytest.raises(ValueError):
         list(
-            core.compute_off_targets_directory(
-                input_dir=_in_dir(tmp_path, PREDICTIONS),
+            core.compute_off_targets(
+                risearch_file=_in_dir(tmp_path, PREDICTIONS),
                 gtf_file=EXAMPLES / "annotation.gtf",
                 alpha="0.8,1.0",
                 n_workers=1,
@@ -750,10 +754,12 @@ def test_directory_mode_leaves_no_ipc_dir_when_setup_fails(tmp_path, monkeypatch
 
 
 @pytest.mark.parametrize("source", ["risearch_file", "sirna_fasta"])
-def test_single_file_checks_profiles_before_reading_predictions(
-    tmp_path, monkeypatch, source
-):
-    """An empty -a fails before predictions are loaded, searched or intersected."""
+def test_empty_profiles_fail_before_reading_predictions(tmp_path, monkeypatch, source):
+    """An empty -a fails before predictions are loaded, searched or intersected.
+
+    Only the cheap checks come first (the query FASTA's IDs, input files
+    exist), not the work.
+    """
     import sioff.core.off_targets as core
 
     called: list[str] = []
@@ -761,7 +767,6 @@ def test_single_file_checks_profiles_before_reading_predictions(
         monkeypatch,
         [
             (core.RIsearchParser, "load"),
-            (core.RIsearchService, "validate_sirna_fasta"),
             (core.RIsearchService, "index_target"),
             (core.RIsearchService, "run_search"),
             (core.AnnotationParser, "load_gtf"),
@@ -773,17 +778,15 @@ def test_single_file_checks_profiles_before_reading_predictions(
     predictions = (
         {"risearch_file": PREDICTIONS}
         if source == "risearch_file"
-        else {
-            "sirna_fasta": EXAMPLES / "sirnas.fa",
-            "target_fasta": GENOME,
-            "target_index": tmp_path / "missing.idx",
-        }
+        else {"sirna_fasta": EXAMPLES / "sirnas.fa", "target_fasta": GENOME}
     )
     with pytest.raises(AccessibilityError, match="No accessibility profiles in"):
-        core.compute_off_targets_single(
-            **predictions,
-            gtf_file=EXAMPLES / "annotation.gtf",
-            accessibility_dir=empty,
+        next(
+            core.compute_off_targets(
+                **predictions,
+                gtf_file=EXAMPLES / "annotation.gtf",
+                accessibility_dir=empty,
+            )
         )
     assert called == []
 
