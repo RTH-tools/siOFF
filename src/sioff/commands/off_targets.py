@@ -1,5 +1,6 @@
 import contextlib
 import os
+import re
 from pathlib import Path
 from typing import Annotated, Any, Optional
 
@@ -16,6 +17,44 @@ from rich.progress import (
 )
 
 console = Console()
+
+# Engine argument names in error messages, and the flags a CLI user typed
+# instead (only the arguments that have a flag).
+_FLAG_NAMES = {
+    "genome_file": "-f/--fasta",
+    "accessibility_dir": "-a/--accessibility-dir",
+    "accessibility_cache_dir": "--accessibility-cache-dir",
+    "sirna_fasta": "-s/--sirna-fasta",
+    "risearch_file": "-r/--risearch-file",
+    "target_fasta": "--target-fasta",
+    "target_index": "-idx/--target-index",
+    "gtf_file": "-t/--transcriptome",
+    "sirna_table": "--sirna-table",
+}
+# A whole word, not part of a path or file name.
+_ARGUMENT_NAME = re.compile(
+    r"(?<![\w/.-])(" + "|".join(_FLAG_NAMES) + r")(?![\w/-])(?!\.\w)"
+)
+_TABLE_SUFFIXES = (".tsv", ".csv", ".parquet")
+
+
+def _with_flag_names(message: str) -> str:
+    """Name the CLI flags where an engine message names its arguments."""
+    return _ARGUMENT_NAME.sub(lambda m: _FLAG_NAMES[m.group(1)], message)
+
+
+def _table_path(output_file: Path, output_format: str) -> Path:
+    """Where ``-o`` puts the per-interaction table in ``output_format``.
+
+    A table suffix (``.tsv``, ``.csv``, ``.parquet``) is replaced by the
+    format's; any other name keeps its suffix and gets the format's appended,
+    so ``results.txt`` writes ``results.txt.tsv`` and ``run.v1`` and
+    ``run.v2`` do not collide.
+    """
+    ext = {"parquet": ".parquet", "tsv": ".tsv"}.get(output_format, ".csv")
+    if output_file.suffix.lower() in _TABLE_SUFFIXES:
+        return output_file.with_suffix(ext)
+    return output_file.with_name(output_file.name + ext)
 
 
 def _as_path(value: Optional[Path | str]) -> Optional[Path]:
@@ -133,7 +172,7 @@ def run(
         typer.Option(
             "-o",
             "--output",
-            help="Where to write the per-interaction table, in --output-format; the .summary files go next to it, or into it when it has no suffix.",
+            help="Where to write the per-interaction table, in --output-format: a .tsv, .csv or .parquet suffix is replaced by the format's, any other name gets it appended (results.txt -> results.txt.tsv, out -> out.tsv). The .summary files go next to it, or into it when it has no suffix.",
         ),
     ] = None,
     genome_file: Annotated[
@@ -332,23 +371,24 @@ def run(
         _csv_first_batch = True
         _pq_writer = None
         if output_file and not summary_only:
-            if output_format == "parquet":
-                out_path = output_file.with_suffix(".parquet")
-            elif output_format == "tsv":
-                out_path = output_file.with_suffix(".tsv")
-            else:
-                out_path = output_file.with_suffix(".csv")
+            out_path = _table_path(output_file, output_format)
+            if out_path.exists() and not out_path.is_file():
+                console.print(
+                    f"[bold red]Error:[/bold red] {escape(str(out_path))} exists "
+                    "and is not a regular file; pass another -o/--output"
+                )
+                raise typer.Exit(code=1)
             out_path.parent.mkdir(parents=True, exist_ok=True)
+            # A run that scores nothing writes no table, so an earlier run's
+            # must not be left in its place.
+            out_path.unlink(missing_ok=True)
 
         # Resolve the .summary output dir. If --output is a directory path
-        # (no extension / trailing slash), write there; else alongside it.
+        # (no suffix; pathlib drops a trailing slash), write there; else
+        # alongside it.
         summary_out_dir = None
         if output_file is not None:
-            if (
-                output_file.suffix == ""
-                or str(output_file).endswith("/")
-                or output_file.is_dir()
-            ):
+            if output_file.suffix == "" or output_file.is_dir():
                 summary_out_dir = output_file
             else:
                 summary_out_dir = output_file.parent
@@ -531,10 +571,12 @@ def run(
     except typer.Exit:
         raise
     except FileNotFoundError as e:
-        console.print(f"[bold red]Error:[/bold red] {escape(str(e))}")
+        console.print(f"[bold red]Error:[/bold red] {escape(_with_flag_names(str(e)))}")
         raise typer.Exit(code=1)
     except Exception as e:
-        console.print(f"[bold red]Failed:[/bold red] {escape(str(e))}")
+        # The engine's argument checks name its parameters; say the flags.
+        message = _with_flag_names(str(e)) if isinstance(e, ValueError) else str(e)
+        console.print(f"[bold red]Failed:[/bold red] {escape(message)}")
         if verbose:
             console.print_exception()
         raise typer.Exit(code=1)
