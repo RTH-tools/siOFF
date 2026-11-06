@@ -6,11 +6,14 @@ from pathlib import Path
 
 import pytest
 
+import polars as pl
 from typer.testing import CliRunner
 
 from sioff.cli import app
 
 runner = CliRunner()
+TSV = Path(__file__).parent / "data" / "risearch_siRNAID.out"
+EXAMPLES = Path(__file__).resolve().parents[2] / "examples" / "data"
 
 
 def test_accessibility_strategy_option_is_gone(plain) -> None:
@@ -43,14 +46,13 @@ def test_fasta_on_target_options_are_gone(plain, flag) -> None:
 class TestCLIMain:
     """Tests for the main command."""
 
-    def test_run_valid_file(self, plain) -> None:
-        """CLI loads valid TSV and prints summary."""
-        tsv_path = Path(__file__).parent / "data" / "risearch_siRNAID.out"
-        result = runner.invoke(app, ["off-targets", "-r", str(tsv_path)])
+    def test_run_valid_file(self, tmp_path: Path) -> None:
+        """No -t, so the output has one row per prediction."""
+        out = tmp_path / "o.tsv"
+        result = runner.invoke(app, ["off-targets", "-r", str(TSV), "-o", str(out)])
 
-        assert result.exit_code == 0
-        assert "60 predictions" in plain(result.stdout)
-        assert "Energy range" in plain(result.stdout)
+        assert result.exit_code == 0, result.output
+        assert pl.read_csv(out, separator="\t").height == 60
 
     def test_run_missing_file(self) -> None:
         """CLI exits with error for missing file."""
@@ -58,20 +60,95 @@ class TestCLIMain:
 
         assert result.exit_code != 0
 
-    def test_run_shows_chromosomes(self, plain) -> None:
-        """CLI output includes chromosome information."""
-        # Use verbose to see the dataframe head where chromosomes/targets are listed
-        tsv_path = Path(__file__).parent / "data" / "risearch_siRNAID.out"
-        result = runner.invoke(app, ["off-targets", "-r", str(tsv_path), "-v"])
+    def test_run_shows_chromosomes(self, tmp_path: Path) -> None:
+        """The written table keeps each prediction's chromosome."""
+        out = tmp_path / "o.tsv"
+        result = runner.invoke(app, ["off-targets", "-r", str(TSV), "-o", str(out)])
 
-        assert "transcript_3" in plain(result.stdout)
+        assert result.exit_code == 0, result.output
+        assert "transcript_3" in pl.read_csv(out, separator="\t")["chrom"].to_list()
 
-    def test_run_shows_strands(self, plain) -> None:
-        """CLI output includes strand information."""
-        tsv_path = Path(__file__).parent / "data" / "risearch_siRNAID.out"
-        result = runner.invoke(app, ["off-targets", "-r", str(tsv_path), "-v"])
+    def test_run_shows_strands(self, tmp_path: Path) -> None:
+        """The written table keeps each prediction's strand."""
+        out = tmp_path / "o.tsv"
+        result = runner.invoke(app, ["off-targets", "-r", str(TSV), "-o", str(out)])
 
-        assert "+" in plain(result.stdout)
+        assert result.exit_code == 0, result.output
+        assert set(pl.read_csv(out, separator="\t")["strand"]) == {"+", "-"}
+
+
+def test_sirna_table_option_replaces_on_target_ids(tmp_path: Path, plain) -> None:
+    result = runner.invoke(
+        app, ["off-targets", "-r", str(TSV), "--on-target-ids", str(TSV)]
+    )
+    assert result.exit_code == 2
+    assert "No such option" in plain(result.output)
+
+    help_text = plain(
+        runner.invoke(app, ["off-targets", "--help"], terminal_width=200).output
+    )
+    assert "--sirna-table" in help_text
+    assert "--on-target-ids" not in help_text
+
+    table = tmp_path / "sirna_table.tsv"
+    table.write_text("sirna_id\ton_target_id\tsequence\nsiRNAID\ttranscript_3\tACGU\n")
+    out = tmp_path / "o.tsv"
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(TSV), "--sirna-table", str(table), "-o", str(out)],
+    )
+    assert result.exit_code == 0, result.output
+    assert pl.read_csv(out, separator="\t").height == 60
+
+
+def test_file_input_honours_output_format(tmp_path: Path) -> None:
+    out = tmp_path / "o.tsv"
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(TSV), "-o", str(out), "--output-format", "parquet"],
+    )
+    assert result.exit_code == 0, result.output
+    assert not out.exists()
+    assert pl.read_parquet(tmp_path / "o.parquet").height == 60
+
+
+def test_rows_are_sorted_within_each_sirna(tmp_path: Path) -> None:
+    out = tmp_path / "out" / "o.tsv"
+    result = runner.invoke(
+        app,
+        [
+            "off-targets",
+            "-r",
+            str(EXAMPLES / "predictions.out"),
+            "-t",
+            str(EXAMPLES / "annotation.gtf"),
+            "-j",
+            "2",
+            "-o",
+            str(out),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    df = pl.read_csv(out, separator="\t")
+    # One contiguous block per siRNA ...
+    blocks = df["sirna_id"].rle()
+    assert blocks.struct.field("value").n_unique() == blocks.len() == 5
+    # ... each non-increasing in P_off_target.
+    for (sid,), block in df.group_by("sirna_id", maintain_order=True):
+        p = block["P_off_target"]
+        assert (p.diff().drop_nulls() <= 0).all(), sid
+
+
+@pytest.mark.parametrize("output", ["out/o.tsv", "out"])
+def test_single_sirna_run_writes_a_summary(tmp_path: Path, output: str) -> None:
+    """One .summary per siRNA: next to -o, or inside it when it has no suffix."""
+    result = runner.invoke(
+        app, ["off-targets", "-r", str(TSV), "-o", str(tmp_path / output)]
+    )
+    assert result.exit_code == 0, result.output
+    assert [p.relative_to(tmp_path) for p in tmp_path.rglob("*.summary")] == [
+        Path("out") / "siRNAID.summary"
+    ]
 
 
 class TestCLIStartup:

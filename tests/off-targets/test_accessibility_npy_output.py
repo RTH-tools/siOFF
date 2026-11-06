@@ -169,14 +169,10 @@ def test_npy_and_parquet_directories_give_the_same_results(
     in_dir = tmp_path / "in"
     in_dir.mkdir()
     (in_dir / PREDICTIONS.name).write_bytes(PREDICTIONS.read_bytes())
-    frames = list(
-        sioff.off_targets(risearch_file=in_dir, accessibility_dir=npy_dir, n_workers=1)
+    folder = sioff.off_targets(
+        risearch_file=in_dir, accessibility_dir=npy_dir, n_workers=1
     )
-    assert len(frames) == 1
-    common = [c for c in single.columns if c in frames[0].columns]
-    assert (
-        frames[0].select(common).sort(common).equals(single.select(common).sort(common))
-    )
+    assert folder.sort(folder.columns).equals(single.sort(single.columns))
     assert sorted(f.name for f in npy_dir.iterdir()) == before
 
 

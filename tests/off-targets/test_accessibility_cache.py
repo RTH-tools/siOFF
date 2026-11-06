@@ -618,7 +618,8 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
     assert packed_paths(cache_dir, "+")[0].exists()
     assert not list(acc_dir.glob("*.npy")), "cache written into the Parquet dir"
 
-    # Directory form: the cache is built up front, before the pool starts.
+    # Directory form, streamed: the cache is built up front, before any siRNA
+    # is scored.
     in_dir = tmp_path / "in"
     in_dir.mkdir()
     (in_dir / PREDICTIONS.name).write_bytes(PREDICTIONS.read_bytes())
@@ -628,14 +629,12 @@ def test_api_cache_dir_single_file_and_directory(tmp_path: Path) -> None:
         accessibility_dir=acc_dir,
         accessibility_cache_dir=cache_dir2,
         n_workers=1,
+        stream=True,
     )
     first = next(gen)
     assert packed_paths(cache_dir2, "-")[0].exists()
-    frames = [first, *gen]
-    assert len(frames) == 1
-    batch = frames[0]
-    common = [c for c in single.columns if c in batch.columns]
-    assert batch.select(common).sort(common).equals(single.select(common).sort(common))
+    batch = pl.concat([first, *gen])
+    assert batch.sort(batch.columns).equals(single.sort(single.columns))
 
     # Default: no cache dir, so the cache is built next to the Parquet.
     default = sioff.off_targets(risearch_file=PREDICTIONS, accessibility_dir=acc_dir)
@@ -674,14 +673,12 @@ def test_off_targets_refuses_a_directory_without_profiles(tmp_path, form):
     empty.mkdir()
     source = PREDICTIONS if form == "single" else _in_dir(tmp_path, PREDICTIONS)
     with pytest.raises(AccessibilityError, match="No accessibility profiles in"):
-        out = sioff.off_targets(
+        sioff.off_targets(
             risearch_file=source,
             accessibility_dir=empty,
             accessibility_cache_dir=tmp_path / "cache",
             n_workers=1,
         )
-        if not isinstance(out, pl.DataFrame):
-            list(out)
 
 
 def _record_calls(monkeypatch, targets, called: list[str]) -> None:
@@ -832,11 +829,7 @@ def test_read_only_parquet_dir_without_cache_dir_is_reported(tmp_path, form):
     acc.chmod(0o555)
     try:
         with pytest.raises(AccessibilityError, match="--accessibility-cache-dir"):
-            out = sioff.off_targets(
-                risearch_file=source, accessibility_dir=acc, n_workers=1
-            )
-            if not isinstance(out, pl.DataFrame):
-                list(out)
+            sioff.off_targets(risearch_file=source, accessibility_dir=acc, n_workers=1)
     finally:
         acc.chmod(0o755)
 
@@ -879,10 +872,9 @@ def test_refolding_a_parquet_dir_rebuilds_its_cache(tmp_path, form):
     source = PREDICTIONS if form == "single" else _in_dir(tmp_path, PREDICTIONS)
 
     def run() -> pl.DataFrame:
-        out = sioff.off_targets(
+        return sioff.off_targets(
             risearch_file=source, accessibility_dir=acc, n_workers=1
         )
-        return out if isinstance(out, pl.DataFrame) else pl.concat(list(out))
 
     _fold_to_parquet(acc, 40, 20, 10)
     first = run()

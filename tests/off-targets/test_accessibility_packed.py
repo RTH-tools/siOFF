@@ -650,15 +650,11 @@ def test_off_targets_packed_equals_per_record(pq_copy, tmp_path, form):
             hits_dir.mkdir(exist_ok=True)
             for (sid,), part in hits.group_by("sirna_id"):
                 part.write_parquet(hits_dir / f"risearch_{sid}.parquet")
-            out = pl.concat(
-                list(
-                    sioff.off_targets(
-                        risearch_file=hits_dir,
-                        accessibility_dir=acc_dir,
-                        accessibility_cache_dir=cache_dir,
-                        n_workers=2,
-                    )
-                )
+            out = sioff.off_targets(
+                risearch_file=hits_dir,
+                accessibility_dir=acc_dir,
+                accessibility_cache_dir=cache_dir,
+                n_workers=2,
             )
         return out.sort(keys)
 
