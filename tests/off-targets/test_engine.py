@@ -692,3 +692,41 @@ def test_spills_are_removed(tmp_root, profiles, source, ending):
         assert len(list(gen)) == len(SIRNAS)
     assert [n for n in during if n.startswith(prefix)], "no spill seen mid-run"
     assert _engine_dirs(tmp_root) == []
+
+
+@pytest.mark.parametrize("bad", ["", ".", "..", "chr/1", "../escape", "nul\0byte"])
+def test_profile_key_that_cannot_be_a_file_name_is_refused(
+    tmp_path, tmp_root, profiles, bad
+):
+    (frame,) = profiles.values()
+    with pytest.raises(ValueError) as info:
+        next(
+            compute_off_targets(
+                risearch_file=PREDICTIONS, accessibility={"chr1": frame, bad: frame}
+            )
+        )
+    assert repr(bad) in str(info.value) and "'chr1'" not in str(info.value)
+    assert _engine_dirs(tmp_root) == []
+    assert not list(tmp_path.rglob("*.accessibility.parquet")), "a profile escaped"
+
+
+def test_every_bad_profile_key_is_named(tmp_root, profiles):
+    (frame,) = profiles.values()
+    with pytest.raises(ValueError) as info:
+        next(
+            compute_off_targets(
+                risearch_file=PREDICTIONS,
+                accessibility={"a/b": frame, "chr1": frame, "..": frame},
+            )
+        )
+    assert str(info.value).endswith("'a/b', '..'")
+
+
+def test_empty_profiles_are_refused(tmp_root):
+    with pytest.raises(ValueError) as info:
+        next(compute_off_targets(risearch_file=PREDICTIONS, accessibility={}))
+    assert str(info.value) == (
+        "accessibility holds no profiles; pass one per chromosome, as "
+        "sioff.accessibility returns"
+    )
+    assert _engine_dirs(tmp_root) == []
