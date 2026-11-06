@@ -600,24 +600,53 @@ def test_genome_file_with_profiles_is_refused(tmp_root, scored, profiles, given)
     )
 
 
-@pytest.mark.parametrize("given", ["accessibility", "genome_file"])
+CACHE_DIR_IGNORED = {
+    "accessibility": "accessibility is packed in a temporary directory, so drop "
+    "accessibility_cache_dir",
+    "genome_file": "genome_file is folded in a temporary directory, so drop "
+    "accessibility_cache_dir",
+    "nothing": "without accessibility_dir it is unused, so pass accessibility_dir "
+    "or drop accessibility_cache_dir",
+}
+
+
+@pytest.mark.parametrize("given", list(CACHE_DIR_IGNORED))
 def test_cache_dir_without_accessibility_dir_is_refused(
     tmp_path, tmp_root, scored, profiles, given
 ):
-    source = profiles if given == "accessibility" else GENOME
+    source = {
+        "accessibility": {"accessibility": profiles},
+        "genome_file": {"genome_file": GENOME},
+        "nothing": {},
+    }[given]
     message = _refused(
         tmp_root,
         scored,
         risearch_file=PREDICTIONS,
         accessibility_cache_dir=tmp_path / "cache",
-        **{given: source},
+        **source,
     )
-    done = "packed" if given == "accessibility" else "folded"
     assert message == (
         "accessibility_cache_dir only holds the cache of accessibility_dir; "
-        f"{given} is {done} in a temporary directory, so drop accessibility_cache_dir"
+        + CACHE_DIR_IGNORED[given]
     )
     assert not (tmp_path / "cache").exists()
+
+
+def test_missing_sirna_table_fails_before_the_profiles(tmp_path, tmp_root):
+    """A typo in the table path fails before -a is checked or packed."""
+    empty = tmp_path / "empty"  # would raise AccessibilityError if packed first
+    empty.mkdir()
+    ghost = tmp_path / "missing.tsv"
+    with pytest.raises(
+        FileNotFoundError, match=re.escape(f"siRNA table not found: {ghost}")
+    ):
+        next(
+            compute_off_targets(
+                risearch_file=PREDICTIONS, accessibility_dir=empty, sirna_table=ghost
+            )
+        )
+    assert _engine_dirs(tmp_root) == []
 
 
 @pytest.mark.parametrize("target", ["target_fasta", "target_index"])

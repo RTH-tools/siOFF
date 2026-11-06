@@ -212,8 +212,7 @@ def off_targets(
         default ``accessibility_dir``. Created if absent; use it when
         ``accessibility_dir`` is read-only or to stage the cache on local
         disk. It may also hold a complete cache without any Parquet. Refused
-        with ``accessibility`` or ``genome_file``. CLI:
-        ``--accessibility-cache-dir``.
+        without ``accessibility_dir``. CLI: ``--accessibility-cache-dir``.
     genome_file : str or pathlib.Path, optional
         Genome FASTA to fold during the call; the profiles go to a temporary
         directory that is removed when the run ends. Refused with
@@ -283,15 +282,17 @@ def off_targets(
         Return a generator of one DataFrame per siRNA, in the order they are
         scored, instead of one DataFrame. The worker pool and the temporary
         files live as long as the generator: consume it fully, or close it
-        (``contextlib.closing``), for prompt cleanup. No CLI equivalent; the
-        CLI always streams to its output file.
+        (``contextlib.closing``), for prompt cleanup. The generator is lazy,
+        so the argument errors under Raises come from the first ``next()``,
+        not from this call. No CLI equivalent; the CLI always streams to its
+        output file.
 
     Returns
     -------
     polars.DataFrame or Iterator[polars.DataFrame]
-        One DataFrame holding every siRNA's rows (empty when nothing was
-        scored), or with ``stream=True`` a generator yielding one DataFrame
-        per siRNA. Each row is one prediction with the input columns
+        One DataFrame holding every siRNA's rows (an empty DataFrame with no
+        columns when nothing was scored), or with ``stream=True`` a generator
+        yielding one DataFrame per siRNA. Each row is one prediction with the input columns
         ``sirna_id, chrom, start, end, strand, energy``; the annotation
         columns ``trans_start, trans_end, gene_id, transcript_id`` when
         ``gtf_file`` is given; ``exp_value`` (1.0 without ``gtf_file``);
@@ -311,8 +312,9 @@ def off_targets(
         ``target_fasta`` or ``target_index`` with ``risearch_file`` or
         ``predictions``; ``accessibility`` with ``accessibility_dir``;
         ``genome_file`` with ``accessibility`` or ``accessibility_dir``;
-        ``accessibility_cache_dir`` with ``accessibility`` or ``genome_file``.
-        Also when ``sirna_fasta`` is given without ``target_fasta``; when
+        ``accessibility_cache_dir`` without ``accessibility_dir``. Also when
+        ``accessibility`` is empty or has a key that cannot be a file name;
+        when ``sirna_fasta`` is given without ``target_fasta``; when
         ``predictions`` lacks one of its required columns; when
         ``sirna_fasta`` contains duplicate IDs; when ``sirna_table`` cannot
         be read; when a ``sirna_id`` occurs in two input files; and when an
@@ -320,8 +322,8 @@ def off_targets(
         predictions has no row in ``sirna_table`` (or there is no table).
     FileNotFoundError
         When ``risearch_file``, ``gtf_file``, ``genome_file``, ``sirna_fasta``,
-        ``target_fasta`` or ``target_index`` does not exist, or a directory
-        ``risearch_file`` contains no prediction files.
+        ``sirna_table``, ``target_fasta`` or ``target_index`` does not exist,
+        or a directory ``risearch_file`` contains no prediction files.
     RIsearchError
         `sioff.services.risearch_service.RIsearchError`, when the
         in-process RIsearch run (``sirna_fasta`` form) fails, including when the
@@ -333,8 +335,10 @@ def off_targets(
         cannot be written.
     WorkerFailureError
         `sioff.core.off_targets.WorkerFailureError`, when an input file
-        could not be split or a siRNA could not be scored; with
-        ``stream=True`` it is raised after the last siRNA that succeeded.
+        could not be split or a siRNA could not be scored. With
+        ``stream=True`` it is raised after the last siRNA that succeeded; with
+        ``stream=False`` nothing is returned, so the frames already scored are
+        discarded.
 
     See Also
     --------
