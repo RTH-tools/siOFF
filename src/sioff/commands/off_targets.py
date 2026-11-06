@@ -73,6 +73,21 @@ def _input_at(
     return None
 
 
+def _read_from_folder(path: Path, folder: Optional[Path], suffixes) -> bool:
+    """Whether listing the ``-r`` folder would pick ``path`` up as an input.
+
+    The listing is flat: a file directly in the folder with one of the
+    reader's ``suffixes`` is read, whether or not it exists yet.
+    """
+    return (
+        folder is not None
+        and folder.is_dir()
+        and path.suffix in suffixes
+        and path.parent.exists()
+        and path.parent.samefile(folder)
+    )
+
+
 def _as_path(value: Optional[Path | str]) -> Optional[Path]:
     """Coerce a str (e.g. from the Python API) to Path; pass Path/None through."""
     return Path(value) if isinstance(value, str) else value
@@ -340,6 +355,7 @@ def run(
     )
     from sioff.services.probability import ProbabilityService
     from sioff.services.profiling import PipelineProfiler
+    from sioff.services.risearch_parser import _VALID_SUFFIXES
 
     # Accept str paths (Python API) as well as Path objects (CLI coerces these itself).
     risearch_file = _as_path(risearch_file)
@@ -412,6 +428,16 @@ def run(
                 console.print(
                     f"[bold red]Error:[/bold red] -o/--output resolves to the {flag} "
                     f"input {escape(str(given))}; choose another -o/--output"
+                )
+                raise typer.Exit(code=1)
+            # Written there, the table is read back as input by this run or
+            # the next (a duplicate sirna_id).
+            if _read_from_folder(out_path, risearch_file, _VALID_SUFFIXES):
+                console.print(
+                    f"[bold red]Error:[/bold red] -o/--output resolves to "
+                    f"{escape(str(out_path))} inside the -r/--risearch-file folder "
+                    f"{escape(str(risearch_file))}, which would be read as input; "
+                    "choose another -o/--output"
                 )
                 raise typer.Exit(code=1)
             out_path.parent.mkdir(parents=True, exist_ok=True)
