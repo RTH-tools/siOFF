@@ -238,6 +238,7 @@ def _init_worker(
     accessibility_cache_dir: Optional[str] = None,
     summary_only: bool = False,
     detailed_report: bool = False,
+    log_level: str = "WARNING",
     in_process: bool = False,
 ) -> None:
     """Initialise per-worker state; called once per spawned worker process.
@@ -250,11 +251,17 @@ def _init_worker(
     ``accessibility_dir``) before starting the pool, so the worker does not
     check it against the Parquet again.
 
+    A spawned worker logs to stderr at ``log_level``: it starts with loguru's
+    DEBUG sink, and the parent's handlers do not cross spawn.
+
     With ``in_process`` the state is set up in the calling process instead, for
     a run without a pool. That process's polars and pyarrow thread pools are
-    already sized, so ``polars_max_threads`` is not applied.
+    already sized, so ``polars_max_threads`` is not applied, and its logging
+    handlers are left alone.
     """
     if not in_process:
+        logger.remove()
+        logger.add(sys.stderr, level=log_level)
         os.environ["POLARS_MAX_THREADS"] = str(polars_max_threads)
         # pyarrow reads the shared transcriptome IPC and the cache-building
         # Parquet, so keep its pool inside the per-worker budget.
@@ -908,6 +915,7 @@ def compute_off_targets(
     n_workers: int = 1,
     summary_only: bool = False,
     detailed_report: bool = False,
+    worker_log_level: str = "WARNING",
     on_split: Optional[Callable[[int], None]] = None,
     accessibility_progress_callback=None,
 ) -> Generator[tuple[pl.DataFrame, dict], None, None]:
@@ -1075,6 +1083,11 @@ def compute_off_targets(
     detailed_report : bool, default False
         Keep the raw ``boltzmann_weight*``, ``Z_sirna*`` and ``E_min``
         columns in each ``df`` (CLI ``--detailed-report``).
+    worker_log_level : str, default "WARNING"
+        The loguru level of the spawned workers' stderr sink. They do not
+        inherit this process's handlers, and loguru's own default is DEBUG.
+        The CLI passes ``"DEBUG"`` under ``sioff -v``. A run without a pool
+        logs through this process's handlers instead.
     on_split : callable, optional
         Called once with the number of siRNAs to score, after the inputs are
         split and checked and before any siRNA is scored.
@@ -1274,6 +1287,7 @@ def compute_off_targets(
                 ),
                 "summary_only": summary_only,
                 "detailed_report": detailed_report,
+                "log_level": worker_log_level,
             },
         )
 

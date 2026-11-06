@@ -346,6 +346,7 @@ def run(
     # load polars/pyarrow/numpy and the core (see TestCLIStartup).
     import pyarrow.parquet as pq
 
+    from sioff._logging import logging_level
     from sioff.core.off_targets import (
         WorkerFailureError,
         _build_alpha_gamma_pairs,
@@ -520,6 +521,8 @@ def run(
                     # metadata alone; workers then send back no per-site table.
                     summary_only=summary_only,
                     detailed_report=detailed_report,
+                    # Spawned workers do not inherit this process's handlers.
+                    worker_log_level=logging_level(),
                     on_split=on_split,
                     accessibility_progress_callback=acc_cb,
                 )
