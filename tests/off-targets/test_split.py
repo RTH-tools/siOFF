@@ -58,6 +58,37 @@ def test_split_file_reads_gz_and_search_tsv(tmp_path):
         assert _sorted(_concat(parts)).equals(_sorted(loaded))
 
 
+def test_parquet_with_one_sirna_is_its_own_part(tmp_path):
+    # As `load` reads it: sirna_id cast to text, null IDs and extra columns dropped.
+    one = (
+        RIsearchParser()
+        .load(PREDICTIONS)
+        .filter(pl.col("sirna_id") == "siRNA_2")
+        .with_columns(pl.col("sirna_id").cast(pl.Categorical), raw_e_min=pl.lit(-1.0))
+    )
+    path = tmp_path / "s2.parquet"
+    pl.concat([one, one.head(1).with_columns(sirna_id=None)]).write_parquet(path)
+    out = tmp_path / "o"
+    assert split_file(str(path), str(out)) == {"siRNA_2": str(path)}
+    assert not out.exists()
+
+
+def test_parquet_without_sirna_ids_has_no_parts(tmp_path):
+    path = tmp_path / "none.parquet"
+    RIsearchParser().load(PREDICTIONS).with_columns(sirna_id=None).write_parquet(path)
+    assert split_file(str(path), str(tmp_path / "o")) == {}
+
+
+def test_parquet_with_several_sirnas_is_split(tmp_path):
+    loaded = RIsearchParser().load(PREDICTIONS)
+    path = tmp_path / "all.parquet"
+    loaded.write_parquet(path)
+    parts = split_file(str(path), str(tmp_path / "o"))
+    assert len(parts) == 5
+    assert all(Path(p).parent == tmp_path / "o" for p in parts.values())
+    assert _sorted(_concat(parts)).equals(_sorted(loaded))
+
+
 def test_split_frame_matches_split_file(tmp_path):
     loaded = RIsearchParser().load(PREDICTIONS)
     from_frame = split_frame(loaded, tmp_path / "f")

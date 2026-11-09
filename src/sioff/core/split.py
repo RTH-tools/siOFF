@@ -4,7 +4,8 @@ Every prediction input (a file, a folder of files or an in-memory frame) is
 turned into per-siRNA Parquet parts, so each siRNA can be scored as its own
 task. Parts are named by index (``0.parquet``, ``1.parquet``, ...), never by
 ``sirna_id``, because an ID may contain characters that are unsafe in a file
-name.
+name. A Parquet input that holds one siRNA is its own part and is not copied;
+a part is therefore read with ``RIsearchParser.load``, as its source was.
 
 [`split_file`][sioff.core.split.split_file] is a top-level function so it can
 be pickled by reference and run in spawned worker processes.
@@ -15,7 +16,7 @@ from pathlib import Path
 
 import polars as pl
 
-from sioff.models import RISEARCH_COLUMNS
+from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
 from sioff.services.risearch_parser import RIsearchParser
 
 
@@ -42,8 +43,20 @@ def split_file(path: str, out_dir: str) -> dict[str, str]:
     Returns
     -------
     dict[str, str]
-        ``{sirna_id: part path}``.
+        ``{sirna_id: part path}``; for a Parquet file that holds one siRNA,
+        ``{sirna_id: path}``, with nothing written.
     """
+    if path.endswith(".parquet"):
+        # Only the IDs are read, as `load` would read them: a folder of
+        # per-siRNA Parquet files is then scored in place, not copied first.
+        ids = (
+            pl.read_parquet(path, columns=["sirna_id"])
+            .select(pl.col("sirna_id").cast(RISEARCH_SCHEMA["sirna_id"]))
+            .drop_nulls()
+            .unique()
+        )
+        if ids.height == 1:
+            return {ids.item(): path}
     df = RIsearchParser().load(Path(path))
     return {k: str(v) for k, v in _write_parts(df, Path(out_dir)).items()}
 

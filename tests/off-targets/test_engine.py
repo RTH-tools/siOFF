@@ -104,14 +104,22 @@ def _forms(tmp_path: Path) -> dict[str, Path]:
     parts = split_frame(RIsearchParser().load(PREDICTIONS), parquet_dir)
     tsv_dir = tmp_path / "per_sirna_tsv"
     tsv_dir.mkdir()
+    # Scored in place, not split: the engine must still read only what `load`
+    # keeps (sirna_id as text, no extra columns).
+    raw_dir = tmp_path / "per_sirna_parquet_raw"
+    raw_dir.mkdir()
     for sid, part in parts.items():
         # The `sioff search` layout: tab-separated, header = RISEARCH_COLUMNS.
         pl.read_parquet(part).write_csv(tsv_dir / f"{sid}.tsv", separator="\t")
+        pl.read_parquet(part).with_columns(
+            pl.col("sirna_id").cast(pl.Categorical), raw_e_min=pl.lit(-1.0)
+        ).write_parquet(raw_dir / f"{sid}.parquet")
     return {
         "file": PREDICTIONS,
         "folder": one_dir,
         "per_sirna_tsv": tsv_dir,
         "per_sirna_parquet": parquet_dir,
+        "per_sirna_parquet_raw": raw_dir,
     }
 
 
@@ -450,6 +458,21 @@ def test_temp_dirs_are_removed_on_every_path(tmp_path, tmp_root, ending):
     else:
         assert len(list(gen)) == len(SIRNAS)
     assert _engine_dirs(tmp_root) == []
+
+
+@pytest.mark.parametrize("n_workers", [1, 2])
+def test_per_sirna_parquet_is_scored_in_place(tmp_path, tmp_root, n_workers):
+    # A Parquet file that holds one siRNA is its own part: the split copies nothing.
+    copied: list[Path] = []
+    results = list(
+        compute_off_targets(
+            risearch_file=_forms(tmp_path)["per_sirna_parquet_raw"],
+            n_workers=n_workers,
+            on_split=lambda n: copied.extend(tmp_root.glob("sioff_split_*/**/*")),
+        )
+    )
+    assert len(results) == len(SIRNAS)
+    assert copied == []
 
 
 def test_perfect_match_energy_comes_from_the_table_sequence(tmp_path):

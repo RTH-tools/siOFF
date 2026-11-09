@@ -330,7 +330,8 @@ sioff off-targets \
 into per-siRNA parts, scored in parallel with `-j` processes, and written as one
 block of rows per siRNA, sorted by `P_off_target` descending. The split writes
 every input again under `TMPDIR`, so for large runs `TMPDIR` needs free space
-about the size of the input.
+about the size of the input; a Parquet file that holds one siRNA is the
+exception, scored in place, so a folder of per-siRNA Parquet files needs none.
 
 `--sirna-table` is a tab-separated file with a header; columns are found by
 name, `#` lines are skipped:
