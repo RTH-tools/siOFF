@@ -11,7 +11,8 @@ The core writes no output files, with two exceptions. The in-process search
 builds the RIsearch index ``<target>.idx`` next to ``target_fasta`` when no
 ``target_index`` is given (and reuses it later). And there are temporary
 files: the Arrow-IPC copy of the transcriptome that every task memory-maps,
-the per-siRNA split parts, and accessibility profiles spilled to disk so
+the per-siRNA split parts (none for a Parquet input that already holds one
+siRNA), and accessibility profiles spilled to disk so
 workers can memory-map them. They live inside the generator's ``try/finally``
 and are removed when the run ends, on error too, so callers should consume
 the generator fully (or close it) for deterministic cleanup. The
@@ -532,7 +533,9 @@ def _score_part(
     prob_service = _m._WORKER_PROB_SERVICE
 
     _t_start = time.perf_counter()
-    df = pl.read_parquet(part_path)
+    # A part may be an input Parquet file itself (see split_file), with other
+    # columns or types: read it as its source was read.
+    df = RIsearchParser().load(Path(part_path))
     _t_load = time.perf_counter()
 
     if sense_only:
