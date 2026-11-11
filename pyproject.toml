@@ -42,6 +42,8 @@ dependencies = [
   # Unpinned so the latest release is picked up automatically. While only
   # alphas exist on PyPI, resolvers fall back to pre-releases ("if-necessary"
   # strategy); once a stable release is out, the latest stable wins.
+  # uv.lock still records one exact version: .github/dependabot.yml opens a
+  # pull request that bumps it whenever a new risearch release appears.
   "risearch",
   "typer",
   "viennaRNA==2.7.2",

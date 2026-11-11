@@ -1137,15 +1137,15 @@ wheels = [
 
 [[package]]
 name = "risearch"
-version = "3.0.0a4"
+version = "3.0.0a5"
 source = { registry = "https://pypi.org/simple" }
 dependencies = [
     { name = "polars" },
 ]
-sdist = { url = "https://files.pythonhosted.org/packages/1f/c4/0ba734d912870ae0a38d53c2945101bd05507af62431c002d1ba0a2ff8b9/risearch-3.0.0a4.tar.gz", hash = "sha256:1a1b4d76eade055934edab550e4ad6ff54898fbc18d9acd3ca2a8de8e7b6d7fe", size = 178195, upload-time = "2026-09-28T16:02:30.422Z" }
+sdist = { url = "https://files.pythonhosted.org/packages/7b/8e/6eda4f0c9898b2bb45be24c36c72cbe07de7bbbffd03e975f1b6e443dda6/risearch-3.0.0a5.tar.gz", hash = "sha256:6033759f3332475ba5348d3ef30bab2ce7a19cc10e1cdf8845cf4188d31cce1a", size = 183311, upload-time = "2026-10-28T15:03:27.619Z" }
 wheels = [
-    { url = "https://files.pythonhosted.org/packages/1c/39/fd29a0e6679cd3013e6a3bcc46211a9a8061effc4b51ad65e261c5af5176/risearch-3.0.0a4-cp310-abi3-macosx_11_0_arm64.whl", hash = "sha256:a5aa1a4256329d7a9261e226f2bb89caa4845fdb7bdb6143e8ed77dc4d9c55b1", size = 759217, upload-time = "2026-09-28T16:02:27.317Z" },
-    { url = "https://files.pythonhosted.org/packages/f8/d5/d836fed98205747d4c40948cf6a156e8f6717bba93db6c40d2d10c4c737d/risearch-3.0.0a4-cp310-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:a3837f412cb759bb806b485ea5b9c1b888cf24ff7a0c753777e405189ce8b6a1", size = 899365, upload-time = "2026-09-28T16:02:28.827Z" },
+    { url = "https://files.pythonhosted.org/packages/ea/f8/abcc15497b7548b0b6fa776da445fb5bfb75c41d2113ff471620ff869a7a/risearch-3.0.0a5-cp311-abi3-macosx_11_0_arm64.whl", hash = "sha256:586d1cd4edaf6b6a7ce8584cd42723bb957265a2f41f7b0baa41be98a4d526c9", size = 764524, upload-time = "2026-10-28T15:03:24.727Z" },
+    { url = "https://files.pythonhosted.org/packages/fc/41/74f3ba448d3f097601d970d4f1bebd7f5b5e64249f5d47fada96e5e93e21/risearch-3.0.0a5-cp311-abi3-manylinux_2_28_x86_64.whl", hash = "sha256:ab0e9d46c51fc91482cc4c495a2de00ff39e01d4948951b59f10ad5890bfab22", size = 900248, upload-time = "2026-10-28T15:03:26.187Z" },
 ]
 
 [package.optional-dependencies]

@@ -23,6 +23,8 @@ jobs:
           python-version: "3.14"
           enable-cache: true
       # --frozen installs exactly what uv.lock pins (risearch included, from PyPI).
+      # Dependabot keeps the locked risearch on the latest release
+      # (.github/dependabot.yml).
       - run: uv sync --frozen --no-group lts
       - name: Ruff lint
         run: uv run --no-sync ruff check src/ tests/ scripts/
