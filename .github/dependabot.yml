@@ -1,0 +1,57 @@
+# Dependabot keeps uv.lock and the workflow actions current. Mirrors the
+# sibling risearch project's setup.
+#
+# Every update is a pull request, never an automatic merge: the normal CI
+# matrix runs on it and someone merges it.
+version: 2
+
+updates:
+  # Python dependencies (uv project: uv.lock + PEP 735 dependency-groups).
+  #
+  # pyproject.toml leaves `risearch` unpinned, so `pip install sioff` already
+  # resolves to the newest release. CI, the docs build and `uv sync` install
+  # what uv.lock records, which only moves when someone re-locks; this entry
+  # is what moves it.
+  #
+  # The check is daily so a new risearch release is picked up within a day.
+  # risearch is kept out of the group below and gets a pull request of its
+  # own, because a risearch release can change search results (3.0.0a5 widened
+  # the extension window by one base per side).
+  # tests/scripts/test_example_data.py then fails until
+  # examples/data/predictions.out is regenerated with
+  # `python examples/generate_example_data.py`. While the locked risearch is a
+  # pre-release, Dependabot proposes newer pre-releases as well as stable
+  # releases.
+  - package-ecosystem: uv
+    directory: "/"
+    schedule:
+      interval: daily
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: build
+      include: scope
+    groups:
+      uv-minor-patch:
+        update-types:
+          - minor
+          - patch
+        exclude-patterns:
+          - "risearch"
+    # Pinned on purpose in pyproject.toml (see the comments there); bump these
+    # by hand.
+    ignore:
+      - dependency-name: "pyrefly"
+      - dependency-name: "viennarna"
+
+  # GitHub Actions used by ci.yml, docs.yml and release.yml.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: ci
+    groups:
+      actions-all:
+        patterns:
+          - "*"
