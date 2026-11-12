@@ -35,7 +35,7 @@ class OffTargetsConfig:
     sirna_table: Optional[str] = None
     transcriptome: Optional[str] = None
     transcriptome_format: str = "auto"
-    feature: str = "exon"
+    feature: Optional[str] = None
     expression_metric: str = "RPKM"
     accessibility_dir: Optional[str] = None
     accessibility_cache_dir: Optional[str] = None

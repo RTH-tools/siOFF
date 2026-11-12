@@ -56,7 +56,7 @@ off_targets:
   # attribute column: GTF writes `key "value";`, GFF3 writes `key=value;`.
   transcriptome_format: gtf
 
-  # Feature type to extract from GTF/GFF3. Default: "exon"
+  # Feature type to extract from GTF/GFF3. Default: "exon" ("transcript" with type: tw)
   feature: exon
 
   # Column / attribute in the annotation file that holds expression values. Default: "RPKM"

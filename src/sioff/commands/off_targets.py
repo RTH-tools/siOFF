@@ -182,12 +182,12 @@ def run(
         ),
     ] = None,
     feature_type: Annotated[
-        str,
+        Optional[str],
         typer.Option(
             "--feature",
-            help="Feature type (column 3) of the annotation rows to use (default: exon); a type no row has is an error.",
+            help="Feature type (column 3) of the annotation rows to use (default: exon, or transcript with --type tw); a type no row has is an error.",
         ),
-    ] = "exon",
+    ] = None,
     expression_metric: Annotated[
         str,
         typer.Option(

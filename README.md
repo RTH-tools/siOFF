@@ -231,7 +231,10 @@ Standalone prediction (stage 1 by itself) is also available as
    analysis mode: `--type gw` (genome-wide, default) intersects predictions
    with the annotation by genomic coordinates; `--type tw`
    (transcriptome-wide) matches the prediction's target ID against
-   `transcript_id` directly.
+   `transcript_id` directly. There the annotation only has to say how much of
+   each transcript there is: its `transcript` rows are used by default
+   (`--feature`), and a transcript given as several rows (its exons) still
+   counts each hit once; those rows must carry the same expression.
 3. **Annotation with expression** — GTF or GFF3. Expression is
    read from an attribute of your choice (`--expression-metric`, default
    `RPKM`) — annotate your GTF with RPKM/TPM values from your expression data
@@ -438,7 +441,7 @@ Available on `sioff` itself, before any subcommand.
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
 | `-a / --accessibility-dir` | Directory of accessibility profiles from the `accessibility` command: the packed `accessibility.*.packed.npy` cache (its default) or per-record Parquet files, packed on the first run |
 | `--accessibility-cache-dir` | Where the packed cache is read from / built (default: the accessibility dir) |
-| `--feature` | Feature type (column 3) of the annotation rows to use (default: `exon`); a type that no row has is an error |
+| `--feature` | Feature type (column 3) of the annotation rows to use (default: `exon`, or `transcript` with `--type tw`); a type that no row has is an error |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
 | `--sense-only` | Keep only `+`-strand predictions (use it with profiles from `accessibility --strand +`) |
