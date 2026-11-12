@@ -196,7 +196,10 @@ def off_targets(
         row of the file has is an error. CLI: ``--feature``.
     expression_metric : str, default "RPKM"
         Annotation attribute used as the expression score (``exp_value``).
-        CLI: ``--expression-metric``.
+        It must be each transcript's own abundance: every transcript
+        containing a site adds its value, so a gene-level value copied onto
+        every transcript counts the gene once per isoform. CLI:
+        ``--expression-metric``.
     transcriptome_format : str, default "auto"
         One of ``"auto"``, ``"gtf"`` or ``"gff3"``; BED is rejected.
         ``"auto"`` detects the format from the file, telling GTF from GFF3 by
