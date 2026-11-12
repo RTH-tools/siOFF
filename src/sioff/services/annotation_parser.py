@@ -89,7 +89,12 @@ class AnnotationParser:
         )
 
         if feature:
-            df = df.filter(pl.col("feature") == feature)
+            selected = df.filter(pl.col("feature") == feature)
+            if selected.height == 0:
+                # Before the attribute guard below, which has no row to look
+                # at: an empty annotation scores nothing and exits 0.
+                raise ValueError(self._no_feature_rows_message(df, path, feature))
+            df = selected
 
         def extract_attr(key: str) -> pl.Expr:
             if fmt == "gff3":
@@ -169,6 +174,28 @@ class AnnotationParser:
         ):
             expr = expr.str.replace_all(escape, char, literal=True)
         return expr
+
+    @staticmethod
+    def _no_feature_rows_message(df: pl.DataFrame, path: Path, feature: str) -> str:
+        """Word the error for a ``feature`` that no row of the file has.
+
+        The feature types the file does hold are listed with their row
+        counts, most frequent first, so the caller can pick one.
+        """
+        counts = (
+            df.select(pl.col("feature").fill_null("<missing>"))
+            .group_by("feature")
+            .len()
+            .sort(["len", "feature"], descending=[True, False])
+        )
+        shown = ", ".join(f"{name} ({n:,})" for name, n in counts.head(10).iter_rows())
+        if counts.height > 10:
+            shown += f" and {counts.height - 10} more"
+        return (
+            f"No '{feature}' rows in {path.name}: its {df.height:,} rows are "
+            f"{shown}. Select one of these feature types with --feature; the "
+            "name is matched exactly."
+        )
 
     @staticmethod
     def _reject_total_extraction_failure(

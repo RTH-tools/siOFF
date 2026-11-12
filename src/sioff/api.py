@@ -186,7 +186,8 @@ def off_targets(
         performed and every prediction is kept with unit expression. CLI:
         ``-t/--transcriptome``.
     feature_type : str, default "exon"
-        Feature type to select from a GTF/GFF3 annotation. CLI: ``--feature``.
+        Feature type to select from a GTF/GFF3 annotation; a type that no
+        row of the file has is an error. CLI: ``--feature``.
     expression_metric : str, default "RPKM"
         Annotation attribute used as the expression score (``exp_value``).
         CLI: ``--expression-metric``.

@@ -265,6 +265,37 @@ def test_run_that_scores_nothing_leaves_no_stale_table(tmp_path: Path, plain) ->
     assert "No predictions to process" in plain(result.output)
 
 
+def test_feature_no_annotation_row_has_fails_the_run(tmp_path: Path, plain) -> None:
+    """The default --feature exon on one 'transcript' row per transcript.
+
+    It used to score nothing against an empty annotation and exit 0.
+    """
+    gtf = tmp_path / "transcripts.gtf"
+    gtf.write_text(
+        'chr1\tt\ttranscript\t1\t9000\t.\t+\t.\tgene_id "g1"; transcript_id "t1"; RPKM "4";\n'
+    )
+    out = tmp_path / "o.tsv"
+    result = runner.invoke(
+        app,
+        ["off-targets", "-r", str(EXAMPLES / "predictions.out"), "-t", str(gtf)]
+        + ["-o", str(out)],
+    )
+    text = " ".join(plain(result.output).split())
+    assert result.exit_code == 1, result.output
+    assert "No 'exon' rows in transcripts.gtf" in text
+    assert "transcript (1)" in text
+    assert "No predictions to process" not in text
+    assert not out.exists()
+
+    scored = runner.invoke(
+        app,
+        ["off-targets", "-r", str(EXAMPLES / "predictions.out"), "-t", str(gtf)]
+        + ["--feature", "transcript", "-o", str(out)],
+    )
+    assert scored.exit_code == 0, scored.output
+    assert out.exists()
+
+
 def test_table_path_that_is_not_a_file_is_an_error(tmp_path: Path, plain) -> None:
     (tmp_path / "o.tsv").mkdir()
     result = runner.invoke(

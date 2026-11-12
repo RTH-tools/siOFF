@@ -434,6 +434,7 @@ Available on `sioff` itself, before any subcommand.
 | `-t / --transcriptome` | GTF or GFF3 annotation file |
 | `-a / --accessibility-dir` | Directory of accessibility profiles from the `accessibility` command: the packed `accessibility.*.packed.npy` cache (its default) or per-record Parquet files, packed on the first run |
 | `--accessibility-cache-dir` | Where the packed cache is read from / built (default: the accessibility dir) |
+| `--feature` | Feature type (column 3) of the annotation rows to use (default: `exon`); a type that no row has is an error |
 | `--expression-metric` | GTF attribute for expression weighting (default: `RPKM`) |
 | `--type` | `gw` (genome-wide) or `tw` (transcriptome-wide, default: `gw`) |
 | `--sense-only` | Keep only `+`-strand predictions (use it with profiles from `accessibility --strand +`) |

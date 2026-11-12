@@ -1070,6 +1070,7 @@ def compute_off_targets(
         ``exp_value``. Read before ``genome_file`` is folded.
     feature_type : str, default "exon"
         Feature type to select from a GTF/GFF3 annotation (CLI ``--feature``).
+        A type that no row of the file has is an error.
     expression_metric : str, default "RPKM"
         Annotation attribute used as the expression score (CLI
         ``--expression-metric``).
@@ -1202,7 +1203,9 @@ def compute_off_targets(
         Also when ``accessibility`` is empty or has a key that cannot be a
         file name; when no prediction source is given; when ``sirna_fasta``
         is given without ``target_fasta``; when ``predictions`` lacks a
-        required column; when ``sirna_fasta`` holds a duplicate ID; when the
+        required column; when no row of ``gtf_file`` has the feature
+        type ``feature_type``, or none has an expression above 0; when
+        ``sirna_fasta`` holds a duplicate ID; when the
         siRNA table cannot be read; when a ``sirna_id`` occurs in two input
         files; and when an alpha/gamma pair other than (1, 1) is computed and
         a siRNA with predictions has no row in ``sirna_table`` (or there is
@@ -1328,7 +1331,19 @@ def compute_off_targets(
                 score_col=expression_metric,
                 format=transcriptome_format,
             )
-            df_trans = sort_for_preload(_drop_unexpressed(df_trans))
+            n_selected = df_trans.height
+            df_trans = _drop_unexpressed(df_trans)
+            if df_trans.height == 0:
+                # Every site would be dropped by the intersection: a run that
+                # scores nothing and exits 0.
+                raise ValueError(
+                    f"None of the {n_selected:,} {feature_type or 'annotation'} "
+                    f"rows of {Path(gtf_file).name} has a {expression_metric} "
+                    "above 0 (a value that is not a number counts as 0), so no "
+                    "site could be scored; check --expression-metric and the "
+                    "values in the file"
+                )
+            df_trans = sort_for_preload(df_trans)
             ipc_dir = tempfile.mkdtemp(prefix="risearch_ipc_")
             ipc_path = str(Path(ipc_dir) / "transcriptome.arrow")
             df_trans.write_ipc(
