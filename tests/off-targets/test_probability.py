@@ -33,8 +33,10 @@ class TestProbabilityService(unittest.TestCase):
         """Test with accessibility service mocked."""
         acc_service = MagicMock()
         # annotate_opening_energy_vectorized adds opening_energy column (0.5 for all rows)
-        acc_service.annotate_opening_energy_vectorized.side_effect = lambda df: (
-            df.with_columns(pl.lit(0.5).cast(pl.Float32).alias("opening_energy"))
+        acc_service.annotate_opening_energy_vectorized.side_effect = (
+            lambda df, stats=None: df.with_columns(
+                pl.lit(0.5).cast(pl.Float32).alias("opening_energy")
+            )
         )
 
         service = ProbabilityService(acc_service)

@@ -120,6 +120,36 @@ _OUT_OF_BOUNDS_ENERGY = (
     10.0  # the `np.full` default of annotate_opening_energy_vectorized
 )
 
+# Names kept per kind in a lookup's default-energy counters.
+_MAX_DEFAULT_EXAMPLES = 10
+
+
+def new_default_energy_stats() -> dict:
+    """Counters of the hits one lookup left at the default opening energy.
+
+    `GenomeAccessibilityService.annotate_opening_energy_vectorized` adds to
+    one when given it and never logs: a worker sees only its own siRNA, so
+    the engine sums the counters and reports once, in the parent process.
+    """
+    return {
+        "n_hits": 0,  # hits looked up
+        "n_found": 0,  # hits that got a profile value
+        "n_unknown": 0,  # hits on a sequence without a profile
+        "n_out_of_bounds": 0,  # hits outside their sequence's profile
+        "unknown": [],  # up to _MAX_DEFAULT_EXAMPLES sequence names
+        "out_of_bounds": [],  # up to _MAX_DEFAULT_EXAMPLES sequence names
+    }
+
+
+def add_default_examples(examples: list, names: Iterable[str]) -> None:
+    """Append the new ``names`` to ``examples`` until it holds the maximum."""
+    for name in names:
+        if len(examples) >= _MAX_DEFAULT_EXAMPLES:
+            return
+        if name not in examples:
+            examples.append(str(name))
+
+
 # Strands `_warn_missing_strand` has reported in this process.
 _WARNED_MISSING_STRANDS: set[str] = set()
 
@@ -2264,12 +2294,17 @@ class GenomeAccessibilityService:
 
         return int(round(raw_val * 10.0)) / 10.0
 
-    def annotate_opening_energy_vectorized(self, df: pl.DataFrame) -> pl.DataFrame:
+    def annotate_opening_energy_vectorized(
+        self, df: pl.DataFrame, stats: Optional[dict] = None
+    ) -> pl.DataFrame:
         """Add `opening_energy` column by vectorized numpy gather per (chrom, strand) group.
 
         Hits on an unknown contig, on ``onTarget``, on a strand other than
         ``+``/``-`` or outside their contig keep 10.0; so do hits on a strand
-        the profile lacks, with a warning.
+        the profile lacks, with a warning. Nothing is logged for the others:
+        ``stats`` (see `new_default_energy_stats`) counts the hits looked up,
+        found, on an unknown contig and outside their contig, for the caller
+        to report once per run.
 
         Raises
         ------
@@ -2286,6 +2321,8 @@ class GenomeAccessibilityService:
 
         if n_rows == 0:
             return df.with_columns(pl.Series("opening_energy", [], dtype=pl.Float32))
+        if stats is not None:
+            stats["n_hits"] += n_rows
 
         if not self._frames and self._packed_dir() is not None:
             # Map each distinct contig once: a per-hit array of names costs
@@ -2303,6 +2340,7 @@ class GenomeAccessibilityService:
                 ends,
                 strands,
                 opening_energies,
+                stats,
             )
             return df.with_columns(
                 pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
@@ -2325,6 +2363,9 @@ class GenomeAccessibilityService:
                 _warn_missing_strand(chrom, strand)
                 continue
             except ProfileNotFoundError:
+                if stats is not None:
+                    stats["n_unknown"] += len(row_indices)
+                    add_default_examples(stats["unknown"], [chrom])
                 continue
 
             profile = self._profiles[profile_key]
@@ -2339,6 +2380,12 @@ class GenomeAccessibilityService:
             # Quantize to 0.1 resolution (match legacy query_single behaviour)
             raw_vals = (np.round(raw_vals * 10.0) / 10.0).astype(np.float32)
             opening_energies[idx[in_bounds]] = raw_vals[in_bounds]
+            if stats is not None:
+                n_in = int(in_bounds.sum())
+                stats["n_found"] += n_in
+                if n_in < idx.size:
+                    stats["n_out_of_bounds"] += int(idx.size) - n_in
+                    add_default_examples(stats["out_of_bounds"], [chrom])
 
         return df.with_columns(
             pl.Series("opening_energy", opening_energies, dtype=pl.Float32)
@@ -2352,6 +2399,7 @@ class GenomeAccessibilityService:
         ends: np.ndarray,
         strands: np.ndarray,
         out: np.ndarray,
+        stats: Optional[dict] = None,
     ) -> None:
         """Fill ``out`` with every hit's opening energy from the packed cache.
 
@@ -2394,6 +2442,22 @@ class GenomeAccessibilityService:
                 strand, starts[sel], ends[sel], lengths, packed.codes.shape[1]
             )
             ok = known & in_bounds & (lengths > 0)
+            if stats is not None:
+                # From the masks, never from the values: 10.0 is also an
+                # ordinary opening energy.
+                stats["n_found"] += int(ok.sum())
+                for key, mask in (
+                    ("unknown", ~known),
+                    ("out_of_bounds", known & (lengths > 0) & ~in_bounds),
+                ):
+                    n = int(mask.sum())
+                    if n:
+                        stats[f"n_{key}"] += n
+                        named = np.zeros(names.size, dtype=bool)
+                        named[inv[sel[mask]]] = True
+                        add_default_examples(
+                            stats[key], names[named][:_MAX_DEFAULT_EXAMPLES].tolist()
+                        )
             if not ok.any():
                 continue
             global_rows = rows[ok] + packed.offsets[rid[ok]]

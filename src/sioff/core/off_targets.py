@@ -51,11 +51,15 @@ from loguru import logger
 from sioff.core.split import merge_splits, split_file, split_frame
 from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA, PredictionsMode
 from sioff.services.accessibility import (
+    _MAX_DEFAULT_EXAMPLES,
+    _OUT_OF_BOUNDS_ENERGY,
     PARQUET_SUFFIX,
     AccessibilityError,
     GenomeAccessibilityService,
+    add_default_examples,
     ensure_accessibility_cache,
     has_profiles,
+    new_default_energy_stats,
 )
 from sioff.services.annotation_parser import AnnotationParser
 from sioff.services.intersection_service import (
@@ -1053,6 +1057,51 @@ def _check_sirna_table(
         logger.warning(_NO_TRANSCRIPTOME_WARNING)
 
 
+def _warn_default_opening_energies(total: dict, n_sirnas: dict[str, int]) -> None:
+    """Warn, once per run, about the hits scored with the default opening energy.
+
+    ``total`` sums the per-siRNA counters of
+    `sioff.services.accessibility.new_default_energy_stats`; ``n_sirnas`` is
+    the number of siRNAs with at least one such hit, per kind.
+    """
+    default = f"the default opening energy of {_OUT_OF_BOUNDS_ENERGY} kcal/mol"
+    for key, what, hint in (
+        (
+            "unknown",
+            "are on sequences without an accessibility profile",
+            "Profile names must equal the target names of the predictions; "
+            "'sioff accessibility' names a profile by the first word of its "
+            "FASTA header.",
+        ),
+        (
+            "out_of_bounds",
+            "lie outside the accessibility profile of their sequence",
+            "Fold the profiles from the FASTA the predictions were searched against.",
+        ),
+    ):
+        n = total[f"n_{key}"]
+        if not n:
+            continue
+        names = ", ".join(total[key])
+        more = ", ..." if len(total[key]) >= _MAX_DEFAULT_EXAMPLES else ""
+        logger.warning(
+            f"{n:,} of {total['n_hits']:,} scored hits ({n_sirnas[key]:,} siRNA(s)) "
+            f"{what} and were scored with {default} instead of their own: "
+            f"{names}{more}. {hint}"
+        )
+
+
+def _no_hit_has_a_profile(total: dict) -> bool:
+    """Whether every scored hit of the run is on a sequence without a profile.
+
+    Returns
+    -------
+    bool
+        True when hits were looked up and none of them has a profile.
+    """
+    return bool(total["n_hits"]) and total["n_unknown"] == total["n_hits"]
+
+
 def compute_off_targets(
     *,
     predictions: Optional[pl.DataFrame] = None,
@@ -1122,6 +1171,13 @@ def compute_off_targets(
     warning otherwise), table rows without predictions (an info line), and
     on-target IDs without ``gtf_file`` (a warning). After the last siRNA, the
     siRNAs whose on-target matched no row are named in one warning.
+
+    **Default opening energies**: a hit on a sequence without a profile, or
+    outside its sequence's profile, keeps the default 10.0 kcal/mol, which
+    all but removes it from the partition function. After the last siRNA
+    one warning per kind gives the number of such hits and up to ten
+    sequence names; if no hit of the run has a profile, an
+    `AccessibilityError` is raised instead.
 
     **Accessibility** reaches the workers as a memory-mapped packed cache,
     whatever its source: the cache of ``accessibility_dir``, the
@@ -1298,7 +1354,12 @@ def compute_off_targets(
         ``P_off_target*`` column is Float32). ``meta`` contains
         ``"n_sirnas"``, ``"n_rows"``, ``"z_per_sirna"`` (``{sirna_id: row}``
         with the ``Z_sirna*`` sums), ``"on_target_weights"``,
-        ``"on_target_count"``, ``"n_on_target_rows"`` and ``"_timings"``
+        ``"on_target_count"``, ``"n_on_target_rows"``,
+        ``"default_opening_energy"`` (with an accessibility source: how many
+        of the siRNA's hits were looked up, found a profile value, are on a
+        sequence without a profile or lie outside their sequence's profile,
+        the last two kept at the default 10.0 kcal/mol, with up to ten
+        sequence names each; ``None`` without a source) and ``"_timings"``
         (per-stage wall times of the task: ``load_s``, ``intersect_s``,
         ``prob_s``, ``serialize_s``, ``total_s`` and the intersection
         sub-timings). With ``gtf_file``, ``"on_target_weights"`` maps each
@@ -1341,7 +1402,10 @@ def compute_off_targets(
     AccessibilityError
         When ``accessibility_dir`` (and ``accessibility_cache_dir``) holds no
         profile, when the cache cannot be built, or when ``accessibility``
-        cannot be packed or ``genome_file`` cannot be folded.
+        cannot be packed or ``genome_file`` cannot be folded. After the last
+        siRNA, when no scored hit of the run is on a sequence with a
+        profile: the profile names and the predictions' target names do not
+        match.
     WorkerFailureError
         After the last successful siRNA, when an input file could not be
         split or a siRNA could not be scored.
@@ -1589,6 +1653,8 @@ def compute_off_targets(
         # processes x threads within n_workers.
         n_proc = max(1, min(executor.n_workers, len(tasks)))
         n_on_target_rows: dict[str, int] = {}
+        default_energy = new_default_energy_stats()
+        default_sirnas = {"unknown": 0, "out_of_bounds": 0}
         for sid, (arrow_table, meta) in executor.run(
             _score_part,
             tasks,
@@ -1601,6 +1667,13 @@ def compute_off_targets(
                 n_on_target_rows[sid] = 0
                 continue
             n_on_target_rows.update(meta["n_on_target_rows"])
+            stats = meta.get("default_opening_energy")
+            if stats:
+                for key in ("n_hits", "n_found", "n_unknown", "n_out_of_bounds"):
+                    default_energy[key] += stats[key]
+                for key in default_sirnas:
+                    add_default_examples(default_energy[key], stats[key])
+                    default_sirnas[key] += bool(stats[f"n_{key}"])
             df_chunk = cast(pl.DataFrame, pl.from_arrow(arrow_table))
             del arrow_table  # Polars owns the data now
             yield df_chunk, meta
@@ -1618,6 +1691,9 @@ def compute_off_targets(
                     f"{len(unmatched)} siRNA(s) have no on-target row (W_on = 0): "
                     f"{', '.join(unmatched[:10])}"
                 )
+        no_profile = _no_hit_has_a_profile(default_energy)
+        if not no_profile:
+            _warn_default_opening_energies(default_energy, default_sirnas)
         if executor.failures:
             # An input file that could not be split counts as one task: how
             # many siRNAs it held is unknown.
@@ -1625,6 +1701,25 @@ def compute_off_targets(
                 "splitting and scoring",
                 executor.failures,
                 n_split_failures + len(tasks),
+            )
+        if no_profile:
+            # The names of the profiles and of the predictions do not match
+            # at all; after the siRNAs, like a worker failure, since a worker
+            # only knows its own.
+            names = ", ".join(default_energy["unknown"])
+            more = (
+                ", ..."
+                if len(default_energy["unknown"]) >= _MAX_DEFAULT_EXAMPLES
+                else ""
+            )
+            raise AccessibilityError(
+                f"None of the {default_energy['n_hits']:,} scored hits is on a "
+                f"sequence with an accessibility profile ({names}{more}), so "
+                "every opening energy is the default of "
+                f"{_OUT_OF_BOUNDS_ENERGY} kcal/mol and the results are those of "
+                "a run without accessibility. Profile names must equal the "
+                "target names of the predictions; 'sioff accessibility' names "
+                "a profile by the first word of its FASTA header"
             )
     finally:
         # 10. Pool first (its workers hold the files open), then the files,
