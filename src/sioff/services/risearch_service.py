@@ -13,6 +13,8 @@ import polars as pl
 from Bio import SeqIO
 from loguru import logger
 
+from sioff.services.risearch_parser import _FIRST_WORD
+
 # NOTE: `risearch` (the PyO3 bindings) is imported lazily inside the methods that
 # use it (index_target / run_search), not at module top. This keeps `import sioff`
 # and all non-RIsearch code paths (off-targets, accessibility) working when the
@@ -311,16 +313,22 @@ class RIsearchService:
                 }
             )
 
-        query_names = pl.Series(_fasta_names(str(query_path)), dtype=pl.Utf8)
-        target_names = pl.Series(_fasta_names(str(resolved_target)), dtype=pl.Utf8)
+        if {"query_name", "target_name"} <= set(raw.columns):
+            # RIsearch's own names. Its indices count the records it kept,
+            # and it drops a record that is empty after normalisation, so
+            # looking them up in another parse of the FASTA named every hit
+            # on a later record after an earlier one.
+            sirna_ids = _first_words(raw["query_name"])
+            chroms = _first_words(raw["target_name"])
+        else:
+            # A risearch whose hits carry the indices only.
+            query_names = pl.Series(_fasta_names(str(query_path)), dtype=pl.Utf8)
+            target_names = pl.Series(_fasta_names(str(resolved_target)), dtype=pl.Utf8)
+            sirna_ids = query_names.gather(raw["query_idx"])
+            chroms = target_names.gather(raw["target_idx"])
 
         df = (
-            raw.with_columns(
-                [
-                    query_names.gather(raw["query_idx"]).alias("sirna_id"),
-                    target_names.gather(raw["target_idx"]).alias("chrom"),
-                ]
-            )
+            raw.with_columns([sirna_ids.alias("sirna_id"), chroms.alias("chrom")])
             .rename({"t_start": "start", "t_end": "end"})
             .select(["sirna_id", "chrom", "start", "end", "strand", "energy", *extra])
             .cast({"start": pl.Int32, "end": pl.Int32, "energy": pl.Float32})
@@ -372,6 +380,18 @@ class RIsearchService:
             emin = float(cast(float, df["energy"].min()))
             logger.debug(f"Self-hyb E_min {sirna_id}: {emin:.4f} kcal/mol")
             return emin
+
+
+def _first_words(names: pl.Series) -> pl.Series:
+    """Cut each name at its first whitespace: the ID of a FASTA header.
+
+    RIsearch names a record by its whole header line; the annotation, the
+    accessibility profiles and the siRNA table use the first word. Done per
+    distinct name, since a search returns many hits on few names.
+    """
+    distinct = names.unique()
+    words = distinct.str.extract(_FIRST_WORD, 1).fill_null(distinct)
+    return names.replace_strict(distinct, words, return_dtype=pl.Utf8)
 
 
 @lru_cache(maxsize=32)
