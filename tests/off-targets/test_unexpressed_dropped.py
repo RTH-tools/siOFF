@@ -90,3 +90,50 @@ def test_zero_tpm_transcripts_change_no_partition_function(tmp_path, monkeypatch
         for k, v in without[sid].items():
             if k != "sirna_id":
                 assert with_zero[sid][k] == pytest.approx(v, rel=1e-9), (sid, k)
+
+
+@pytest.mark.parametrize("predictions_type", ["gw", "tw"])
+@pytest.mark.parametrize("value", ["0", "0.000000", "NA"])
+def test_annotation_without_an_expressed_row_is_an_error(
+    tmp_path, predictions_type, value
+):
+    """Every row dropped leaves nothing to score: say so instead of exiting 0."""
+    gtf = tmp_path / "zero.gtf"
+    gtf.write_text(
+        f'chr1\tt\texon\t100\t300\t.\t+\t.\tgene_id "g1"; transcript_id "t1"; TPM "{value}";\n'
+        f'chr1\tt\texon\t500\t700\t.\t-\t.\tgene_id "g2"; transcript_id "t2"; TPM "{value}";\n'
+    )
+    with pytest.raises(ValueError) as excinfo:
+        list(
+            compute_off_targets(
+                risearch_file=_hits(tmp_path / "hits"),
+                gtf_file=gtf,
+                feature_type="exon",
+                expression_metric="TPM",
+                predictions_type=predictions_type,
+            )
+        )
+    message = str(excinfo.value)
+    assert "None of the 2 exon rows of zero.gtf" in message
+    assert "TPM" in message and "above 0" in message
+
+
+@pytest.mark.parametrize(
+    "predictions_type, rows, missing",
+    [("gw", "transcript", "exon"), ("tw", "transcript", "exon")],
+)
+def test_feature_without_rows_stops_the_run(tmp_path, predictions_type, rows, missing):
+    """The default feature against a file that has no such row."""
+    gtf = tmp_path / "ann.gtf"
+    gtf.write_text(
+        f'chr1\tt\t{rows}\t100\t300\t.\t+\t.\tgene_id "g1"; transcript_id "t1"; TPM "4";\n'
+    )
+    with pytest.raises(ValueError, match=f"No '{missing}' rows in ann.gtf"):
+        list(
+            compute_off_targets(
+                risearch_file=_hits(tmp_path / "hits"),
+                gtf_file=gtf,
+                expression_metric="TPM",
+                predictions_type=predictions_type,
+            )
+        )

@@ -185,7 +185,7 @@ def run(
         str,
         typer.Option(
             "--feature",
-            help="Feature type to select from GTF (default: exon).",
+            help="Feature type (column 3) of the annotation rows to use (default: exon); a type no row has is an error.",
         ),
     ] = "exon",
     expression_metric: Annotated[

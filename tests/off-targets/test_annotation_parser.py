@@ -76,3 +76,60 @@ class TestAnnotationParser:
         """Parser raises FileNotFoundError for missing file."""
         with pytest.raises(FileNotFoundError):
             parser.load_gtf(Path("/nonexistent/file.gtf"))
+
+
+TRANSCRIPT_ROWS = (
+    'chr1\tt\ttranscript\t100\t300\t.\t+\t.\tgene_id "g1"; transcript_id "t1"; TPM "4";\n'
+    'chr1\tt\ttranscript\t500\t700\t.\t-\t.\tgene_id "g2"; transcript_id "t2"; TPM "7";\n'
+    'chr1\tt\tCDS\t120\t280\t.\t+\t.\tgene_id "g1"; transcript_id "t1"; TPM "4";\n'
+)
+
+
+class TestFeatureWithoutRows:
+    """A feature type that no row of the file has is an error.
+
+    The filter used to leave an empty frame, which the all-null guard skips
+    (it has no row to look at), so the run went on against an empty
+    annotation, scored nothing and exited 0.
+    """
+
+    def test_default_exon_on_a_transcript_level_file_raises(
+        self, parser: AnnotationParser, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "transcripts.gtf"
+        path.write_text(TRANSCRIPT_ROWS)
+        with pytest.raises(ValueError) as excinfo:
+            parser.load_gtf(path, score_col="TPM")
+        message = str(excinfo.value)
+        assert "No 'exon' rows in transcripts.gtf" in message
+        # The types the file does hold, most frequent first, with their counts.
+        assert "transcript (2), CDS (1)" in message
+        assert "--feature" in message
+
+    def test_the_guard_is_not_masked_by_a_wrong_expression_attribute(
+        self, parser: AnnotationParser, tmp_path: Path
+    ) -> None:
+        """No row is left to miss the attribute, so the feature is the error."""
+        path = tmp_path / "transcripts.gtf"
+        path.write_text(TRANSCRIPT_ROWS)
+        with pytest.raises(ValueError, match="No 'exon' rows"):
+            parser.load_gtf(path, score_col="RPKM")
+
+    def test_a_feature_the_file_has_still_loads(
+        self, parser: AnnotationParser, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "transcripts.gtf"
+        path.write_text(TRANSCRIPT_ROWS)
+        df = parser.load_gtf(path, feature="transcript", score_col="TPM")
+        assert df["transcript_id"].to_list() == ["t1", "t2"]
+
+    def test_gff3_feature_without_rows_raises(
+        self, parser: AnnotationParser, tmp_path: Path
+    ) -> None:
+        path = tmp_path / "ann.gff3"
+        path.write_text(
+            "##gff-version 3\n"
+            "chr1\t.\tmRNA\t100\t300\t.\t+\t.\tID=t1;gene_id=g1;TPM=4\n"
+        )
+        with pytest.raises(ValueError, match=r"No 'exon' rows.*mRNA \(1\)"):
+            parser.load_gtf(path, score_col="TPM")
