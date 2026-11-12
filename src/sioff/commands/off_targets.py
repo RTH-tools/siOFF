@@ -192,7 +192,7 @@ def run(
         str,
         typer.Option(
             "--expression-metric",
-            help="Attribute to use for expression score (default: RPKM).",
+            help="Annotation attribute holding the expression (default: RPKM). It must be each transcript's own abundance: a gene-level value copied onto every transcript counts the gene once per isoform.",
         ),
     ] = "RPKM",
     transcriptome_format: Annotated[
@@ -321,7 +321,11 @@ def run(
                 "Keep the raw Boltzmann weights, partition functions and E_min "
                 "for every interaction in the output table. E_min is the lower "
                 "of the perfect-match energy of the --sirna-table sequence and "
-                "the strongest hit left; without a table row, that hit."
+                "the strongest hit left; without a table row, that hit. The "
+                "weights and Z are Float64, computed from the Float32 energy, "
+                "dG_total and exp_value columns: to recompute a weight exactly "
+                "from a tsv/csv, read those columns as Float32, or use "
+                "--output-format parquet."
             ),
         ),
     ] = False,
@@ -358,7 +362,7 @@ def run(
         str,
         typer.Option(
             "--output-format",
-            help="Final output format: 'tsv', 'csv', or 'parquet'.",
+            help="Final output format: 'tsv', 'csv', or 'parquet'. Parquet stores the column types (Float32 energies, expression and probabilities; Float64 weights and Z).",
         ),
     ] = "tsv",
     summary_only: Annotated[

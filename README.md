@@ -241,8 +241,11 @@ Standalone prediction (stage 1 by itself) is also available as
    first. Sites that don't overlap any feature are dropped. A site counts once
    per transcript: a site touching two exons of one transcript counts that
    transcript once, and every transcript containing the site contributes its
-   own expression. BED is not accepted: with a single ID column it cannot say
-   which rows belong to the same transcript.
+   own expression. The value must therefore be each transcript's own
+   abundance (isoform-level TPM/RPKM), so that the transcripts of a gene add
+   up to the gene: a gene-level value copied onto every transcript counts the
+   gene once per isoform. BED is not accepted: with a single ID column it
+   cannot say which rows belong to the same transcript.
    Hits and features are 1-based closed intervals, so a site that shares a
    single position with an exon overlaps it. Exons with expression ≤ 0 are
    dropped after loading: they would add weight 0 to every partition function.
@@ -623,6 +626,17 @@ under [Thermodynamic Model](#thermodynamic-model) for a siRNA with a
 `--sirna-table` row; for one without (no table, which only the baseline
 allows, or a missing row) it is the strongest hit left. It cannot be
 combined with `--summary-only`.
+
+**Precision of the table.** The energies (`energy*`, `opening_energy`,
+`dG_total*`, `E_min`), `exp_value` and every `P_off_target*` are single
+precision (Float32); `boltzmann_weight*` and `Z_sirna*` are double precision.
+Each weight is `exp_value × exp(−dG_total / RT)` (`energy` in place of
+`dG_total` for `_noacc`) with `RT = 0.001987 × (T + 273.15)` kcal/mol,
+evaluated on the single-precision values. To recompute a weight exactly, use
+`--output-format parquet`, which stores the column types, or read those
+columns of the TSV/CSV as Float32: read as double precision, the printed
+decimals differ from the stored values by up to about 3e-6 relative in the
+weight.
 
 ---
 
