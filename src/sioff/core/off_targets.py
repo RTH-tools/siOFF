@@ -63,7 +63,7 @@ from sioff.services.intersection_service import (
     sort_for_preload,
 )
 from sioff.services.probability import ProbabilityService
-from sioff.services.risearch_parser import RIsearchParser
+from sioff.services.risearch_parser import RIsearchParser, first_word_targets
 from sioff.services.risearch_service import RIsearchService
 from sioff.services.sirna_table import SirnaRecord, read_sirna_table
 
@@ -475,17 +475,20 @@ def _coerce_predictions(frame: pl.DataFrame) -> pl.DataFrame:
 
     Extra columns are dropped and compatible dtypes (Int64 coordinates, Float64
     energies, Categorical strings) are cast, so a frame that went through Parquet
-    or a user's own manipulation still works.
+    or a user's own manipulation still works. Targets are named by the first
+    word of their FASTA header, as a predictions file is read.
 
     Returns
     -------
     polars.DataFrame
-        ``frame`` restricted to ``RISEARCH_COLUMNS`` and cast to ``RISEARCH_SCHEMA``.
+        ``frame`` restricted to ``RISEARCH_COLUMNS`` and cast to
+        ``RISEARCH_SCHEMA``, ``chrom`` cut at its first whitespace.
 
     Raises
     ------
     ValueError
-        When one or more of ``RISEARCH_COLUMNS`` is missing; the message names them.
+        When one or more of ``RISEARCH_COLUMNS`` is missing; the message names
+        them. When two different ``chrom`` values share a first word.
     """
     missing = [c for c in RISEARCH_COLUMNS if c not in frame.columns]
     if missing:
@@ -493,7 +496,9 @@ def _coerce_predictions(frame: pl.DataFrame) -> pl.DataFrame:
             f"predictions is missing column(s) {', '.join(missing)}; expected the "
             f"sioff.search schema {RISEARCH_COLUMNS}"
         )
-    return frame.select(RISEARCH_COLUMNS).cast(pl.Schema(RISEARCH_SCHEMA))
+    return first_word_targets(
+        frame.select(RISEARCH_COLUMNS).cast(pl.Schema(RISEARCH_SCHEMA))
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +848,8 @@ def _check_profile_names(profiles: Mapping[str, pl.DataFrame]) -> None:
     ValueError
         When there are no profiles, or when a key is empty, ``.`` or ``..``,
         or holds ``/``, the path separator or a NUL; the message names every
-        such key.
+        such key. When a key holds whitespace: a hit's target is cut to the
+        first word of its name, so such a key would match no hit.
     """
     if not profiles:
         raise ValueError(
@@ -859,6 +865,14 @@ def _check_profile_names(profiles: Mapping[str, pl.DataFrame]) -> None:
         raise ValueError(
             "accessibility keys name the chromosomes and become file names; "
             f"these cannot: {', '.join(map(repr, bad))}"
+        )
+    spaced = [chrom for chrom in profiles if any(c.isspace() for c in chrom)]
+    if spaced:
+        raise ValueError(
+            "accessibility keys are matched against the first word of a target's "
+            "name, so a key with whitespace would match no hit: "
+            f"{', '.join(map(repr, spaced))}; key each profile by the first word "
+            "of its FASTA header, as sioff.accessibility does"
         )
 
 
@@ -1041,13 +1055,17 @@ def compute_off_targets(
         In-memory predictions, typically the value returned by
         [`sioff.search`][sioff.search]. Must contain the columns ``sirna_id,
         chrom, start, end, strand, energy``; extra columns are dropped and
-        compatible dtypes are cast to the RIsearch schema.
+        compatible dtypes are cast to the RIsearch schema. ``chrom`` is cut
+        at its first whitespace, as for ``risearch_file``.
     risearch_file : pathlib.Path, optional
         A predictions file, or a directory of them (CLI
         ``-r/--risearch-file``): RIsearch2 output (plain or ``.gz``), a
         ``sioff search`` TSV, or Parquet. From a directory every ``*.gz``,
         ``*.tsv``, ``*.out`` and ``*.parquet`` is read, each holding one siRNA
-        or many.
+        or many. A target is named by the first word of its FASTA header,
+        as in the annotation and the accessibility profiles: the
+        ``risearch`` command line writes the whole header, which is cut at
+        its first whitespace.
     sirna_fasta : pathlib.Path, optional
         Query FASTA for an in-process RIsearch run against ``target_fasta``
         (CLI ``-s/--sirna-fasta``), searched with ``matrix``; duplicate
@@ -1083,7 +1101,8 @@ def compute_off_targets(
         returned by [`sioff.accessibility`][sioff.accessibility]. They are
         written to a temporary directory, one ``<chrom>.accessibility.parquet``
         per key, and packed there, so a key cannot be empty, ``.`` or ``..``,
-        or hold ``/``, the path separator or a NUL. Mutually exclusive with
+        or hold ``/``, the path separator, a NUL or whitespace (a target is
+        matched by the first word of its name). Mutually exclusive with
         ``accessibility_dir``.
     accessibility_dir : pathlib.Path, optional
         The npy cache from ``sioff accessibility`` or per-chromosome Parquet
@@ -1203,7 +1222,8 @@ def compute_off_targets(
         Also when ``accessibility`` is empty or has a key that cannot be a
         file name; when no prediction source is given; when ``sirna_fasta``
         is given without ``target_fasta``; when ``predictions`` lacks a
-        required column; when no row of ``gtf_file`` has the feature
+        required column; when two targets of one input share the first
+        word of their names; when no row of ``gtf_file`` has the feature
         type ``feature_type``, or none has an expression above 0; when
         ``sirna_fasta`` holds a duplicate ID; when the
         siRNA table cannot be read; when a ``sirna_id`` occurs in two input
