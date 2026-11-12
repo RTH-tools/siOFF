@@ -120,10 +120,10 @@ def test_annotation_without_an_expressed_row_is_an_error(
 
 @pytest.mark.parametrize(
     "predictions_type, rows, missing",
-    [("gw", "transcript", "exon"), ("tw", "transcript", "exon")],
+    [("gw", "transcript", "exon"), ("tw", "exon", "transcript")],
 )
 def test_feature_without_rows_stops_the_run(tmp_path, predictions_type, rows, missing):
-    """The default feature against a file that has no such row."""
+    """Each mode's default feature against a file that only has the other's."""
     gtf = tmp_path / "ann.gtf"
     gtf.write_text(
         f'chr1\tt\t{rows}\t100\t300\t.\t+\t.\tgene_id "g1"; transcript_id "t1"; TPM "4";\n'

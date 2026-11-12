@@ -139,19 +139,43 @@ class IntersectionService:
         risearch_df: pl.DataFrame,
         transcriptome_df: pl.DataFrame,
     ) -> pl.DataFrame:
-        joined = risearch_df.join(
-            transcriptome_df,
+        """Give each hit the annotation of the transcript it names.
+
+        A hit counts once per transcript: the annotation is reduced to one
+        row per ``transcript_id`` among the hits' targets before the join, so
+        a transcript given as several rows (its exons) does not multiply its
+        hits. The off-target driver passes one row per transcript already
+        (and has checked that a transcript's rows agree on expression), so
+        there this keeps every row. The columns are those of the genome-wide
+        path; ``trans_start``/``trans_end`` are the kept row's.
+        """
+        per_transcript = (
+            transcriptome_df.filter(
+                pl.col("transcript_id").is_in(risearch_df["chrom"].unique().implode())
+            )
+            .unique(subset=["transcript_id"], keep="first", maintain_order=True)
+            .select(
+                "transcript_id",
+                pl.col("start").alias("trans_start"),
+                pl.col("end").alias("trans_end"),
+                "gene_id",
+                "exp_value",
+            )
+        )
+        return risearch_df.join(
+            per_transcript,
             left_on="chrom",
             right_on="transcript_id",
             how="inner",
-            suffix="_trans",
             maintain_order="left",
+        ).select(
+            *risearch_df.columns,
+            "trans_start",
+            "trans_end",
+            "gene_id",
+            pl.col("chrom").alias("transcript_id"),
+            "exp_value",
         )
-
-        if "transcript_id" not in joined.columns:
-            joined = joined.with_columns(pl.col("chrom").alias("transcript_id"))
-
-        return joined
 
     def _genome_wide_streaming(
         self,

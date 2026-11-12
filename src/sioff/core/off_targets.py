@@ -49,7 +49,7 @@ import pyarrow.ipc
 from loguru import logger
 
 from sioff.core.split import merge_splits, split_file, split_frame
-from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA
+from sioff.models import RISEARCH_COLUMNS, RISEARCH_SCHEMA, PredictionsMode
 from sioff.services.accessibility import (
     PARQUET_SUFFIX,
     AccessibilityError,
@@ -190,6 +190,62 @@ def _drop_unexpressed(df_trans: pl.DataFrame) -> pl.DataFrame:
             "expression <= 0 (weight 0 in every partition function)"
         )
     return kept
+
+
+def _one_row_per_transcript(
+    df_trans: pl.DataFrame, name: str, expression_metric: str
+) -> pl.DataFrame:
+    """Reduce the annotation to one row per transcript, for transcriptome-wide hits.
+
+    Such a hit names its transcript, and the annotation only says how much of
+    that transcript there is: joined to every row of the transcript (its
+    exons), the hit would count once per row. The kept row spans the
+    transcript's rows (lowest ``start`` to highest ``end``) and carries their
+    expression. Rows without a ``transcript_id`` are dropped: no hit names
+    them.
+
+    Parameters
+    ----------
+    df_trans : polars.DataFrame
+        Annotation as `AnnotationParser.load_gtf` returns it.
+    name : str
+        File name of the annotation, for the error.
+    expression_metric : str
+        Name of the expression attribute, for the error.
+
+    Returns
+    -------
+    polars.DataFrame
+        One row per ``transcript_id``, same columns, in first-seen order.
+
+    Raises
+    ------
+    ValueError
+        When rows of one transcript carry different expression values; the
+        message names up to ten such transcripts.
+    """
+    per_transcript = (
+        df_trans.filter(pl.col("transcript_id").is_not_null())
+        .group_by("transcript_id", maintain_order=True)
+        .agg(
+            pl.col("chrom").first(),
+            pl.col("start").min(),
+            pl.col("end").max(),
+            pl.col("strand").first(),
+            pl.col("gene_id").first(),
+            pl.col("exp_value").first(),
+            pl.col("exp_value").n_unique().alias("_n_values"),
+        )
+    )
+    disagree = per_transcript.filter(pl.col("_n_values") > 1)["transcript_id"]
+    if disagree.len():
+        raise ValueError(
+            f"{disagree.len():,} transcript(s) of {name} have rows that disagree "
+            f"on {expression_metric}, so a transcriptome-wide hit on them has no "
+            f"single expression: {', '.join(disagree.head(10).to_list())}. Give "
+            "every row of a transcript the transcript's own value"
+        )
+    return per_transcript.select(df_trans.columns)
 
 
 def _read_shared_ipc(path: Path) -> pl.DataFrame:
@@ -1005,7 +1061,7 @@ def compute_off_targets(
     target_fasta: Optional[Path] = None,
     target_index: Optional[Path] = None,
     gtf_file: Optional[Path] = None,
-    feature_type: str = "exon",
+    feature_type: Optional[str] = None,
     expression_metric: str = "RPKM",
     transcriptome_format: str = "auto",
     accessibility: Optional[Mapping[str, pl.DataFrame]] = None,
@@ -1117,9 +1173,12 @@ def compute_off_targets(
         Rows with expression <= 0 are dropped; predictions are intersected
         with the rest and annotated with ``transcript_id``, ``gene_id`` and
         ``exp_value``. Read before ``genome_file`` is folded.
-    feature_type : str, default "exon"
-        Feature type to select from a GTF/GFF3 annotation (CLI ``--feature``).
-        A type that no row of the file has is an error.
+    feature_type : str, optional
+        Feature type (column 3) of the annotation rows to use (CLI
+        ``--feature``). Default: ``"exon"`` for genome-wide predictions, where
+        a site has to lie in an exon, and ``"transcript"`` for
+        transcriptome-wide ones, where a hit names its transcript. A type
+        that no row of the file has is an error.
     expression_metric : str, default "RPKM"
         Annotation attribute used as the expression score (CLI
         ``--expression-metric``).
@@ -1196,7 +1255,9 @@ def compute_off_targets(
     predictions_type : str, default "gw"
         ``"gw"`` for genome-wide predictions (interval intersection with the
         annotation) or ``"tw"`` for transcriptome-wide predictions (join on
-        transcript ID) (CLI ``--type``).
+        transcript ID) (CLI ``--type``). Either way a site counts once per
+        transcript: for ``"tw"`` the annotation is reduced to one row per
+        ``transcript_id``, whose rows must agree on expression.
     n_workers : int, default 1
         Worker processes for splitting and scoring (CLI ``-j/--workers``). A
         pool is started only when more than one task can run at once.
@@ -1262,6 +1323,8 @@ def compute_off_targets(
         required column; when two targets of one input share the first
         word of their names; when no row of ``gtf_file`` has the feature
         type ``feature_type``, or none has an expression above 0; when
+        ``predictions_type`` is ``"tw"`` and rows of one transcript disagree
+        on expression; when
         ``sirna_fasta`` holds a duplicate ID; when the
         siRNA table cannot be read; when a ``sirna_id`` occurs in two input
         files; and when an alpha/gamma pair other than (1, 1) is computed and
@@ -1389,19 +1452,32 @@ def compute_off_targets(
         # can be memory-mapped at all; see preload_transcriptome.
         ipc_path = ""
         if gtf_file is not None:
+            # A transcriptome-wide hit names its transcript, so the rows that
+            # describe it are the transcript rows; a genome-wide site has to
+            # lie in an exon.
+            feature = feature_type
+            if feature is None:
+                feature = (
+                    "transcript" if predictions_type == PredictionsMode.TW else "exon"
+                )
             df_trans = AnnotationParser().load_gtf(
                 Path(gtf_file),
-                feature=feature_type,
+                feature=feature,
                 score_col=expression_metric,
                 format=transcriptome_format,
             )
             n_selected = df_trans.height
+            if predictions_type == PredictionsMode.TW:
+                # Before the unexpressed rows go: 0 and 10 disagree as well.
+                df_trans = _one_row_per_transcript(
+                    df_trans, Path(gtf_file).name, expression_metric
+                )
             df_trans = _drop_unexpressed(df_trans)
             if df_trans.height == 0:
                 # Every site would be dropped by the intersection: a run that
                 # scores nothing and exits 0.
                 raise ValueError(
-                    f"None of the {n_selected:,} {feature_type or 'annotation'} "
+                    f"None of the {n_selected:,} {feature or 'annotation'} "
                     f"rows of {Path(gtf_file).name} has a {expression_metric} "
                     "above 0 (a value that is not a number counts as 0), so no "
                     "site could be scored; check --expression-metric and the "

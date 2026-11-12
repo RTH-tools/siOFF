@@ -83,7 +83,7 @@ def off_targets(
     target_fasta: Optional[Union[str, Path]] = None,
     target_index: Optional[Union[str, Path]] = None,
     gtf_file: Optional[Union[str, Path]] = None,
-    feature_type: str = "exon",
+    feature_type: Optional[str] = None,
     expression_metric: str = "RPKM",
     transcriptome_format: str = "auto",
     accessibility: Optional[Mapping[str, pl.DataFrame]] = None,
@@ -189,8 +189,10 @@ def off_targets(
         expression <= 0 are dropped first. Without it no intersection is
         performed and every prediction is kept with unit expression. CLI:
         ``-t/--transcriptome``.
-    feature_type : str, default "exon"
-        Feature type to select from a GTF/GFF3 annotation; a type that no
+    feature_type : str, optional
+        Feature type (column 3) of the annotation rows to use. Default:
+        ``"exon"`` for genome-wide predictions and ``"transcript"`` for
+        transcriptome-wide ones (``predictions_type="tw"``). A type that no
         row of the file has is an error. CLI: ``--feature``.
     expression_metric : str, default "RPKM"
         Annotation attribute used as the expression score (``exp_value``).
