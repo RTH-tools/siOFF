@@ -153,14 +153,18 @@ def off_targets(
         Pre-computed predictions: a file, or a directory of files. Read are
         RIsearch2 output (plain or ``.gz``), ``sioff search -o`` TSV and
         Parquet; from a directory every ``*.gz``, ``*.tsv``, ``*.out`` and
-        ``*.parquet``. A ``sirna_id`` found in two files is an error. CLI:
+        ``*.parquet``. A ``sirna_id`` found in two files is an error. A
+        target name is cut at its first whitespace: the ``risearch`` command
+        line writes the whole FASTA header, while the annotation and the
+        accessibility profiles are keyed by its first word. CLI:
         ``-r/--risearch-file``.
     predictions : polars.DataFrame, optional
         In-memory predictions in the [`search`][sioff.search] schema. The columns
         ``sirna_id, chrom, start, end, strand, energy`` are required; extra
         columns are dropped and dtypes are cast to the schema (``Utf8`` ids and
         strand, ``Int32`` coordinates, ``Float32`` energy), so a frame that went
-        through Parquet or your own manipulation still works. Mutually
+        through Parquet or your own manipulation still works. ``chrom`` is
+        cut at its first whitespace, as for ``risearch_file``. Mutually
         exclusive with ``risearch_file``. No CLI equivalent.
     sirna_fasta : str or pathlib.Path, optional
         siRNA FASTA with one or more sequences and unique IDs, searched
@@ -202,8 +206,9 @@ def off_targets(
         temporary directory and packed into the same cache
         ``accessibility_dir`` uses, so the opening energies match that path.
         Each key becomes a file name, so it cannot be empty, ``.`` or ``..``,
-        or hold ``/``. Mutually exclusive with ``accessibility_dir``. No CLI
-        equivalent.
+        or hold ``/``; nor whitespace, since a target is matched by the
+        first word of its name. Mutually exclusive with
+        ``accessibility_dir``. No CLI equivalent.
     accessibility_dir : str or pathlib.Path, optional
         The packed npy cache from ``sioff accessibility`` or per-chromosome
         Parquet files. Parquet is packed into the cache in

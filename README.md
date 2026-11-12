@@ -246,6 +246,10 @@ Standalone prediction (stage 1 by itself) is also available as
 4. Either **pre-computed [RIsearch](https://github.com/RTH-tools/risearch)
    predictions** (a TSV / `.out.gz` / Parquet file, or a folder of them) **or**
    a siRNA FASTA plus target FASTA so siOFF can run RIsearch itself in-process.
+   A target is named by the first word of its FASTA header, which is what
+   the annotation and the accessibility profiles are matched on: the
+   `risearch` command line writes the whole header line as the target name
+   (`rna-XM_1.2 CDS=163-1434`), and siOFF cuts it at the first whitespace.
 5. Optional, but required for `--alpha`/`--gamma` other than 1: the **siRNA
    table** (`--sirna-table`), which names each siRNA's intended target (it
    enters the partition function as the on-target term) and gives its guide
