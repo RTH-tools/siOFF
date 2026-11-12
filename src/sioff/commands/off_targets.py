@@ -258,7 +258,15 @@ def run(
         typer.Option(
             "--temperature",
             "-T",
-            help="Folding temperature in °C (default 37.0). Affects both accessibility and partition function.",
+            help=(
+                "Temperature in °C (default 37.0) of everything this run "
+                "computes: RT of the partition function, the -f/--fasta fold, "
+                "the in-process search (-s) and the perfect-match energy of "
+                "E_min (the last two take whole degrees, 0-50). Inputs "
+                "computed earlier keep their own temperature: fold the -a "
+                "profiles ('sioff accessibility -T') and search the -r "
+                "predictions ('sioff search -T') at this temperature too."
+            ),
         ),
     ] = 37.0,
     matrix: Annotated[
