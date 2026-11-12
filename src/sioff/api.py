@@ -235,9 +235,14 @@ def off_targets(
         computed (profile columns ``u1..u{unpaired_prob}``). CLI:
         ``-u/--unpaired``.
     temperature : float, default 37.0
-        Folding temperature in degrees Celsius. Affects both the
-        ``genome_file`` fold and the ``RT`` term of the partition function.
-        CLI: ``-T/--temperature``.
+        Temperature in degrees Celsius of everything this run computes: the
+        ``RT`` term of the partition function, the ``genome_file`` fold, the
+        in-process search of ``sirna_fasta`` and the perfect-match energy of
+        E_min. The last two are RIsearch energies, which take whole degrees
+        from 0 to 50. Inputs computed earlier keep their own temperature:
+        fold the ``accessibility`` / ``accessibility_dir`` profiles and
+        search the ``risearch_file`` / ``predictions`` hits at this
+        temperature too. CLI: ``-T/--temperature``.
     matrix : str or pathlib.Path, default "t04"
         Energy parameter set for the in-process search and for the
         perfect-match energies of E_min: a bundled id or the path of a DSM

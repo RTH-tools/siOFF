@@ -47,7 +47,7 @@ class TestPlumbing:
     def test_engine_uses_the_matrix_for_emin(self, monkeypatch, tmp_path):
         seen = {}
 
-        def fake(self, sequence, sirna_id="query", matrix="t04"):
+        def fake(self, sequence, sirna_id="query", matrix="t04", temperature=37):
             seen["matrix"] = matrix
             raise RuntimeError("stop after E_min")
 

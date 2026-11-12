@@ -69,7 +69,7 @@ def perfect_match(monkeypatch):
     seqs = {sid: s.replace("U", "T") for sid, s in _sequences().items()}
     calls: list[str] = []
 
-    def fake(self, sequence, sirna_id="query", matrix="t04"):
+    def fake(self, sequence, sirna_id="query", matrix="t04", temperature=37):
         assert sequence == seqs[sirna_id] and matrix == "t04"
         calls.append(sirna_id)
         return -25.0 - SIRNAS.index(sirna_id)

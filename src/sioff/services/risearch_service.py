@@ -332,15 +332,21 @@ class RIsearchService:
         return df
 
     def self_hybridization_emin(
-        self, sequence: str, sirna_id: str = "query", matrix: Union[str, Path] = "t04"
+        self,
+        sequence: str,
+        sirna_id: str = "query",
+        matrix: Union[str, Path] = "t04",
+        temperature: int = 37,
     ) -> float:
         """Compute E_min by searching a siRNA against itself.
 
         seed_length = len(seq) - 1 ensures only near-full-length hybridisations,
         replicating ``risearch2.x -q siRNA.fa -i siRNA.pksuf -s len-1 -e 0``.
         ``matrix`` is the energy parameter set (bundled id or DSM TSV path) and
-        should be the one the predictions were searched with, since E_min is the
-        reference energy their alpha/gamma clamp is measured against.
+        ``temperature`` the energy-model temperature in °C (an integer in
+        ``TEMPERATURE_RANGE``); both should be the ones the predictions were
+        searched with, since E_min is the reference energy their alpha/gamma
+        clamp is measured against.
         Returns 0.0 if no hits found.
         """
         seq_dna = sequence.upper().replace("U", "T")
@@ -356,6 +362,7 @@ class RIsearchService:
                 seed_length=len(seq_dna) - 1,
                 energy_threshold=0.0,
                 matrix=matrix,
+                temperature=temperature,
             )
             if df.is_empty():
                 logger.warning(

@@ -64,7 +64,9 @@ def _e_min(
     monkeypatch.setattr(
         RIsearchService,
         "self_hybridization_emin",
-        lambda self, sequence, sirna_id="query", matrix="t04": perfect_match,
+        lambda self, sequence, sirna_id="query", matrix="t04", temperature=37: (
+            perfect_match
+        ),
     )
     table = tmp_path / "sirnas.tsv"
     table.write_text("sirna_id\ton_target_id\tsequence\ns1\t\tACGUACGUACGUACGUACG\n")

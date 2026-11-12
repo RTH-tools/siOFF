@@ -151,7 +151,7 @@ def perfect_match(monkeypatch):
     Computed in the parent, so the fake holds with worker processes too.
     """
 
-    def fake(self, sequence, sirna_id="query", matrix="t04"):
+    def fake(self, sequence, sirna_id="query", matrix="t04", temperature=37):
         return -30.0 - int(sirna_id.removeprefix("siRNA"))
 
     monkeypatch.setattr(RIsearchService, "self_hybridization_emin", fake)

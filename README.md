@@ -447,6 +447,7 @@ Available on `sioff` itself, before any subcommand.
 | `-z / --matrix` | Energy parameter set (`t04`, `slh04`, `s95-rna-dna`, `s95-dna-rna` or a DSM TSV path) for the in-process search and the perfect-match energy of `E_min`; use the set the predictions were searched with (default: `t04`) |
 | `--detailed-report` | Add the raw weights, partition functions and `E_min` to the table |
 | `--summary-only` | Write only the `.summary` files |
+| `-T / --temperature` | Temperature °C of everything the run computes (default: 37.0): RT of the partition function, the `-f` fold, the in-process search (`-s`) and the perfect-match energy of `E_min` (the last two take whole degrees, 0–50). Inputs computed earlier keep their own temperature: fold the `-a` profiles and search the `-r` predictions at this temperature too |
 | `--output-format` | `tsv` (default), `csv` or `parquet` |
 | `--profile` | Print the run's timing and memory breakdown |
 | `-j / --workers` | Parallel worker processes (default: CPU count) |

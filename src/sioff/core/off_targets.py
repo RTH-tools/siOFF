@@ -64,7 +64,7 @@ from sioff.services.intersection_service import (
 )
 from sioff.services.probability import ProbabilityService
 from sioff.services.risearch_parser import RIsearchParser, first_word_targets
-from sioff.services.risearch_service import RIsearchService
+from sioff.services.risearch_service import TEMPERATURE_RANGE, RIsearchService
 from sioff.services.sirna_table import SirnaRecord, read_sirna_table
 
 # ---------------------------------------------------------------------------
@@ -876,16 +876,46 @@ def _check_profile_names(profiles: Mapping[str, pl.DataFrame]) -> None:
         )
 
 
+def _energy_model_temperature(temperature: float) -> int:
+    """Give the run's temperature as the whole degree RIsearch's energy model takes.
+
+    RIsearch computes duplex energies at a whole number of degrees in
+    ``TEMPERATURE_RANGE``; a fraction is refused, not rounded, so the search
+    and the partition function never differ in temperature unnoticed.
+
+    Returns
+    -------
+    int
+        ``temperature`` as an integer.
+
+    Raises
+    ------
+    ValueError
+        When ``temperature`` is not a whole number or lies outside the range.
+    """
+    low, high = TEMPERATURE_RANGE
+    if not float(temperature).is_integer() or not low <= temperature <= high:
+        raise ValueError(
+            f"temperature {temperature} cannot be used for the energies RIsearch "
+            "computes in this run (the in-process search of sirna_fasta and the "
+            "perfect-match energies of sirna_table): RIsearch takes a whole "
+            f"number of degrees from {low} to {high}"
+        )
+    return int(temperature)
+
+
 def _search_in_process(
     sirna_fasta: Path,
     target_fasta: Path,
     target_index: Optional[Path],
     matrix: Union[str, Path],
+    temperature: int,
 ) -> pl.DataFrame:
     """Search the siRNAs against the target with RIsearch, in this process.
 
     The target is indexed first unless ``target_index`` is given; the index is
-    built (or reused) next to ``target_fasta``.
+    built (or reused) next to ``target_fasta``. The duplex energies are those
+    of ``matrix`` at ``temperature``.
 
     Returns
     -------
@@ -901,6 +931,7 @@ def _search_in_process(
         index_path=index_path,
         target_fasta=target_fasta,
         matrix=matrix,
+        temperature=temperature,
     )
 
 
@@ -1130,8 +1161,14 @@ def compute_off_targets(
         Maximum unpaired-stretch length for folding ``genome_file`` (CLI
         ``-u/--unpaired``).
     temperature : float, default 37.0
-        Temperature in degrees Celsius for the partition function (CLI
-        ``-T/--temperature``).
+        Temperature in degrees Celsius of everything this run computes (CLI
+        ``-T/--temperature``): the ``RT`` term of the partition function,
+        the ``genome_file`` fold, the in-process search of ``sirna_fasta``
+        and the perfect-match energies of ``sirna_table``. The last two are
+        RIsearch energies, which take whole degrees from 0 to 50. Inputs
+        computed earlier keep their own temperature: fold the
+        ``accessibility`` / ``accessibility_dir`` profiles and search the
+        ``risearch_file`` / ``predictions`` hits at this temperature too.
     matrix : str or pathlib.Path, default "t04"
         Energy parameter set for the perfect-match energies: a bundled id or
         the path of a DSM TSV table (CLI ``-z/--matrix``). Use the set the
@@ -1332,6 +1369,13 @@ def compute_off_targets(
         logger.info(f"Skipped alpha > gamma pairs: {skipped_pairs}")
     theta_vals = _parse_theta(theta)
     needs_e_min = any(pair != (1.0, 1.0) for pair in alpha_gamma_pairs)
+    # The energies RIsearch computes in this run (the in-process search of
+    # step 5, the perfect-match energies of step 7) are taken at the run's
+    # temperature, as RT and the genome_file fold are. Checked here, before
+    # any fold: RIsearch only takes whole degrees within its range.
+    search_temperature = 37
+    if sirna_fasta is not None or ((needs_e_min or detailed_report) and table):
+        search_temperature = _energy_model_temperature(temperature)
 
     spill_dir: Optional[str] = None
     ipc_dir: Optional[str] = None
@@ -1424,6 +1468,7 @@ def compute_off_targets(
                     Path(target_fasta),
                     Path(target_index) if target_index is not None else None,
                     matrix,
+                    search_temperature,
                 )
             parts = dict(sorted(split_frame(frame, Path(split_root) / "0").items()))
             frame = None  # the parts hold the rows now
@@ -1442,7 +1487,10 @@ def compute_off_targets(
             service = RIsearchService()
             perfect_match = {
                 sid: service.self_hybridization_emin(
-                    table[sid].sequence, sid, matrix=matrix
+                    table[sid].sequence,
+                    sid,
+                    matrix=matrix,
+                    temperature=search_temperature,
                 )
                 for sid in parts
                 if sid in table
