@@ -34,8 +34,8 @@ def _with_expression():
 
 def _with_accessibility():
     acc = MagicMock()
-    acc.annotate_opening_energy_vectorized.side_effect = lambda df: df.with_columns(
-        pl.Series("opening_energy", [0.5, 1.5, 0.0]).cast(pl.Float32)
+    acc.annotate_opening_energy_vectorized.side_effect = lambda df, stats=None: (
+        df.with_columns(pl.Series("opening_energy", [0.5, 1.5, 0.0]).cast(pl.Float32))
     )
     _, df = _plain()
     return ProbabilityService(acc), df.with_columns(

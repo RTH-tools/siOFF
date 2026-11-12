@@ -3,7 +3,10 @@ from typing import Mapping, Optional, Tuple, Dict
 import polars as pl
 from loguru import logger
 
-from sioff.services.accessibility import GenomeAccessibilityService
+from sioff.services.accessibility import (
+    GenomeAccessibilityService,
+    new_default_energy_stats,
+)
 
 # Gas constant in kcal/mol*K
 R = 0.001987
@@ -81,8 +84,10 @@ class ProbabilityService:
             f"Processing {len(unique_sirnas)} siRNAs with per-siRNA partition functions"
         )
 
+        default_energy = None
         if self.accessibility_service:
-            df = self._annotate_opening_energy(df)
+            default_energy = new_default_energy_stats()
+            df = self._annotate_opening_energy(df, default_energy)
 
         if "opening_energy" in df.columns:
             df = df.with_columns(
@@ -272,6 +277,7 @@ class ProbabilityService:
             "on_target_weights": on_target_weight_metadata,
             "on_target_count": len(on_target_weight_metadata),
             "n_on_target_rows": n_on_target_rows,
+            "default_opening_energy": default_energy,
         }
         if aggregate_only:
             return df.head(0), metadata
@@ -428,7 +434,9 @@ class ProbabilityService:
         lines.append("## End of on-target info ##\n")
         return "\n".join(lines)
 
-    def _annotate_opening_energy(self, df: pl.DataFrame) -> pl.DataFrame:
+    def _annotate_opening_energy(
+        self, df: pl.DataFrame, stats: Optional[dict] = None
+    ) -> pl.DataFrame:
         if df.height == 0:
             return df
 
@@ -441,4 +449,4 @@ class ProbabilityService:
         if not self.accessibility_service:
             return df
 
-        return self.accessibility_service.annotate_opening_energy_vectorized(df)
+        return self.accessibility_service.annotate_opening_energy_vectorized(df, stats)
