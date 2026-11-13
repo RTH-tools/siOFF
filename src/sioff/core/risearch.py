@@ -227,8 +227,9 @@ def run_search(
         Report every seed's hit instead of one best hit per duplex (CLI
         ``--no-dedup``).
     alignment : bool, default False
-        Add the columns ``q_start``, ``q_end`` (query coordinates, same
-        convention as ``start``/``end``) and ``alignment`` (pairing string,
+        Add the columns ``q_start``, ``q_end`` (first and last paired query
+        nucleotide, counted from 1 like ``start``/``end``) and ``alignment``
+        (pairing string,
         query 5' to 3': ``P`` pair, ``W`` G:U, ``U`` mismatch, ``T`` / ``Q``
         extra target / query base) (CLI ``--alignment``).
     threads : int, optional
@@ -246,7 +247,10 @@ def run_search(
         One row per hit with columns ``sirna_id, chrom, start, end, strand,
         energy`` (the schema [`sioff.off_targets`][sioff.off_targets] accepts as
         ``predictions``), followed by ``q_start, q_end, alignment`` when
-        ``alignment`` is set.
+        ``alignment`` is set. ``start`` and ``end`` are the first and last
+        target nucleotide of the site, counted from 1 along the target as
+        written (the RIsearch2 convention; the ``risearch`` package counts
+        from 0).
 
     See Also
     --------

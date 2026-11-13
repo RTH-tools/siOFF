@@ -160,7 +160,8 @@ def off_targets(
         ``-r/--risearch-file``.
     predictions : polars.DataFrame, optional
         In-memory predictions in the [`search`][sioff.search] schema. The columns
-        ``sirna_id, chrom, start, end, strand, energy`` are required; extra
+        ``sirna_id, chrom, start, end, strand, energy`` are required, with
+        ``start`` and ``end`` counted from 1 and inclusive; extra
         columns are dropped and dtypes are cast to the schema (``Utf8`` ids and
         strand, ``Int32`` coordinates, ``Float32`` energy), so a frame that went
         through Parquet or your own manipulation still works. ``chrom`` is
@@ -684,8 +685,9 @@ def search(
         Report every seed's hit instead of one best hit per duplex. CLI:
         ``--no-dedup``.
     alignment : bool, default False
-        Add the columns ``q_start``, ``q_end`` (query coordinates, same
-        convention as ``start``/``end``) and ``alignment`` (pairing string,
+        Add the columns ``q_start``, ``q_end`` (first and last paired query
+        nucleotide, counted from 1 like ``start``/``end``) and ``alignment``
+        (pairing string,
         query 5' to 3': ``P`` pair, ``W`` G:U, ``U`` mismatch, ``T`` / ``Q``
         extra target / query base). CLI: ``--alignment``.
     threads : int, optional
@@ -704,7 +706,11 @@ def search(
         One row per hit with the columns ``sirna_id`` (query record ID),
         ``chrom`` (target sequence name), ``start``, ``end``, ``strand`` and
         ``energy`` (hybridisation energy, kcal/mol), followed by ``q_start``,
-        ``q_end`` and ``alignment`` when *alignment* is set.
+        ``q_end`` and ``alignment`` when *alignment* is set. ``start`` and
+        ``end`` are the first and last target nucleotide of the site, counted
+        from 1 along the target as written, for hits on either strand: the
+        RIsearch2 convention, and the one [`off_targets`][sioff.off_targets]
+        reads. (The ``risearch`` package itself counts from 0.)
 
     Raises
     ------

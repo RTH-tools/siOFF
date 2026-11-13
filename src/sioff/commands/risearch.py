@@ -172,7 +172,8 @@ def search(
         typer.Option(
             "--alignment",
             help=(
-                "Add the columns q_start, q_end and alignment (pairing string, query "
+                "Add the columns q_start, q_end (first and last paired query "
+                "nucleotide, counted from 1) and alignment (pairing string, query "
                 "5'->3': P pair, W G:U, U mismatch, T/Q extra target/query base)."
             ),
         ),
@@ -201,6 +202,9 @@ def search(
     ] = False,
 ) -> Any:
     """Run a RIsearch search and output hits as TSV.
+
+    start and end are the first and last target nucleotide of a hit, counted
+    from 1 along the target as written.
 
     Returns the hits as a polars DataFrame. Spelled ``Any`` because Typer
     evaluates every annotation while building ``--help``, and polars is

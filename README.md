@@ -154,7 +154,7 @@ The key columns:
 | Column | Description |
 |--------|-------------|
 | `sirna_id` | siRNA the site belongs to |
-| `chrom`, `start`, `end`, `strand` | Binding site location |
+| `chrom`, `start`, `end`, `strand` | Binding site location: first and last nucleotide, counted from 1 |
 | `gene_id`, `transcript_id` | Overlapping annotation feature |
 | `energy` | Duplex hybridization energy from RIsearch (kcal/mol) |
 | `opening_energy` | Accessibility penalty — cost to unfold the site (kcal/mol) |
@@ -499,7 +499,7 @@ Available on `sioff` itself, before any subcommand.
 | `--seed-energy` | Accepted by risearch for compatibility; no effect in risearch 3.0.0a4/a5 (default: 0.0) |
 | `--no-max-prune` | Also extend non-maximal seeds (redundant hits) |
 | `--no-dedup` | Report every seed's hit instead of one best hit per duplex |
-| `--alignment` | Add the columns `q_start`, `q_end` and `alignment` (pairing string, query 5′→3′: `P` pair, `W` G:U, `U` mismatch, `T`/`Q` extra target/query base) |
+| `--alignment` | Add the columns `q_start`, `q_end` (first and last paired query nucleotide, counted from 1) and `alignment` (pairing string, query 5′→3′: `P` pair, `W` G:U, `U` mismatch, `T`/`Q` extra target/query base) |
 | `-j / --threads` | Worker threads (default: `RAYON_NUM_THREADS`, else every core) |
 | `--sense-only` | Keep only `+`-strand hits, for a target already in sense orientation (a transcriptome) |
 | `-o / --output` | Output TSV file (default: stdout) |
@@ -603,7 +603,7 @@ Pairs with α > γ are skipped and listed before scoring. An α or γ value that
 | Column | Description |
 |--------|-------------|
 | `chrom` | Chromosome or transcript ID |
-| `start`, `end` | Binding site coordinates |
+| `start`, `end` | Binding site coordinates: first and last nucleotide, counted from 1 along the target as written |
 | `strand` | Strand orientation |
 | `energy` | Hybridization energy (kcal/mol) |
 | `opening_energy` | Accessibility penalty (kcal/mol) |
