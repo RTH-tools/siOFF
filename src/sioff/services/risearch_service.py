@@ -48,8 +48,8 @@ VALID_DSM_IDS = frozenset({"t04", "slh04", "s95-rna-dna", "s95-dna-rna"})
 # once the search is under way).
 TEMPERATURE_RANGE = (0, 50)
 
-# Columns added to the hits by `alignment=True`: risearch's query coordinates
-# (same convention as `start`/`end`) and its pairing string.
+# Columns added to the hits by `alignment=True`: the query coordinates
+# (counted from 1, like `start`/`end`) and risearch's pairing string.
 ALIGNMENT_COLUMNS = ("q_start", "q_end", "alignment")
 
 
@@ -327,14 +327,18 @@ class RIsearchService:
             sirna_ids = query_names.gather(raw["query_idx"])
             chroms = target_names.gather(raw["target_idx"])
 
+        # risearch counts positions from 0 (inclusive on both ends). siOFF, like
+        # RIsearch2, counts from 1: the opening-energy lookup, the overlap with
+        # annotation features and the RIsearch2 file layout all read a hit
+        # that way, so the hits are converted once, here.
+        coordinates = ["start", "end", *(["q_start", "q_end"] if alignment else [])]
         df = (
             raw.with_columns([sirna_ids.alias("sirna_id"), chroms.alias("chrom")])
             .rename({"t_start": "start", "t_end": "end"})
             .select(["sirna_id", "chrom", "start", "end", "strand", "energy", *extra])
-            .cast({"start": pl.Int32, "end": pl.Int32, "energy": pl.Float32})
+            .with_columns(pl.col(coordinates).cast(pl.Int32) + 1)
+            .cast({"energy": pl.Float32})
         )
-        if alignment:
-            df = df.cast({"q_start": pl.Int32, "q_end": pl.Int32})
 
         logger.info(f"Search complete: {df.height} hits")
         return df
