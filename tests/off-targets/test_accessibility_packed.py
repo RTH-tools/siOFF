@@ -533,8 +533,11 @@ def test_mixed_generation_pair_is_repacked(pq_copy, warnings_seen):
     d, seqs = pq_copy
     ensure_accessibility_cache(d)
     # The minus pair is left over from an older pack; the plus pair is fresh.
+    # Date it before the newest Parquet, not before the pack: the copied
+    # Parquets keep the module fixture's mtime, which a slow run leaves more
+    # than 100 s behind the pack, and then pack - 100 s is still current.
     npy = packed_paths(d, "-")[0]
-    old = npy.stat().st_mtime - 100
+    old = max(f.stat().st_mtime for f in d.glob("*.accessibility.parquet")) - 100
     os.utime(npy, (old, old))
     assert ensure_accessibility_cache(d) == sorted(seqs)
     assert any("does not match the Parquet profiles" in m for m in warnings_seen)
