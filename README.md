@@ -162,13 +162,15 @@ The key columns:
 | `exp_value` | Expression of the overlapping transcript (e.g. RPKM) |
 | `P_off_target` | Off-target probability (per-siRNA partition function) |
 
-For example, `siRNA_4` has two equally strong binding sites in the toy data;
-the site in the higher-expressed gene absorbs most of the probability:
+For example, `siRNA_4` has two equally strong binding sites in the toy data.
+The `gene_6` transcript is six times more expressed, but its site costs
+1.7 kcal/mol more to open, so the more accessible site in `gene_5` takes most
+of the probability:
 
 ```
-sirna_id  gene_id  energy    dG_total  exp_value  P_off_target
-siRNA_4   gene_6   -34.15    -28.35    600        0.727
-siRNA_4   gene_5   -34.15    -28.85    100        0.273
+sirna_id  gene_id  energy  opening_energy  dG_total  exp_value  P_off_target
+siRNA_4   gene_5   -34.15  5.0             -29.15    100        0.724
+siRNA_4   gene_6   -34.15  6.7             -27.45    600        0.276
 ```
 
 The full column list is documented in [Output](#output).
