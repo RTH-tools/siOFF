@@ -9,6 +9,58 @@ section as the GitHub release notes. The project uses
 
 <!-- git-cliff: end of header -->
 
+## [0.3.0] - 2026-11-16
+
+### 🚀 Features
+
+- *(accessibility)* --strand + folds the forward strand only ([#39](https://github.com/RTH-tools/siOFF/pull/39)) ([a7234b6](https://github.com/RTH-tools/siOFF/commit/a7234b6784161fe7a9443d8b6e775e0cdeed168f))
+- [**breaking**] The memory-mapped cache is the only accessibility lookup ([#40](https://github.com/RTH-tools/siOFF/pull/40)) ([9ba3a29](https://github.com/RTH-tools/siOFF/commit/9ba3a29e19d63e38ecac34dca7b4f5e143d2ce91))
+- *(accessibility)* Pack the npy cache into one pair of files per strand ([#41](https://github.com/RTH-tools/siOFF/pull/41)) ([c898d11](https://github.com/RTH-tools/siOFF/commit/c898d11312893e27329bf6b5be19155d24fc9ac5))
+- *(search)* Pass every risearch.search option through siOFF ([#43](https://github.com/RTH-tools/siOFF/pull/43)) ([2aff34a](https://github.com/RTH-tools/siOFF/commit/2aff34aab0d8ea3b072a74d792180d48a2b6205d))
+- *(search)* Add --sense-only to sioff search ([#44](https://github.com/RTH-tools/siOFF/pull/44)) ([c91e624](https://github.com/RTH-tools/siOFF/commit/c91e624e15df16aafd90d9cd1911b3a98ed096af))
+- [**breaking**] Retire the single-siRNA model, --legacy-format and the FASTA on-target flags ([#45](https://github.com/RTH-tools/siOFF/pull/45)) ([30a4750](https://github.com/RTH-tools/siOFF/commit/30a4750dd267666ffbfdd5d3bd16320f0749bf91))
+- *(off-targets)* [**breaking**] One engine for files, folders and in-memory input; --sirna-table and the legacy E_min rule ([#49](https://github.com/RTH-tools/siOFF/pull/49)) ([67eaa49](https://github.com/RTH-tools/siOFF/commit/67eaa49566ac272d086c469c9bb8ac5746c16e84))
+- *(off-targets)* [**breaking**] List skipped alpha > gamma pairs; reject values no pair uses ([#50](https://github.com/RTH-tools/siOFF/pull/50)) ([b0681d1](https://github.com/RTH-tools/siOFF/commit/b0681d1c5cb3764b7c3555f9576a789e3e95bb95))
+- *(off-targets)* Report hits scored with the default opening energy ([#60](https://github.com/RTH-tools/siOFF/pull/60)) ([4320b9e](https://github.com/RTH-tools/siOFF/commit/4320b9e3216fb052ccca328ec296168be9449cd5))
+
+### 🐛 Bug Fixes
+
+- *(accessibility)* Leave no partial pack behind and skip the unused minus index ([#42](https://github.com/RTH-tools/siOFF/pull/42)) ([4b341b1](https://github.com/RTH-tools/siOFF/commit/4b341b19ec04ab1514bc3494e7e3e49ec3a1b03e))
+- *(probability)* Compute Boltzmann weights in float64 so strong duplexes cannot overflow ([#51](https://github.com/RTH-tools/siOFF/pull/51)) ([7d126a4](https://github.com/RTH-tools/siOFF/commit/7d126a4929d74e20ba67b5f2ee780dd9b04f6b06))
+- *(annotation)* Fail when --feature matches no row or no row is expressed ([#56](https://github.com/RTH-tools/siOFF/pull/56)) ([9807391](https://github.com/RTH-tools/siOFF/commit/98073911acac732d137fd932bee65241c3a796d8))
+- *(off-targets)* Name a target by the first word of its FASTA header ([#57](https://github.com/RTH-tools/siOFF/pull/57)) ([76cf93f](https://github.com/RTH-tools/siOFF/commit/76cf93fd87987d3227285cbfe5058aab4a7ab7ab))
+- *(off-targets)* [**breaking**] -T reaches the in-process search and the perfect-match energy ([#58](https://github.com/RTH-tools/siOFF/pull/58)) ([5e10d01](https://github.com/RTH-tools/siOFF/commit/5e10d01791d6b7029b14e4bfddba14fbc39780c6))
+- *(off-targets)* [**breaking**] --type tw counts a hit once per transcript ([#59](https://github.com/RTH-tools/siOFF/pull/59)) ([b9c5545](https://github.com/RTH-tools/siOFF/commit/b9c5545a44d67f7cde61a071995fe690db53fa49))
+- *(search)* Name hits by RIsearch's own target and query names ([#61](https://github.com/RTH-tools/siOFF/pull/61)) ([60dbc57](https://github.com/RTH-tools/siOFF/commit/60dbc571fcdfca57e165c699aaef260d76b866f0))
+- *(search)* [**breaking**] Report hits 1-based, as the scoring step reads them ([#64](https://github.com/RTH-tools/siOFF/pull/64)) ([ba66360](https://github.com/RTH-tools/siOFF/commit/ba663608f98ed4651b56fac9d0057bdf695642fe))
+
+### 📚 Documentation
+
+- Expression is per transcript; which table columns are single precision ([#62](https://github.com/RTH-tools/siOFF/pull/62)) ([6f92e72](https://github.com/RTH-tools/siOFF/commit/6f92e726c304d61bb927ba23889091dc8807f3c2))
+- *(readme)* Show the quick start's real siRNA_4 numbers ([#67](https://github.com/RTH-tools/siOFF/pull/67)) ([084b79e](https://github.com/RTH-tools/siOFF/commit/084b79e1b974bbc4a2b9c1115d3644f047bfbbb4))
+
+### ⚡ Performance
+
+- *(off-targets)* Score a one-siRNA Parquet input in place, not a copy of it ([#52](https://github.com/RTH-tools/siOFF/pull/52)) ([66da637](https://github.com/RTH-tools/siOFF/commit/66da637bc7974c6a29765be0d4fa59b3525de8e1))
+
+### 🧪 Testing
+
+- *(accessibility)* Date the stale minus pack before the newest Parquet ([#66](https://github.com/RTH-tools/siOFF/pull/66)) ([be5ed79](https://github.com/RTH-tools/siOFF/commit/be5ed79269b02984c2119d6c633fa54fa1813602))
+
+### 📦 Build
+
+- Unpin risearch so the latest release installs automatically ([f0a92c6](https://github.com/RTH-tools/siOFF/commit/f0a92c69edc63180ac6c83d55b587ab9abefa833))
+- Lock risearch 3.0.0a5 and let Dependabot keep the lock current ([#53](https://github.com/RTH-tools/siOFF/pull/53)) ([d1831c8](https://github.com/RTH-tools/siOFF/commit/d1831c873b0065dd4f13e9ee9e4ad4ae3d1fc945))
+- *(deps)* Bump the uv-minor-patch group with 12 updates ([#55](https://github.com/RTH-tools/siOFF/pull/55)) ([f69c8e2](https://github.com/RTH-tools/siOFF/commit/f69c8e2e5c68a51f1cc23fbbb9daaec8dafafa95))
+- *(deps)* Bump the uv-minor-patch group with 2 updates ([#63](https://github.com/RTH-tools/siOFF/pull/63)) ([1daf005](https://github.com/RTH-tools/siOFF/commit/1daf005a11bc2614d2dd74981d629fffbabce9ed))
+- *(deps-dev)* Bump zensical ([#65](https://github.com/RTH-tools/siOFF/pull/65)) ([85431f4](https://github.com/RTH-tools/siOFF/commit/85431f44a9c66638c8ad1b928e52b92a6526de35))
+
+### ⚙️ Miscellaneous Tasks
+
+- Untrack embedded risearch checkout and local plan docs ([26831ef](https://github.com/RTH-tools/siOFF/commit/26831efcf7f857c60f1afcfef44c8ff9c8a3365d))
+- Bump the actions-all group with 4 updates ([#54](https://github.com/RTH-tools/siOFF/pull/54)) ([9225324](https://github.com/RTH-tools/siOFF/commit/9225324a90a1ffa265000e680de658e28ab7c52a))
+
+
 ## [0.2.0] - 2026-10-26
 
 ### 🚀 Features
